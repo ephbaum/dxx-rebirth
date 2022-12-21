@@ -56,17 +56,17 @@
 #include "byteutil.h"
 #include "internal.h"
 #include "gauges.h"
-#include "playsave.h"
 #include "object.h"
 #include "args.h"
 
-#include "compiler-exchange.h"
-#include "compiler-make_unique.h"
 #include "compiler-range_for.h"
-#include "d_range.h"
+#include "d_levelstate.h"
+#include "d_zip.h"
 #include "partial_range.h"
 
 #include <algorithm>
+#include <memory>
+#include <utility>
 using std::max;
 
 //change to 1 for lots of spew.
@@ -98,6 +98,14 @@ struct enable_ogl_client_state
 template <typename T, unsigned... Gs>
 using ogl_client_states = std::tuple<T, enable_ogl_client_state<Gs>...>;
 
+template <typename T, std::size_t N1, std::size_t N2>
+union flatten_array
+{
+	std::array<T, N1 * N2> flat;
+	std::array<std::array<T, N1>, N2> nested;
+	static_assert(sizeof(flat) == sizeof(nested), "array padding error");
+};
+
 }
 
 #if defined(_WIN32) || (defined(__APPLE__) && defined(__MACH__)) || defined(__sun__) || defined(macintosh)
@@ -121,20 +129,20 @@ static int ogl_rgba_internalformat = GL_RGBA8;
 static int ogl_rgb_internalformat = GL_RGB8;
 #endif
 static std::unique_ptr<GLfloat[]> sphere_va, circle_va, disk_va;
-static array<std::unique_ptr<GLfloat[]>, 3> secondary_lva;
+static std::array<std::unique_ptr<GLfloat[]>, 3> secondary_lva;
 static int r_polyc,r_tpolyc,r_bitmapc,r_ubitbltc;
 #define f2glf(x) (f2fl(x))
 
 #define OGL_BINDTEXTURE(a) glBindTexture(GL_TEXTURE_2D, a);
 
 /* I assume this ought to be >= MAX_BITMAP_FILES in piggy.h? */
-static array<ogl_texture, 20000> ogl_texture_list;
+static std::array<ogl_texture, 20000> ogl_texture_list;
 static int ogl_texture_list_cur;
 
 /* some function prototypes */
 
 #define GL_TEXTURE0_ARB 0x84C0
-static int ogl_loadtexture(const palette_array_t &, const uint8_t *data, int dxo, int dyo, ogl_texture &tex, int bm_flags, int data_format, int texfilt, bool texanis, bool edgepad) __attribute_nonnull();
+static int ogl_loadtexture(const palette_array_t &, const uint8_t *data, int dxo, int dyo, ogl_texture &tex, int bm_flags, int data_format, opengl_texture_filter texfilt, bool texanis, bool edgepad) __attribute_nonnull();
 static void ogl_freetexture(ogl_texture &gltexture);
 
 static void ogl_loadbmtexture(grs_bitmap &bm, bool edgepad)
@@ -164,6 +172,8 @@ static void perspective(double fovy, double aspect, double zNear, double zFar)
 	glDepthMask(GL_TRUE);
 }
 #endif
+
+namespace dcx {
 
 static void ogl_init_texture_stats(ogl_texture &t)
 {
@@ -273,10 +283,10 @@ ogl_texture* ogl_get_free_texture(void){
 	Error("OGL: texture list full!\n");
 }
 
-static void ogl_texture_stats(void)
+static void ogl_texture_stats(grs_canvas &canvas)
 {
 	int used = 0, usedother = 0, usedidx = 0, usedrgb = 0, usedrgba = 0;
-	int databytes = 0, truebytes = 0, datatexel = 0, truetexel = 0;
+	int databytes = 0, truebytes = 0;
 	int prio0=0,prio1=0,prio2=0,prio3=0,prioh=0;
 	GLint idx, r, g, b, a, dbl, depth;
 	int res, colorsize, depthsize;
@@ -284,8 +294,6 @@ static void ogl_texture_stats(void)
 	{
 		if (i.handle>0){
 			used++;
-			datatexel+=i.w*i.h;
-			truetexel+=i.tw*i.th;
 			databytes+=i.bytesu;
 			truebytes+=i.bytes;
 			if (i.prio<0.299)prio0++;
@@ -323,8 +331,6 @@ static void ogl_texture_stats(void)
 #endif
 	dbl += 1;
 	glGetIntegerv(GL_DEPTH_BITS, &depth);
-	gr_set_default_canvas();
-	auto &canvas = *grd_curcanv;
 	const auto &game_font = *GAME_FONT;
 	gr_set_fontcolor(canvas, BM_XRGB(255, 255, 255), -1);
 	colorsize = (idx * res * dbl) / 8;
@@ -336,6 +342,8 @@ static void ogl_texture_stats(void)
 	gr_printf(canvas, game_font, fspacx2, fspacy1 + line_spacing, "%i(%i,%i,%i,%i) %iK(%iK wasted) (%i postcachedtex)", used, usedrgba, usedrgb, usedidx, usedother, truebytes / 1024, (truebytes - databytes) / 1024, r_texcount - r_cachedtexcount);
 	gr_printf(canvas, game_font, fspacx2, fspacy1 + (line_spacing * 2), "%ibpp(r%i,g%i,b%i,a%i)x%i=%iK depth%i=%iK", idx, r, g, b, a, dbl, colorsize / 1024, depth, depthsize / 1024);
 	gr_printf(canvas, game_font, fspacx2, fspacy1 + (line_spacing * 3), "total=%iK", (colorsize + depthsize + truebytes) / 1024);
+}
+
 }
 
 static void ogl_bindbmtex(grs_bitmap &bm, bool edgepad){
@@ -362,18 +370,24 @@ static void ogl_texwrap(ogl_texture *const gltexture, const int state)
 //similarly, with the objects(esp weapons), we could just go through and cache em all instead, but that would get ones that might not even be on the level
 //TODO: doors
 
-void ogl_cache_polymodel_textures(const unsigned model_num)
+namespace dsx {
+
+void ogl_cache_polymodel_textures(const polygon_model_index model_num)
 {
 	auto &Polygon_models = LevelSharedPolygonModelState.Polygon_models;
-	if (model_num >= Polygon_models.size())
+	if (model_num == polygon_model_index::None)
 		return;
 	const auto &po = Polygon_models[model_num];
 	unsigned i = po.first_texture;
 	const unsigned last_texture = i + po.n_textures;
 	for (; i != last_texture; ++i)
 	{
-		ogl_loadbmtexture(GameBitmaps[ObjBitmaps[ObjBitmapPtrs[i]].index], 1);
+		auto &objbitmap = ObjBitmaps[ObjBitmapPtrs[i]];
+		PIGGY_PAGE_IN(objbitmap);
+		ogl_loadbmtexture(GameBitmaps[objbitmap.index], 1);
 	}
+}
+
 }
 
 static void ogl_cache_vclip_textures(const vclip &vc)
@@ -399,9 +413,9 @@ static void ogl_cache_weapon_textures(const d_vclip_array &Vclip, const weapon_i
 	ogl_cache_vclipn_textures(Vclip, w.flash_vclip);
 	ogl_cache_vclipn_textures(Vclip, w.robot_hit_vclip);
 	ogl_cache_vclipn_textures(Vclip, w.wall_hit_vclip);
-	if (w.render_type == WEAPON_RENDER_VCLIP)
+	if (w.render == WEAPON_RENDER_VCLIP)
 		ogl_cache_vclipn_textures(Vclip, w.weapon_vclip);
-	else if (w.render_type == WEAPON_RENDER_POLYMODEL)
+	else if (w.render == WEAPON_RENDER_POLYMODEL)
 	{
 		ogl_cache_polymodel_textures(w.model_num);
 		ogl_cache_polymodel_textures(w.model_num_inner);
@@ -422,7 +436,7 @@ void ogl_cache_level_textures(void)
 	range_for (auto &ec, partial_const_range(Effects, Num_effects))
 	{
 		ogl_cache_vclipn_textures(Vclip, ec.dest_vclip);
-		if ((ec.changing_wall_texture == -1) && (ec.changing_object_texture==-1) )
+		if (ec.changing_wall_texture == -1 && ec.changing_object_texture == object_bitmap_index::None)
 			continue;
 		if (ec.vc.num_frames>max_efx)
 			max_efx=ec.vc.num_frames;
@@ -431,7 +445,7 @@ void ogl_cache_level_textures(void)
 	for (ef=0;ef<max_efx;ef++){
 		range_for (eclip &ec, partial_range(Effects, Num_effects))
 		{
-			if ((ec.changing_wall_texture == -1) && (ec.changing_object_texture==-1) )
+			if (ec.changing_wall_texture == -1 && ec.changing_object_texture == object_bitmap_index::None)
 				continue;
 			ec.time_left=-1;
 		}
@@ -443,16 +457,20 @@ void ogl_cache_level_textures(void)
 			{
 				const auto tmap1 = side.tmap_num;
 				const auto tmap2 = side.tmap_num2;
-				if (tmap1<0 || tmap1>=NumTextures){
+				const auto tmap1idx = get_texture_index(tmap1);
+				if (tmap1idx >= NumTextures){
 					glmprintf((CON_DEBUG, "ogl_cache_level_textures %p %p %i %i", seg.get_unchecked_pointer(), &side, tmap1, NumTextures));
 					//				tmap1=0;
 					continue;
 				}
-				PIGGY_PAGE_IN(Textures[tmap1]);
-				grs_bitmap *bm = &GameBitmaps[Textures[tmap1].index];
-				if (tmap2 != 0){
-					PIGGY_PAGE_IN(Textures[tmap2&0x3FFF]);
-					auto &bm2 = GameBitmaps[Textures[tmap2&0x3FFF].index];
+				auto &texture1 = Textures[tmap1idx];
+				PIGGY_PAGE_IN(texture1);
+				grs_bitmap *bm = &GameBitmaps[texture1.index];
+				if (tmap2 != texture2_value::None)
+				{
+					const auto texture2 = Textures[get_texture_index(tmap2)];
+					PIGGY_PAGE_IN(texture2);
+					auto &bm2 = GameBitmaps[texture2.index];
 					if (CGameArg.DbgUseOldTextureMerge || bm2.get_flag_mask(BM_FLAG_SUPER_TRANSPARENT))
 						bm = &texmerge_get_cached_bitmap( tmap1, tmap2 );
 					else {
@@ -536,26 +554,17 @@ void ogl_cache_level_textures(void)
 
 namespace dcx {
 
-void g3_draw_line(grs_canvas &canvas, const g3s_point &p0, const g3s_point &p1, const uint8_t c)
+void g3_draw_line(const g3_draw_line_context &context, const g3s_point &p0, const g3s_point &p1)
 {
-	GLfloat color_r, color_g, color_b;
-	GLfloat color_array[] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
-  
 	ogl_client_states<int, GL_VERTEX_ARRAY, GL_COLOR_ARRAY> cs;
 	OGL_DISABLE(TEXTURE_2D);
-	color_r = PAL2Tr(c);
-	color_g = PAL2Tg(c);
-	color_b = PAL2Tb(c);
-	color_array[0] = color_array[4] = color_r;
-	color_array[1] = color_array[5] = color_g;
-	color_array[2] = color_array[6] = color_b;
-	color_array[3] = color_array[7] = 1.0;
-	array<GLfloat, 6> vertices = {{
+	glDisable(GL_CULL_FACE);
+	std::array<GLfloat, 6> vertices = {{
 		f2glf(p0.p3_vec.x), f2glf(p0.p3_vec.y), -f2glf(p0.p3_vec.z),
 		f2glf(p1.p3_vec.x), f2glf(p1.p3_vec.y), -f2glf(p1.p3_vec.z)
 	}};
 	glVertexPointer(3, GL_FLOAT, 0, vertices.data());
-	glColorPointer(4, GL_FLOAT, 0, color_array);
+	glColorPointer(4, GL_FLOAT, 0, context.color_array.data());
 	glDrawArrays(GL_LINES, 0, 2);
 }
 
@@ -569,7 +578,7 @@ static void ogl_drawcircle(const unsigned nsides, const unsigned type, GLfloat *
 
 static std::unique_ptr<GLfloat[]> circle_array_init(const unsigned nsides)
 {
-	auto vertices = make_unique<GLfloat[]>(nsides * 2);
+	auto vertices = std::make_unique<GLfloat[]>(nsides * 2);
 	for (unsigned i = 0; i < nsides; i++)
 	{
 		const float ang = 2.0 * M_PI * i / nsides;
@@ -581,7 +590,7 @@ static std::unique_ptr<GLfloat[]> circle_array_init(const unsigned nsides)
 
 static std::unique_ptr<GLfloat[]> circle_array_init_2(const unsigned nsides, const float xsc, const float xo, const float ysc, const float yo)
 {
-	auto vertices = make_unique<GLfloat[]>(nsides * 2);
+	auto vertices = std::make_unique<GLfloat[]>(nsides * 2);
 	for (unsigned i = 0; i < nsides; i++)
 	{
 		const float ang = 2.0 * M_PI * i / nsides;
@@ -591,13 +600,11 @@ static std::unique_ptr<GLfloat[]> circle_array_init_2(const unsigned nsides, con
 	return vertices;
 }
 
-}
-
-void ogl_draw_vertex_reticle(int cross,int primary,int secondary,int color,int alpha,int size_offs)
+void ogl_draw_vertex_reticle(grs_canvas &canvas, int cross, int primary, int secondary, int color, int alpha, int size_offs)
 {
 	int size=270+(size_offs*20);
 	float scale = (static_cast<float>(SWIDTH)/SHEIGHT);
-	const array<float, 4> ret_rgba{{
+	const std::array<float, 4> ret_rgba{{
 		static_cast<float>(PAL2Tr(color)),
 		static_cast<float>(PAL2Tg(color)),
 		static_cast<float>(PAL2Tb(color)),
@@ -608,7 +615,7 @@ void ogl_draw_vertex_reticle(int cross,int primary,int secondary,int color,int a
 		ret_rgba[2] / 2,
 		ret_rgba[3] / 2
 	}};
-	array<GLfloat, 16 * 4> dark_lca, bright_lca;
+	std::array<GLfloat, 16 * 4> dark_lca, bright_lca;
 	for (uint_fast32_t i = 0; i != dark_lca.size(); i += 4)
 	{
 		bright_lca[i] = ret_rgba[0];
@@ -622,7 +629,7 @@ void ogl_draw_vertex_reticle(int cross,int primary,int secondary,int color,int a
 	}
 
 	glPushMatrix();
-	glTranslatef((grd_curcanv->cv_bitmap.bm_w/2+grd_curcanv->cv_bitmap.bm_x)/static_cast<float>(last_width),1.0-(grd_curcanv->cv_bitmap.bm_h/2+grd_curcanv->cv_bitmap.bm_y)/static_cast<float>(last_height),0);
+	glTranslatef((canvas.cv_bitmap.bm_w / 2 + canvas.cv_bitmap.bm_x) / static_cast<float>(last_width), 1.0 - (canvas.cv_bitmap.bm_h / 2 + canvas.cv_bitmap.bm_y) / static_cast<float>(last_height), 0);
 
 	{
 		float gl1, gl2, gl3;
@@ -650,7 +657,7 @@ void ogl_draw_vertex_reticle(int cross,int primary,int secondary,int color,int a
 	glEnableClientState(GL_COLOR_ARRAY);
 	
 	//cross
-	array<GLfloat, 8 * 4> cross_lca;
+	std::array<GLfloat, 8 * 4> cross_lca;
 	GLfloat *cross_lca_ptr;
 	if (cross)
 	{
@@ -673,13 +680,13 @@ void ogl_draw_vertex_reticle(int cross,int primary,int secondary,int color,int a
 	}
 	glColorPointer(4, GL_FLOAT, 0, cross_lca_ptr);
 
-	static const array<GLfloat, 8 * 2> cross_lva{{
+	static const std::array<GLfloat, 8 * 2> cross_lva{{
 		-4.0, 2.0, -2.0, 0, -3.0, -4.0, -2.0, -3.0, 4.0, 2.0, 2.0, 0, 3.0, -4.0, 2.0, -3.0,
 	}};
 	glVertexPointer(2, GL_FLOAT, 0, cross_lva.data());
 	glDrawArrays(GL_LINES, 0, 8);
 	
-	array<GLfloat, 4 * 4> primary_lca0;
+	std::array<GLfloat, 4 * 4> primary_lca0;
 	GLfloat *lca0_data;
 	//left primary bar
 	if(primary == 0)
@@ -697,22 +704,22 @@ void ogl_draw_vertex_reticle(int cross,int primary,int secondary,int color,int a
 		lca0_data = primary_lca0.data();
 	}
 	glColorPointer(4, GL_FLOAT, 0, lca0_data);
-	static const array<GLfloat, 4 * 2> primary_lva0{{
+	static const std::array<GLfloat, 4 * 2> primary_lva0{{
 		-5.5, -5.0, -6.5, -7.5, -10.0, -7.0, -10.0, -8.7
 	}};
-	static const array<GLfloat, 4 * 2> primary_lva1{{
+	static const std::array<GLfloat, 4 * 2> primary_lva1{{
 		-10.0, -7.0, -10.0, -8.7, -15.0, -8.5, -15.0, -9.5
 	}};
-	static const array<GLfloat, 4 * 2> primary_lva2{{
+	static const std::array<GLfloat, 4 * 2> primary_lva2{{
 		5.5, -5.0, 6.5, -7.5, 10.0, -7.0, 10.0, -8.7
 	}};
-	static const array<GLfloat, 4 * 2> primary_lva3{{
+	static const std::array<GLfloat, 4 * 2> primary_lva3{{
 		10.0, -7.0, 10.0, -8.7, 15.0, -8.5, 15.0, -9.5
 	}};
 	glVertexPointer(2, GL_FLOAT, 0, primary_lva0.data());
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
-	array<GLfloat, 4 * 4> primary_lca1;
+	std::array<GLfloat, 4 * 4> primary_lca1;
 	GLfloat *lca1_data;
 	if(primary != 2)
 		lca1_data = dark_lca.data();
@@ -767,8 +774,6 @@ void ogl_draw_vertex_reticle(int cross,int primary,int secondary,int color,int a
 	glLineWidth(linedotscale);
 }
 
-namespace dcx {
-
 /*
  * Stars on heaven in exit sequence, automap objects
  */
@@ -776,7 +781,7 @@ void g3_draw_sphere(grs_canvas &canvas, cg3s_point &pnt, fix rad, const uint8_t 
 {
 	int i;
 	const float scale = (static_cast<float>(canvas.cv_bitmap.bm_w) / canvas.cv_bitmap.bm_h);
-	array<GLfloat, 20 * 4> color_array;
+	std::array<GLfloat, 20 * 4> color_array;
 	for (i = 0; i < 20*4; i += 4)
 	{
 		color_array[i] = CPAL2Tr(c);
@@ -850,22 +855,12 @@ int gr_disk(grs_canvas &canvas, const fix x, const fix y, const fix r, const uin
 /*
  * Draw flat-shaded Polygon (Lasers, Drone-arms, Driller-ears)
  */
-void _g3_draw_poly(grs_canvas &canvas, const uint_fast32_t nv, cg3s_point *const *const pointlist, const uint8_t palette_color_index)
+void _g3_draw_poly(grs_canvas &canvas, const std::span<cg3s_point *const> pointlist, const uint8_t palette_color_index)
 {
-	struct vfloat
-	{
-		GLfloat x, y, z;
-	};
-	static_assert(sizeof(vfloat) == sizeof(GLfloat) * 3, "vfloat size wrong");
-	struct cfloat
-	{
-		GLfloat r, g, b, a;
-	};
-	static_assert(sizeof(cfloat) == sizeof(GLfloat) * 4, "cfloat size wrong");
-	RAIIdmem<GLfloat[]> color_array;
-
-	auto &&vertices = make_unique<GLfloat[]>(nv * 3);
-	MALLOC(color_array, GLfloat[], nv*4);
+	if (pointlist.size() > MAX_POINTS_PER_POLY)
+		return;
+	flatten_array<GLfloat, 4, MAX_POINTS_PER_POLY> color_array;
+	flatten_array<GLfloat, 3, MAX_POINTS_PER_POLY> vertices;
 
 	r_polyc++;
 	ogl_client_states<int, GL_VERTEX_ARRAY, GL_COLOR_ARRAY> cs;
@@ -876,36 +871,36 @@ void _g3_draw_poly(grs_canvas &canvas, const uint_fast32_t nv, cg3s_point *const
 		? 1.0
 		: 1.0 - static_cast<float>(canvas.cv_fade_level) / (static_cast<float>(GR_FADE_LEVELS) - 1.0);
 
-	vfloat *const varray = reinterpret_cast<vfloat *>(vertices.get());
-	cfloat *const carray = reinterpret_cast<cfloat *>(color_array.get());
-	for (unsigned c=0; c < nv; ++c)
+	for (auto &&[p, v, c] : zip(
+			pointlist,
+			unchecked_partial_range(vertices.nested, pointlist.size()),
+			unchecked_partial_range(color_array.nested, pointlist.size())
+		)
+	)
 	{
-		carray[c].r = color_r;
-		carray[c].g = color_g;
-		carray[c].b = color_b;
-		carray[c].a = color_a;
-		auto &p = pointlist[c]->p3_vec;
-		varray[c].x = f2glf(p.x);
-		varray[c].y = f2glf(p.y);
-		varray[c].z = -f2glf(p.z);
+		c[0] = color_r;
+		c[1] = color_g;
+		c[2] = color_b;
+		c[3] = color_a;
+		auto &pv = p->p3_vec;
+		v[0] = f2glf(pv.x);
+		v[1] = f2glf(pv.y);
+		v[2] = -f2glf(pv.z);
 	}
 
-	glVertexPointer(3, GL_FLOAT, 0, varray);
-	glColorPointer(4, GL_FLOAT, 0, color_array.get());
-	glDrawArrays(GL_TRIANGLE_FAN, 0, nv);
+	glVertexPointer(3, GL_FLOAT, 0, vertices.flat.data());
+	glColorPointer(4, GL_FLOAT, 0, color_array.flat.data());
+	glDrawArrays(GL_TRIANGLE_FAN, 0, pointlist.size());
 }
 
 /*
  * Everything texturemapped (walls, robots, ship)
  */ 
-void _g3_draw_tmap(grs_canvas &canvas, const unsigned nv, cg3s_point *const *const pointlist, const g3s_uvl *const uvl_list, const g3s_lrgb *const light_rgb, grs_bitmap &bm)
+void _g3_draw_tmap(grs_canvas &canvas, const std::span<cg3s_point *const> pointlist, const g3s_uvl *const uvl_list, const g3s_lrgb *const light_rgb, grs_bitmap &bm)
 {
-	int index2, index3, index4;
 	GLfloat color_alpha = 1.0;
 
 	ogl_client_states<int, GL_VERTEX_ARRAY, GL_COLOR_ARRAY> cs;
-	auto &c = std::get<0>(cs);
-	
 	if (tmap_drawer_ptr == draw_tmap) {
 		glEnableClientState(GL_TEXTURE_COORD_ARRAY);
 		OGL_ENABLE(TEXTURE_2D);
@@ -916,43 +911,55 @@ void _g3_draw_tmap(grs_canvas &canvas, const unsigned nv, cg3s_point *const *con
 	} else if (tmap_drawer_ptr == draw_tmap_flat) {
 		OGL_DISABLE(TEXTURE_2D);
 		/* for cloaked state faces */
-		color_alpha = 1.0 - (canvas.cv_fade_level / static_cast<GLfloat>(NUM_LIGHTING_LEVELS));
+		color_alpha = 1.0 - (static_cast<GLfloat>(canvas.cv_fade_level) / static_cast<GLfloat>(NUM_LIGHTING_LEVELS));
 	} else {
 		glmprintf((CON_DEBUG, "g3_draw_tmap: unhandled tmap_drawer"));
 		return;
 	}
 
-	RAIIdmem<GLfloat[]> vertices, color_array, texcoord_array;
-	MALLOC(vertices, GLfloat[], nv*3);
-	MALLOC(color_array, GLfloat[], nv*4);
-	MALLOC(texcoord_array, GLfloat[], nv*2);
+	flatten_array<GLfloat, 3, MAX_POINTS_PER_POLY> vertices;
+	flatten_array<GLfloat, 4, MAX_POINTS_PER_POLY> color_array;
+	flatten_array<GLfloat, 2, MAX_POINTS_PER_POLY> texcoord_array;
 
-	for (c=0; c<nv; c++) {
-		index2 = c * 2;
-		index3 = c * 3;
-		index4 = c * 4;
-		
-		vertices[index3]     = f2glf(pointlist[c]->p3_vec.x);
-		vertices[index3+1]   = f2glf(pointlist[c]->p3_vec.y);
-		vertices[index3+2]   = -f2glf(pointlist[c]->p3_vec.z);
+	const auto nv = pointlist.size();
+	for (auto &&[point, light, uvl, vert, color, texcoord] : zip(
+			pointlist,
+			unchecked_partial_range(light_rgb, nv),
+			unchecked_partial_range(uvl_list, nv),
+			unchecked_partial_range(vertices.nested, nv),
+			unchecked_partial_range(color_array.nested, nv),
+			partial_range(texcoord_array.nested, nv)
+		)
+	)
+	{
+		vert[0] = f2glf(point->p3_vec.x);
+		vert[1] = f2glf(point->p3_vec.y);
+		vert[2] = -f2glf(point->p3_vec.z);
+		color[3] = color_alpha;
 		if (tmap_drawer_ptr == draw_tmap_flat) {
-			color_array[index4]      = 0;
-			color_array[index4+1]    = color_array[index4];
-			color_array[index4+2]    = color_array[index4];
-		} else { 
-			color_array[index4]      = bm.get_flag_mask(BM_FLAG_NO_LIGHTING) ? 1.0 : f2glf(light_rgb[c].r);
-			color_array[index4+1]    = bm.get_flag_mask(BM_FLAG_NO_LIGHTING) ? 1.0 : f2glf(light_rgb[c].g);
-			color_array[index4+2]    = bm.get_flag_mask(BM_FLAG_NO_LIGHTING) ? 1.0 : f2glf(light_rgb[c].b);
+			color[0] = color[1] = color[2] = 0;
 		}
-		color_array[index4+3]    = color_alpha;
-		texcoord_array[index2]   = f2glf(uvl_list[c].u);
-		texcoord_array[index2+1] = f2glf(uvl_list[c].v);
+		else
+		{
+			if (bm.get_flag_mask(BM_FLAG_NO_LIGHTING))
+			{
+				color[0] = color[1] = color[2] = 1.0;
+			}
+			else
+			{
+				color[0] = f2glf(light.r);
+				color[1] = f2glf(light.g);
+				color[2] = f2glf(light.b);
+			}
+			texcoord[0] = f2glf(uvl.u);
+			texcoord[1] = f2glf(uvl.v);
+		}
 	}
-	
-	glVertexPointer(3, GL_FLOAT, 0, vertices.get());
-	glColorPointer(4, GL_FLOAT, 0, color_array.get());
+
+	glVertexPointer(3, GL_FLOAT, 0, vertices.flat.data());
+	glColorPointer(4, GL_FLOAT, 0, color_array.flat.data());
 	if (tmap_drawer_ptr == draw_tmap) {
-		glTexCoordPointer(2, GL_FLOAT, 0, texcoord_array.get());  
+		glTexCoordPointer(2, GL_FLOAT, 0, texcoord_array.flat.data());
 	}
 	
 	glDrawArrays(GL_TRIANGLE_FAN, 0, nv);
@@ -967,89 +974,84 @@ void _g3_draw_tmap(grs_canvas &canvas, const unsigned nv, cg3s_point *const *con
 /*
  * Everything texturemapped with secondary texture (walls with secondary texture)
  */
-void _g3_draw_tmap_2(grs_canvas &canvas, const unsigned nv, const g3s_point *const *const pointlist, const g3s_uvl *uvl_list, const g3s_lrgb *light_rgb, grs_bitmap &bmbot, grs_bitmap &bm, const unsigned orient)
+void _g3_draw_tmap_2(grs_canvas &canvas, const std::span<const g3s_point *const> pointlist, const std::span<const g3s_uvl, 4> uvl_list, const std::span<const g3s_lrgb, 4> light_rgb, grs_bitmap &bmbot, grs_bitmap &bm, const texture2_rotation_low orient)
 {
-	int index2, index3;
-
-	RAIIdmem<GLfloat[]> vertices, color_array, texcoord_array;
-	MALLOC(vertices, GLfloat[], nv*3);
-	MALLOC(color_array, GLfloat[], nv*4);
-	MALLOC(texcoord_array, GLfloat[], nv*2);
-
-	_g3_draw_tmap(canvas, nv, pointlist, uvl_list, light_rgb, bmbot);//draw the bottom texture first.. could be optimized with multitexturing..
-	
+	_g3_draw_tmap(canvas, pointlist, uvl_list.data(), light_rgb.data(), bmbot);//draw the bottom texture first.. could be optimized with multitexturing..
 	ogl_client_states<int, GL_VERTEX_ARRAY, GL_COLOR_ARRAY, GL_TEXTURE_COORD_ARRAY> cs;
-	auto &c = std::get<0>(cs);
-	
+	(void)cs;
 	r_tpolyc++;
 	OGL_ENABLE(TEXTURE_2D);
 	ogl_bindbmtex(bm, 1);
 	ogl_texwrap(bm.gltexture, GL_REPEAT);
 
+	flatten_array<GLfloat, 4, MAX_POINTS_PER_POLY> color_array;
 	{
-		struct rgba
-		{
-			GLfloat r, g, b, a;
-		};
-		static_assert(sizeof(rgba) == sizeof(GLfloat) * 4, "padding error");
-		rgba *const ca = reinterpret_cast<rgba *>(color_array.get());
 		const GLfloat alpha = (canvas.cv_fade_level >= GR_FADE_OFF)
 			? 1.0
 			: (1.0 - static_cast<float>(canvas.cv_fade_level) / (static_cast<float>(GR_FADE_LEVELS) - 1.0));
+		auto &&color_range = unchecked_partial_range(color_array.nested, pointlist.size());
 		if (bm.get_flag_mask(BM_FLAG_NO_LIGHTING))
 		{
-			range_for (auto &e, unchecked_partial_range(ca, nv))
+			for (auto &e : color_range)
 			{
-				e.r = e.g = e.b = 1.0;
-				e.a = alpha;
+				e[0] = e[1] = e[2] = 1.0;
+				e[3] = alpha;
 			}
 		}
 		else
 		{
-			range_for (const unsigned i, xrange(nv))
+			for (auto &&[e, l] : zip(
+					color_range,
+					unchecked_partial_range(light_rgb, pointlist.size())
+				)
+			)
 			{
-				auto &e = ca[i];
-				auto &l = light_rgb[i];
-				e.r = f2glf(l.r);
-				e.g = f2glf(l.g);
-				e.b = f2glf(l.b);
-				e.a = alpha;
+				e[0] = f2glf(l.r);
+				e[1] = f2glf(l.g);
+				e[2] = f2glf(l.b);
+				e[3] = alpha;
 			}
 		}
 	}
 
-	for (c=0; c<nv; c++) {
-		index2 = c * 2;
-		index3 = c * 3;
+	flatten_array<GLfloat, 3, MAX_POINTS_PER_POLY> vertices;
+	flatten_array<GLfloat, 2, MAX_POINTS_PER_POLY> texcoord_array;
 
-		const GLfloat uf = f2glf(uvl_list[c].u), vf = f2glf(uvl_list[c].v);
+	const auto nv = pointlist.size();
+	for (auto &&[point, uvl, vert, texcoord] : zip(
+			pointlist,
+			unchecked_partial_range(uvl_list, nv),
+			unchecked_partial_range(vertices.nested, nv),
+			partial_range(texcoord_array.nested, nv)
+		)
+	)
+	{
+		const GLfloat uf = f2glf(uvl.u), vf = f2glf(uvl.v);
 		switch(orient){
-			case 1:
-				texcoord_array[index2]   = 1.0 - vf;
-				texcoord_array[index2 + 1] = uf;
+			case texture2_rotation_low::_1:
+				texcoord[0] = 1.0 - vf;
+				texcoord[1] = uf;
 				break;
-			case 2:
-				texcoord_array[index2]   = 1.0 - uf;
-				texcoord_array[index2 + 1] = 1.0 - vf;
+			case texture2_rotation_low::_2:
+				texcoord[0] = 1.0 - uf;
+				texcoord[1] = 1.0 - vf;
 				break;
-			case 3:
-				texcoord_array[index2]   = vf;
-				texcoord_array[index2 + 1] = 1.0 - uf;
+			case texture2_rotation_low::_3:
+				texcoord[0] = vf;
+				texcoord[1] = 1.0 - uf;
 				break;
 			default:
-				texcoord_array[index2]   = uf;
-				texcoord_array[index2 + 1] = vf;
+				texcoord[0] = uf;
+				texcoord[1] = vf;
 				break;
 		}
-		
-		vertices[index3]     = f2glf(pointlist[c]->p3_vec.x);
-		vertices[index3+1]   = f2glf(pointlist[c]->p3_vec.y);
-		vertices[index3+2]   = -f2glf(pointlist[c]->p3_vec.z);
+		vert[0] = f2glf(point->p3_vec.x);
+		vert[1] = f2glf(point->p3_vec.y);
+		vert[2] = -f2glf(point->p3_vec.z);
 	}
-	
-	glVertexPointer(3, GL_FLOAT, 0, vertices.get());
-	glColorPointer(4, GL_FLOAT, 0, color_array.get());
-	glTexCoordPointer(2, GL_FLOAT, 0, texcoord_array.get());  
+	glVertexPointer(3, GL_FLOAT, 0, vertices.flat.data());
+	glColorPointer(4, GL_FLOAT, 0, color_array.flat.data());
+	glTexCoordPointer(2, GL_FLOAT, 0, texcoord_array.flat.data());
 	glDrawArrays(GL_TRIANGLE_FAN, 0, nv);
 }
 
@@ -1084,9 +1086,9 @@ void g3_draw_bitmap(grs_canvas &canvas, const vms_vector &pos, const fix iwidth,
 	{
 		GLfloat u, v;
 	};
-	array<fvertex_t, point_count> vertices;
-	array<fcolor_t, point_count> color_array;
-	array<ftexcoord_t, point_count> texcoord_array;
+	std::array<fvertex_t, point_count> vertices;
+	std::array<fcolor_t, point_count> color_array;
+	std::array<ftexcoord_t, point_count> texcoord_array;
 	const auto &v1 = vm_vec_sub(pos,View_position);
 	const auto &rpv = vm_vec_rotate(v1,View_matrix);
 	const auto bmglu = bm.gltexture->u;
@@ -1140,12 +1142,9 @@ void g3_draw_bitmap(grs_canvas &canvas, const vms_vector &pos, const fix iwidth,
  * Movies
  * Since this function will create a new texture each call, mipmapping can be very GPU intensive - so it has an optional setting for texture filtering.
  */
-bool ogl_ubitblt_i(unsigned dw,unsigned dh,unsigned dx,unsigned dy, unsigned sw, unsigned sh, unsigned sx, unsigned sy, const grs_bitmap &src, grs_bitmap &dest, unsigned texfilt)
+bool ogl_ubitblt_i(unsigned dw,unsigned dh,unsigned dx,unsigned dy, unsigned sw, unsigned sh, unsigned sx, unsigned sy, const grs_bitmap &src, grs_bitmap &dest, const opengl_texture_filter texfilt)
 {
 	GLfloat xo,yo,xs,ys,u1,v1;
-	GLfloat color_array[] = { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 };
-	GLfloat texcoord_array[] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
-	GLfloat vertices[] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
 	struct bitblt_free_ogl_texture
 	{
 		ogl_texture t;
@@ -1178,25 +1177,35 @@ bool ogl_ubitblt_i(unsigned dw,unsigned dh,unsigned dx,unsigned dy, unsigned sw,
 	
 	ogl_texwrap(&tex,GL_CLAMP_TO_EDGE);
 
-	vertices[0] = xo;
-	vertices[1] = yo;
-	vertices[2] = xo+xs;
-	vertices[3] = yo;
-	vertices[4] = xo+xs;
-	vertices[5] = yo-ys;
-	vertices[6] = xo;
-	vertices[7] = yo-ys;
+	const GLfloat vertices[] = {
+		xo,
+		yo,
+		xo + xs,
+		yo,
+		xo + xs,
+		yo - ys,
+		xo,
+		yo - ys
+	};
 
-	texcoord_array[0] = u1;
-	texcoord_array[1] = v1;
-	texcoord_array[2] = tex.u;
-	texcoord_array[3] = v1;
-	texcoord_array[4] = tex.u;
-	texcoord_array[5] = tex.v;
-	texcoord_array[6] = u1;
-	texcoord_array[7] = tex.v;
+	const GLfloat texcoord_array[] = {
+		u1,
+		v1,
+		tex.u,
+		v1,
+		tex.u,
+		tex.v,
+		u1,
+		tex.v
+	};
 
 	glVertexPointer(2, GL_FLOAT, 0, vertices);
+	static constexpr GLfloat color_array[] = {
+		1.0, 1.0, 1.0, 1.0,
+		1.0, 1.0, 1.0, 1.0,
+		1.0, 1.0, 1.0, 1.0,
+		1.0, 1.0, 1.0, 1.0
+	};
 	glColorPointer(4, GL_FLOAT, 0, color_array);
 	glTexCoordPointer(2, GL_FLOAT, 0, texcoord_array);  
 	glDrawArrays(GL_TRIANGLE_FAN, 0, 4);//replaced GL_QUADS
@@ -1204,7 +1213,7 @@ bool ogl_ubitblt_i(unsigned dw,unsigned dh,unsigned dx,unsigned dy, unsigned sw,
 }
 
 bool ogl_ubitblt(unsigned w,unsigned h,unsigned dx,unsigned dy, unsigned sx, unsigned sy, const grs_bitmap &src, grs_bitmap &dest){
-	return ogl_ubitblt_i(w,h,dx,dy,w,h,sx,sy,src,dest,0);
+	return ogl_ubitblt_i(w, h, dx, dy, w, h, sx, sy, src, dest, opengl_texture_filter::classic);
 }
 
 /*
@@ -1226,15 +1235,15 @@ void ogl_set_blending(const gr_blend cv_blend_func)
 	GLenum s, d;
 	switch (cv_blend_func)
 	{
-		case GR_BLEND_ADDITIVE_A:
+		case gr_blend::additive_a:
 			s = GL_SRC_ALPHA;
 			d = GL_ONE;
 			break;
-		case GR_BLEND_ADDITIVE_C:
+		case gr_blend::additive_c:
 			s = GL_ONE;
 			d = GL_ONE;
 			break;
-		case GR_BLEND_NORMAL:
+		case gr_blend::normal:
 		default:
 			s = GL_SRC_ALPHA;
 			d = GL_ONE_MINUS_SRC_ALPHA;
@@ -1247,7 +1256,7 @@ void ogl_start_frame(grs_canvas &canvas)
 {
 	r_polyc=0;r_tpolyc=0;r_bitmapc=0;r_ubitbltc=0;
 
-	OGL_VIEWPORT(canvas.cv_bitmap.bm_x, canvas.cv_bitmap.bm_y, Canvas_width, Canvas_height);
+	OGL_VIEWPORT(canvas.cv_bitmap.bm_x, canvas.cv_bitmap.bm_y, canvas.cv_bitmap.bm_w, canvas.cv_bitmap.bm_h);
 	glClearColor(0.0, 0.0, 0.0, 0.0);
 
 	glLineWidth(linedotscale);
@@ -1275,6 +1284,94 @@ void ogl_start_frame(grs_canvas &canvas)
 	glLoadIdentity();//clear matrix
 }
 
+#if DXX_USE_STEREOSCOPIC_RENDER
+void ogl_stereo_frame(const bool left_eye, const int xoff)
+{
+	const float dxoff = xoff * 2.0f / grd_curscreen->sc_canvas.cv_bitmap.bm_w;
+	float stereo_transform_dxoff;
+
+	// query if stereo quad buffering available?
+	GLboolean ogl_stereo_enabled = false;
+	glGetBooleanv(GL_STEREO, &ogl_stereo_enabled);
+
+	int gl_buffer;
+	if (left_eye) {
+		// left eye view
+		if (!ogl_stereo_enabled)
+		{
+			[]() {
+				std::array<GLint, 4> ogl_stereo_viewport;
+				glGetIntegerv(GL_VIEWPORT, ogl_stereo_viewport.data());
+				// center unsqueezed side-by-side format
+				switch (VR_stereo) {
+					case StereoFormat::None:
+						/* Not reached */
+					case StereoFormat::AboveBelow:
+					case StereoFormat::SideBySideFullHeight:
+						/* No modification needed */
+						return;
+					case StereoFormat::SideBySideHalfHeight:
+						ogl_stereo_viewport[1] -= ogl_stereo_viewport[3] / 2;		// y = h/4
+						break;
+					case StereoFormat::AboveBelowSync:
+						{
+							const int dy = VR_sync_width / 2;
+							ogl_stereo_viewport[3] -= dy;
+							ogl_stereo_viewport[1] += dy;
+							break;
+						}
+				}
+				glViewport(ogl_stereo_viewport[0], ogl_stereo_viewport[1], ogl_stereo_viewport[2], ogl_stereo_viewport[3]);
+			}();
+		}
+		// rightward image shift adjustment for left eye offset
+		stereo_transform_dxoff = -dxoff;		// xoff < 0
+		gl_buffer = GL_BACK_LEFT;
+	}
+	else
+	{
+		// right eye view
+		if (!ogl_stereo_enabled)
+		{
+			std::array<GLint, 4> ogl_stereo_viewport;
+			glGetIntegerv(GL_VIEWPORT, ogl_stereo_viewport.data());
+			switch (VR_stereo) {
+				case StereoFormat::None:
+					/* Not reached */
+					break;
+					// center unsqueezed side-by-side format
+				case StereoFormat::SideBySideHalfHeight:
+					ogl_stereo_viewport[1] -= ogl_stereo_viewport[3] / 2;		// y = h/4
+					[[fallthrough]];
+					// half-width viewports for side-by-side format
+				case StereoFormat::SideBySideFullHeight:
+					ogl_stereo_viewport[0] += ogl_stereo_viewport[2];		// x = w/2
+					break;
+					// half-height viewports for above/below format
+				case StereoFormat::AboveBelowSync:
+				case StereoFormat::AboveBelow:
+					ogl_stereo_viewport[1] -= ogl_stereo_viewport[3];		// y = h/2
+					if (VR_stereo == StereoFormat::AboveBelowSync)
+						ogl_stereo_viewport[3] -= VR_sync_width / 2;
+					break;
+			}
+			glViewport(ogl_stereo_viewport[0], ogl_stereo_viewport[1], ogl_stereo_viewport[2], ogl_stereo_viewport[3]);
+		}
+		// leftward image shift adjustment for right eye offset
+		stereo_transform_dxoff = dxoff;		// xoff < 0
+		gl_buffer = GL_BACK_RIGHT;
+	}
+	if (ogl_stereo_enabled)
+		glDrawBuffer(gl_buffer);
+	glMatrixMode(GL_PROJECTION);
+	std::array<GLfloat, 16> ogl_stereo_transform;
+	glGetFloatv(GL_PROJECTION_MATRIX, ogl_stereo_transform.data());
+	ogl_stereo_transform[8] += stereo_transform_dxoff;
+	glLoadMatrixf(ogl_stereo_transform.data());
+	glMatrixMode(GL_MODELVIEW);
+}
+#endif
+
 void ogl_end_frame(void){
 	OGL_VIEWPORT(0, 0, grd_curscreen->get_screen_width(), grd_curscreen->get_screen_height());
 	glMatrixMode(GL_PROJECTION);
@@ -1293,7 +1390,10 @@ void ogl_end_frame(void){
 void gr_flip(void)
 {
 	if (CGameArg.DbgRenderStats)
-		ogl_texture_stats();
+	{
+		gr_set_default_canvas();
+		ogl_texture_stats(*grd_curcanv);
+	}
 
 	ogl_do_palfx();
 	ogl_swap_buffers_internal();
@@ -1318,7 +1418,7 @@ void ogl_init_pixel_buffers(unsigned w, unsigned h)
 	w = pow2ize(w);	// convert to OpenGL texture size
 	h = pow2ize(h);
 
-	texbuf = make_unique<GLubyte[]>(max(w, 1024u)*max(h, 256u)*4);	// must also fit big font texture
+	texbuf = std::make_unique<GLubyte[]>(max(w, 1024u)*max(h, 256u)*4);	// must also fit big font texture
 }
 
 void ogl_close_pixel_buffers(void)
@@ -1374,7 +1474,7 @@ static void ogl_filltexbuf(const palette_array_t &pal, const uint8_t *const data
 					case GL_RGBA:
 						(*(texp++)) = 255;
 						(*(texp++)) = 255;
-						DXX_BOOST_FALLTHROUGH;
+						[[fallthrough]];
 					case GL_LUMINANCE_ALPHA:
 						(*(texp++)) = 255;
 						(*(texp++)) = 0; // transparent pixel
@@ -1395,13 +1495,13 @@ static void ogl_filltexbuf(const palette_array_t &pal, const uint8_t *const data
 				{
 					case GL_RGBA:
 						(*(texp++))=0;
-						DXX_BOOST_FALLTHROUGH;
+						[[fallthrough]];
 					case GL_RGB:
 						(*(texp++))=0;
-						DXX_BOOST_FALLTHROUGH;
+						[[fallthrough]];
 					case GL_LUMINANCE_ALPHA:
 						(*(texp++))=0;
-						DXX_BOOST_FALLTHROUGH;
+						[[fallthrough]];
 					case GL_LUMINANCE:
 						(*(texp++))=0;//transparent pixel
 						break;
@@ -1421,7 +1521,7 @@ static void ogl_filltexbuf(const palette_array_t &pal, const uint8_t *const data
 				{
 					case GL_LUMINANCE_ALPHA:
 						(*(texp++))=255;
-						DXX_BOOST_FALLTHROUGH;
+						[[fallthrough]];
 					case GL_LUMINANCE://these could prolly be done to make the intensity based upon the intensity of the resulting color, but its not needed for anything (yet?) so no point. :)
 						(*(texp++))=255;
 						break;
@@ -1518,7 +1618,7 @@ static void tex_set_size(ogl_texture &tex)
 //In theory this could be a problem for repeating textures, but all real
 //textures (not sprites, etc) in descent are 64x64, so we are ok.
 //stores OpenGL textured id in *texid and u/v values required to get only the real data in *u/*v
-static int ogl_loadtexture(const palette_array_t &pal, const uint8_t *data, const int dxo, int dyo, ogl_texture &tex, const int bm_flags, const int data_format, int texfilt, const bool texanis, const bool edgepad)
+static int ogl_loadtexture(const palette_array_t &pal, const uint8_t *data, const int dxo, int dyo, ogl_texture &tex, const int bm_flags, const int data_format, opengl_texture_filter texfilt, const bool texanis, const bool edgepad)
 {
 	tex.tw = pow2ize (tex.w);
 	tex.th = pow2ize (tex.h);//calculate smallest texture size that can accomodate us (must be multiples of 2)
@@ -1557,7 +1657,7 @@ static int ogl_loadtexture(const palette_array_t &pal, const uint8_t *data, cons
 	}
 
 	//bleed color (rgb) into the alpha area, to deal with "dark edges problem"
-	if ((tex.format == GL_RGBA) && texfilt && edgepad && !CGameArg.OglDarkEdges)
+	if (tex.format == GL_RGBA && texfilt != opengl_texture_filter::classic && edgepad && !CGameArg.OglDarkEdges)
 	{
 		GLubyte *p = bufP;
 		GLubyte *pdone = p + (4 * tex.tw * tex.th);
@@ -1642,7 +1742,7 @@ static int ogl_loadtexture(const palette_array_t &pal, const uint8_t *data, cons
 	}
 
 	int rescale = 1;
-	if (texfilt == 1)
+	if (texfilt == opengl_texture_filter::upscale)
 	{
 		rescale = 4;
 		if ((tex.tw > 256) || (tex.th > 256))
@@ -1650,19 +1750,19 @@ static int ogl_loadtexture(const palette_array_t &pal, const uint8_t *data, cons
 			//don't scale big textures, instead "cheat" and render them as normal (nearest)
 			//these are normally 320x200 and 640x480 images.
 			//this deals with texture size limits, as well as large textures causing noticeable performance issues/hiccups.
-			texfilt = 0;
+			texfilt = opengl_texture_filter::classic;
 			rescale = 1;
 		}
 	}
-	GLubyte	*buftemp = NULL;
+	std::unique_ptr<GLubyte[]> buftemp;
 	if (rescale > 1)
 	{
 		int rebpp = 3;
 		if (tex.format == GL_RGBA) rebpp = 4;
 		if (tex.format == GL_LUMINANCE) rebpp = 1;
-		MALLOC(buftemp,GLubyte,rescale*tex.tw*rescale*tex.th*rebpp);
+		buftemp = std::make_unique<GLubyte[]>(rescale * tex.tw * rescale * tex.th * rebpp);
 		int x,y;
-		GLubyte *p = buftemp;
+		GLubyte *p = buftemp.get();
 		int len = tex.tw*rebpp*rescale;
 		int bppscale = (rebpp*rescale);
 
@@ -1684,7 +1784,7 @@ static int ogl_loadtexture(const palette_array_t &pal, const uint8_t *data, cons
 			}
 			outP += tex.tw*rebpp;
 		}
-		outP = buftemp;
+		outP = buftemp.get();
 	}
 
 	// Generate OpenGL texture IDs.
@@ -1704,7 +1804,7 @@ static int ogl_loadtexture(const palette_array_t &pal, const uint8_t *data, cons
 	switch (texfilt)
 	{
 		default:
-		case OGL_TEXFILT_CLASSIC: // Classic - Nearest
+		case opengl_texture_filter::classic: // Classic - Nearest
 			gl_mag_filter_int = GL_NEAREST;
 			if (texanis && ogl_maxanisotropy > 1.0f)
 			{
@@ -1718,8 +1818,8 @@ static int ogl_loadtexture(const palette_array_t &pal, const uint8_t *data, cons
 				buildmipmap = false;
 			}
 			break;
-		case OGL_TEXFILT_UPSCALE: // Upscaled - i.e. Blocky Filtered (Bilinear)
-		case OGL_TEXFILT_TRLINEAR: // Smooth - Trilinear
+		case opengl_texture_filter::upscale: // Upscaled - i.e. Blocky Filtered (Bilinear)
+		case opengl_texture_filter::trilinear: // Smooth - Trilinear
 			gl_mag_filter_int = GL_LINEAR;
 			gl_min_filter_int = GL_LINEAR_MIPMAP_LINEAR;
 			buildmipmap = true;
@@ -1752,13 +1852,11 @@ static int ogl_loadtexture(const palette_array_t &pal, const uint8_t *data, cons
 	}
 
 	tex_set_size(tex);
-	if (buftemp)
-		d_free(buftemp);
 	r_texcount++;
 	return 0;
 }
 
-void ogl_loadbmtexture_f(grs_bitmap &rbm, int texfilt, bool texanis, bool edgepad)
+void ogl_loadbmtexture_f(grs_bitmap &rbm, const opengl_texture_filter texfilt, bool texanis, bool edgepad)
 {
 	assert(!rbm.get_flag_mask(BM_FLAG_PAGED_OUT));
 	assert(rbm.bm_data);
@@ -1782,7 +1880,7 @@ void ogl_loadbmtexture_f(grs_bitmap &rbm, int texfilt, bool texanis, bool edgepa
 		}
 	}
 
-	array<uint8_t, 300*1024> decodebuf;
+	std::array<uint8_t, 300*1024> decodebuf;
 	if (bm->get_flag_mask(BM_FLAG_RLE))
 	{
 		class bm_rle_expand_state
@@ -1831,7 +1929,7 @@ static void ogl_freetexture(ogl_texture &gltexture)
 void ogl_freebmtexture(grs_bitmap &bm)
 {
 	if (auto &gltexture = bm.gltexture)
-		ogl_freetexture(*exchange(gltexture, nullptr));
+		ogl_freetexture(*std::exchange(gltexture, nullptr));
 }
 
 const ogl_colors::array_type ogl_colors::white = {{
@@ -1859,42 +1957,38 @@ const ogl_colors::array_type &ogl_colors::init_palette(const unsigned c)
 	return a;
 }
 
-bool ogl_ubitmapm_cs(grs_canvas &canvas, int x, int y,int dw, int dh, grs_bitmap &bm,int c, int scale) // to scale bitmaps
+bool ogl_ubitmapm_cs(grs_canvas &canvas, int x, int y,int dw, int dh, grs_bitmap &bm, int c)
 {
 	ogl_colors color;
-	return ogl_ubitmapm_cs(canvas, x, y, dw, dh, bm, color.init(c), scale);
+	return ogl_ubitmapm_cs(canvas, x, y, dw, dh, bm, color.init(c));
 }
 
 /*
  * Menu / gauges 
  */
-bool ogl_ubitmapm_cs(grs_canvas &canvas, int x, int y,int dw, int dh, grs_bitmap &bm, const ogl_colors::array_type &color_array, int scale) // to scale bitmaps
+bool ogl_ubitmapm_cs(grs_canvas &canvas, const int entry_x, const int entry_y, const int entry_dw, const int entry_dh, grs_bitmap &bm, const ogl_colors::array_type &color_array)
 {
-	GLfloat yo,xf,yf,u1,u2,v1,v2,h;
+	GLfloat u1,u2,v1,v2;
 	ogl_client_states<GLfloat, GL_VERTEX_ARRAY, GL_COLOR_ARRAY, GL_TEXTURE_COORD_ARRAY> cs;
 	auto &xo = std::get<0>(cs);
-	x += canvas.cv_bitmap.bm_x;
-	y += canvas.cv_bitmap.bm_y;
-	xo=x/static_cast<float>(last_width);
-	xf=(bm.bm_w+x)/static_cast<float>(last_width);
-	yo=1.0-y/static_cast<float>(last_height);
-	yf=1.0-(bm.bm_h+y)/static_cast<float>(last_height);
+	const int adjusted_canvas_x = entry_x + canvas.cv_bitmap.bm_x;
+	const int adjusted_canvas_y = entry_y + canvas.cv_bitmap.bm_y;
 
-	if (dw < 0)
-		dw = canvas.cv_bitmap.bm_w;
-	else if (dw == 0)
-		dw = bm.bm_w;
-	if (dh < 0)
-		dh = canvas.cv_bitmap.bm_h;
-	else if (dh == 0)
-		dh = bm.bm_h;
+	const int effective_dw = (entry_dw == opengl_bitmap_use_dst_canvas)
+		? canvas.cv_bitmap.bm_w
+		: ((entry_dw == opengl_bitmap_use_src_bitmap)
+			? bm.bm_w
+			: entry_dw);
+	const int effective_dh = (entry_dh == opengl_bitmap_use_dst_canvas)
+		? canvas.cv_bitmap.bm_h
+		: ((entry_dh == opengl_bitmap_use_src_bitmap)
+			? bm.bm_h
+			: entry_dh);
 
-	h = static_cast<double>(scale) / static_cast<double>(F1_0);
-
-	xo = x / (static_cast<double>(last_width) * h);
-	xf = (dw + x) / (static_cast<double>(last_width) * h);
-	yo = 1.0 - y / (static_cast<double>(last_height) * h);
-	yf = 1.0 - (dh + y) / (static_cast<double>(last_height) * h);
+	xo = adjusted_canvas_x / (static_cast<double>(last_width));
+	const GLfloat xf = (effective_dw + adjusted_canvas_x) / (static_cast<double>(last_width));
+	const GLfloat yo = 1.0 - adjusted_canvas_y / (static_cast<double>(last_height));
+	const GLfloat yf = 1.0 - (effective_dh + adjusted_canvas_y) / (static_cast<double>(last_height));
 
 	OGL_ENABLE(TEXTURE_2D);
 	ogl_bindbmtex(bm, 0);
@@ -1921,13 +2015,13 @@ bool ogl_ubitmapm_cs(grs_canvas &canvas, int x, int y,int dw, int dh, grs_bitmap
 		v2=(bm.bm_h+bm.bm_y)/static_cast<float>(bm.gltexture->th);
 	}
 
-	const array<GLfloat, 8> vertices{{
+	const std::array<GLfloat, 8> vertices{{
 		xo, yo,
 		xf, yo,
 		xf, yf,
 		xo, yf,
 	}};
-	const array<GLfloat, 8> texcoord_array{{
+	const std::array<GLfloat, 8> texcoord_array{{
 		u1, v1,
 		u2, v1,
 		u2, v2,

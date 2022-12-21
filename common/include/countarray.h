@@ -11,7 +11,7 @@
 #include <memory>
 #include <stdexcept>
 #include "dxxsconf.h"
-#include "compiler-array.h"
+#include <array>
 
 template <typename T = unsigned>
 class base_count_array_t
@@ -19,18 +19,17 @@ class base_count_array_t
 protected:
 	typedef T size_type;
 	void clear() { m_count = 0; }
-	size_type m_count;
+	size_type m_count = 0;
 public:
 	size_type size() const { return m_count; }
 	bool empty() const { return !m_count; }
-	base_count_array_t() : m_count(0) {}
 };
 
 template <typename T, std::size_t S>
 class count_array_t : public base_count_array_t<>
 {
 public:
-	typedef array<T, S> array_type;
+	using array_type = std::array<T, S>;
 	typedef typename array_type::value_type value_type;
 	typedef typename array_type::iterator iterator;
 	typedef typename array_type::const_iterator const_iterator;

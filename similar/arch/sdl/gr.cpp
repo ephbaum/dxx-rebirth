@@ -29,7 +29,9 @@
 #include "config.h"
 #include "palette.h"
 
-#include "compiler-make_unique.h"
+#include "compiler-range_for.h"
+#include "d_range.h"
+#include <memory>
 
 using std::min;
 
@@ -41,18 +43,12 @@ static int gr_installed;
 
 void gr_flip()
 {
-	SDL_Rect src, dest;
-
-	dest.x = src.x = dest.y = src.y = 0;
-	dest.w = src.w = canvas->w;
-	dest.h = src.h = canvas->h;
-
-	SDL_BlitSurface(canvas, &src, screen, &dest);
+	SDL_BlitSurface(canvas, nullptr, screen, nullptr);
 	SDL_Flip(screen);
 }
 
 // returns possible (fullscreen) resolutions if any.
-uint_fast32_t gr_list_modes(array<screen_mode, 50> &gsmodes)
+uint_fast32_t gr_list_modes(std::array<screen_mode, 50> &gsmodes)
 {
 	SDL_Rect** modes;
 	int modesnum = 0;
@@ -127,6 +123,7 @@ int gr_set_mode(screen_mode mode)
 	}
 
 	*grd_curscreen = {};
+	grd_curscreen->sdl_surface = RAII_SDL_Surface(canvas);
 	grd_curscreen->set_screen_width_height(w, h);
 	grd_curscreen->sc_aspect = fixdiv(grd_curscreen->get_screen_width() * GameCfg.AspectX, grd_curscreen->get_screen_height() * GameCfg.AspectY);
 	gr_init_canvas(grd_curscreen->sc_canvas, reinterpret_cast<unsigned char *>(canvas->pixels), bm_mode::linear, w, h);
@@ -174,8 +171,7 @@ int gr_init()
 		Error("SDL library video initialisation failed: %s.",SDL_GetError());
 	}
 
-	grd_curscreen = make_unique<grs_screen>();
-	*grd_curscreen = {};
+	grd_curscreen = std::make_unique<grs_screen>();
 
 	if (!CGameCfg.WindowMode && !CGameArg.SysWindow)
 		sdl_video_flags|=SDL_FULLSCREEN;
@@ -208,7 +204,6 @@ void gr_close()
 		gr_installed = 0;
 		grd_curscreen.reset();
 		SDL_ShowCursor(1);
-		SDL_FreeSurface(canvas);
 	}
 }
 
@@ -236,7 +231,7 @@ void gr_palette_step_up( int r, int g, int b )
 	if (palette == NULL)
 		return; // Display is not palettised
 
-	array<SDL_Color, 256> colors{};
+	std::array<SDL_Color, 256> colors{};
 	range_for (const int i, xrange(256u))
 	{
 		const auto ir = static_cast<int>(p[i].r) + r + gr_palette_gamma;
@@ -252,7 +247,7 @@ void gr_palette_step_up( int r, int g, int b )
 void gr_palette_load( palette_array_t &pal )
 {
 	SDL_Palette *palette;
-	array<uint8_t, 64> gamma;
+	std::array<uint8_t, 64> gamma;
 
 	if (pal != gr_current_pal)
 		SDL_FillRect(canvas, NULL, SDL_MapRGB(canvas->format, 0, 0, 0));
@@ -270,12 +265,11 @@ void gr_palette_load( palette_array_t &pal )
 	range_for (const int i, xrange(64u))
 		gamma[i] = static_cast<int>((pow((static_cast<double>(14)/static_cast<double>(32)), 1.0)*i) + 0.5);
 
-	array<SDL_Color, 256> colors{};
+	std::array<SDL_Color, 256> colors{};
 	for (int i = 0, j = 0; j < 256; j++)
 	{
-		int c;
-		c = gr_find_closest_color(gamma[gr_palette[j].r],gamma[gr_palette[j].g],gamma[gr_palette[j].b]);
-		gr_fade_table[14][j] = c;
+		const auto c = gr_find_closest_color(gamma[gr_palette[j].r], gamma[gr_palette[j].g], gamma[gr_palette[j].b]);
+		gr_fade_table[(gr_fade_level{14})][j] = c;
 		colors[j].r = (min(gr_current_pal[i].r + gr_palette_gamma, 63)) * 4;
 		colors[j].g = (min(gr_current_pal[i].g + gr_palette_gamma, 63)) * 4;
 		colors[j].b = (min(gr_current_pal[i].b + gr_palette_gamma, 63)) * 4;
@@ -283,7 +277,7 @@ void gr_palette_load( palette_array_t &pal )
 	}
 
 	SDL_SetColors(canvas, colors.data(), 0, colors.size());
-	init_computed_colors();
+	reset_computed_colors();
 	gr_remap_color_fonts();
 }
 

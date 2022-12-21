@@ -32,8 +32,7 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "args.h"
 #include "console.h"
 #include "u_mem.h"
-
-#include "compiler-array.h"
+#include <array>
 
 namespace dcx {
 
@@ -48,12 +47,12 @@ namespace dcx {
 
 #define MAX_INDEX 10000
 
-static array<void *, MAX_INDEX> MallocBase;
-static array<unsigned int, MAX_INDEX> MallocSize;
-static array<unsigned char, MAX_INDEX> Present;
-static array<const char *, MAX_INDEX> Filename;
-static array<const char *, MAX_INDEX> Varname;
-static array<int, MAX_INDEX> LineNum;
+static std::array<void *, MAX_INDEX> MallocBase;
+static std::array<unsigned int, MAX_INDEX> MallocSize;
+static std::array<unsigned char, MAX_INDEX> Present;
+static std::array<const char *, MAX_INDEX> Filename;
+static std::array<const char *, MAX_INDEX> Varname;
+static std::array<int, MAX_INDEX> LineNum;
 static int BytesMalloced = 0;
 
 static int free_list[MAX_INDEX];

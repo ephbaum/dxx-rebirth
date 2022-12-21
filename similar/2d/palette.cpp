@@ -32,42 +32,70 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "pstypes.h"
 #include "u_mem.h"
 #include "gr.h"
-#include "grdef.h"
 #include "dxxerror.h"
 #include "maths.h"
 #include "palette.h"
 
+#include "d_enumerate.h"
 #include "dxxsconf.h"
 #include "dsx-ns.h"
-#include "compiler-array.h"
 #include "compiler-range_for.h"
+#include <array>
 
 namespace dcx {
 
-#define SQUARE(x) ((x)*(x))
+namespace {
 
-#define	MAX_COMPUTED_COLORS	32
+unsigned get_squared_color_delta(const int r, const int g, const int b, const rgb_t &rgb)
+{
+	const auto dr = r - rgb.r;
+	const auto dg = g - rgb.g;
+	const auto db = b - rgb.b;
+	return (dr * dr) + (dg * dg) + (db * db);
+}
+
+color_palette_index gr_find_closest_color_palette(const int r, const int g, const int b, const palette_array_t &palette)
+{
+	// Anything is better than this.
+	unsigned best_value = UINT_MAX;
+	color_palette_index best_index{};
+	// only go to 255, 'cause we dont want to check the transparent color.
+	for (auto &&[candidate_idx, candidate_rgb] : enumerate(unchecked_partial_range(palette, palette.size() - 1)))
+	{
+		const auto candidate_value = get_squared_color_delta(r, g, b, candidate_rgb);
+		if (best_value > candidate_value)
+		{
+			best_index = candidate_idx;
+			if (candidate_value == 0)
+				/* Perfect match */
+				break;
+			best_value = candidate_value;
+		}
+	}
+	return best_index;
+}
 
 static unsigned Num_computed_colors;
 
 struct color_record {
-	ubyte	r,g,b;
-	color_t color_num;
+	uint8_t r, g, b;
+	color_palette_index color_num;
 };
 
-static array<color_record, MAX_COMPUTED_COLORS> Computed_colors;
+uint8_t gr_palette_gamma_param;
+
+}
 
 palette_array_t gr_palette;
 palette_array_t gr_current_pal;
 gft_array1 gr_fade_table;
 
 ubyte gr_palette_gamma = 0;
-int gr_palette_gamma_param = 0;
 
 void copy_bound_palette(palette_array_t &d, const palette_array_t &s)
 {
 	auto a = [](rgb_t c) {
-		const ubyte bound = 63;
+		constexpr uint8_t bound{63};
 		c.r = std::min(c.r, bound);
 		c.g = std::min(c.g, bound);
 		c.b = std::min(c.b, bound);
@@ -76,25 +104,19 @@ void copy_bound_palette(palette_array_t &d, const palette_array_t &s)
 	std::transform(s.begin(), s.end(), d.begin(), a);
 }
 
-void copy_diminish_palette(palette_array_t &palette, const ubyte *p)
-{
-	range_for (auto &i, palette)
-	{
-		i.r = *p++ >> 2;
-		i.g = *p++ >> 2;
-		i.b = *p++ >> 2;
-	}
-}
-
 }
 
 namespace dcx {
+
+namespace {
 
 static void diminish_entry(rgb_t &c)
 {
 	c.r >>= 2;
 	c.g >>= 2;
 	c.b >>= 2; 
+}
+
 }
 
 void diminish_palette(palette_array_t &palette)
@@ -137,21 +159,22 @@ void gr_use_palette_table(const char * filename )
 {
 	int fsize;
 
-	auto fp = PHYSFSX_openReadBuffered(filename);
+	auto &&[fp, physfserr] = PHYSFSX_openReadBuffered(filename);
+	if (!fp)
+	{
 #if defined(DXX_BUILD_DESCENT_I)
-#define FAILURE_FORMAT	"Can't open palette file <%s>"
+		Error("Failed to open palette file <%s>: %s", filename, PHYSFS_getErrorByCode(physfserr));
 #elif defined(DXX_BUILD_DESCENT_II)
-#define FAILURE_FORMAT	"Can open neither palette file <%s> nor default palette file <" DEFAULT_LEVEL_PALETTE ">"
 	// the following is a hack to enable the loading of d2 levels
 	// even if only the d2 mac shareware datafiles are present.
 	// However, if the pig file is present but the palette file isn't,
 	// the textures in the level will look wierd...
-	if (!fp)
-		fp = PHYSFSX_openReadBuffered( DEFAULT_LEVEL_PALETTE );
+		auto &&[fp2, physfserr2] = PHYSFSX_openReadBuffered(DEFAULT_LEVEL_PALETTE);
+		if (!fp)
+			Error("Failed to open both palette file <%s> and default palette file <" DEFAULT_LEVEL_PALETTE ">: (\"%s\", \"%s\")", filename, PHYSFS_getErrorByCode(physfserr), PHYSFS_getErrorByCode(physfserr2));
+		fp = std::move(fp2);
 #endif
-	if (!fp)
-		Error(FAILURE_FORMAT,
-		      filename);
+	}
 
 	fsize	= PHYSFS_fileLength( fp );
 	Assert( fsize == 9472 );
@@ -189,114 +212,50 @@ void gr_use_palette_table(const char * filename )
 
 namespace dcx {
 
-//	Add a computed color (by gr_find_closest_color) to list of computed colors in Computed_colors.
-//	If list wasn't full already, increment Num_computed_colors.
-//	If was full, replace a random one.
-static void add_computed_color(int r, int g, int b, color_t color_num)
+void reset_computed_colors()
 {
-	int	add_index;
-
-	if (Num_computed_colors < MAX_COMPUTED_COLORS) {
-		add_index = Num_computed_colors;
-		Num_computed_colors++;
-	} else
-		add_index = (d_rand() * MAX_COMPUTED_COLORS) >> 15;
-
-	Computed_colors[add_index].r = r;
-	Computed_colors[add_index].g = g;
-	Computed_colors[add_index].b = b;
-	Computed_colors[add_index].color_num = color_num;
+	Num_computed_colors = 0;
 }
 
-void init_computed_colors(void)
+color_palette_index gr_find_closest_color(const int r, const int g, const int b)
 {
-	range_for (auto &i, Computed_colors)
-		i.r = 255;		//	Make impossible to match.
-}
-
-color_t gr_find_closest_color( int r, int g, int b )
-{
-	int j;
-	int best_value, value;
-
-	if (Num_computed_colors == 0)
-		init_computed_colors();
-
+	static std::array<color_record, 32> Computed_colors;
+	const auto num_computed_colors = Num_computed_colors;
 	//	If we've already computed this color, return it!
-	for (unsigned i=0; i<Num_computed_colors; i++)
+	for (unsigned i = 0; i < num_computed_colors; ++i)
 	{
 		auto &c = Computed_colors[i];
 		if (r == c.r && g == c.g && b == c.b)
 		{
 			const auto color_num = c.color_num;
-					if (i > 4) {
+			if (i)
+			{
 						std::swap(Computed_colors[i-1], c);
 					}
 					return color_num;
 				}
 	}
-
-//	r &= 63;
-//	g &= 63;
-//	b &= 63;
-
-	best_value = SQUARE(r-gr_palette[0].r)+SQUARE(g-gr_palette[0].g)+SQUARE(b-gr_palette[0].b);
-	color_t best_index = 0;
-	if (best_value==0) {
-		add_computed_color(r, g, b, best_index);
- 		return best_index;
-	}
-	j=0;
-	// only go to 255, 'cause we dont want to check the transparent color.
-	for (color_t i=1; i < 254; i++ )	{
-		++j;
-		value = SQUARE(r-gr_palette[j].r)+SQUARE(g-gr_palette[j].g)+SQUARE(b-gr_palette[j].b);
-		if ( value < best_value )	{
-			if (value==0) {
-				add_computed_color(r, g, b, i);
-				return i;
-			}
-			best_value = value;
-			best_index = i;
-		}
-	}
-	add_computed_color(r, g, b, best_index);
-	return best_index;
+//	Add a computed color to list of computed colors in Computed_colors.
+//	If list wasn't full already, increment Num_computed_colors.
+//	If was full, replace the last one.  Rely on the bubble-up logic
+//	above to move popular entries away from the end.
+	auto &cc = (num_computed_colors < Computed_colors.size())
+		? Computed_colors[Num_computed_colors++]
+		: Computed_colors.back();
+	cc.r = r;
+	cc.g = g;
+	cc.b = b;
+	return cc.color_num = gr_find_closest_color_palette(r, g, b, gr_palette);
 }
 
-int gr_find_closest_color_15bpp( int rgb )
+color_palette_index gr_find_closest_color_15bpp( int rgb )
 {
 	return gr_find_closest_color( ((rgb>>10)&31)*2, ((rgb>>5)&31)*2, (rgb&31)*2 );
 }
 
-
-color_t gr_find_closest_color_current( int r, int g, int b )
+color_palette_index gr_find_closest_color_current(const int r, const int g, const int b)
 {
-	int j;
-	int best_value, value;
-
-//	r &= 63;
-//	g &= 63;
-//	b &= 63;
-
-	best_value = SQUARE(r-gr_current_pal[0].r)+SQUARE(g-gr_current_pal[0].g)+SQUARE(b-gr_current_pal[0].b);
-	color_t best_index = 0;
-	if (best_value==0)
- 		return best_index;
-
-	j=0;
-	// only go to 255, 'cause we dont want to check the transparent color.
-	for (color_t i=1; i < 254; i++ )	{
-		++j;
-		value = SQUARE(r-gr_current_pal[j].r)+SQUARE(g-gr_current_pal[j].g)+SQUARE(b-gr_current_pal[j].b);
-		if ( value < best_value )	{
-			if (value==0)
-				return i;
-			best_value = value;
-			best_index = i;
-		}
-	}
-	return best_index;
+	return gr_find_closest_color_palette(r, g, b, gr_current_pal);
 }
 
 }

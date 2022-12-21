@@ -29,10 +29,8 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include <string.h>
 #include <ctype.h>
 #include <stdarg.h>
-#include "inferno.h"
 #include "vecmat.h"
 #include "gr.h"
-#include "key.h"
 #include "editor.h"
 #include "editor/esegment.h"
 #include "gameseg.h"
@@ -46,9 +44,9 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 static imsegptridx_t OriginalSeg = segment_none;
 static imsegptridx_t OriginalMarkedSeg = segment_none;
-static int OriginalSide;
-static int OriginalMarkedSide;
-static array<segment *, MAX_SEGMENTS> CurveSegs;
+static sidenum_t OriginalSide;
+static sidenum_t OriginalMarkedSide;
+static std::array<segment *, MAX_SEGMENTS> CurveSegs;
 static unsigned CurveNumSegs;
 
 static void generate_banked_curve(fix maxscale, vms_equation coeffs);
@@ -132,7 +130,10 @@ void plot_parametric(vms_equation *coeffs, fix min_t, fix max_t, fix del_t) {
 static vms_vector p1, p4, r1, r4;
 static vms_vector r4t, r1save;
 
-int generate_curve( fix r1scale, fix r4scale ) {
+int generate_curve(const fix r1scale, const fix r4scale)
+{
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
     vms_vector vec_dir, tvec;
     vms_vector coord,prev_point;
     vms_equation coeffs;
@@ -141,64 +142,63 @@ int generate_curve( fix r1scale, fix r4scale ) {
     fix t, maxscale;
     fixang rangle, uangle;
 
-	const vcsegptr_t cursegp = Cursegp;
-	auto &Vertices = LevelSharedVertexState.get_vertices();
+	const shared_segment &cursegp = Cursegp;
 	auto &vcvertptr = Vertices.vcptr;
 	compute_center_point_on_side(vcvertptr, p1, cursegp, Curside);
 
     switch( Curside ) {
-        case WLEFT:
+		case sidenum_t::WLEFT:
             extract_right_vector_from_segment(vcvertptr, cursegp, r1);
             vm_vec_scale(r1, -F1_0 );
             break;
-        case WTOP:
+		case sidenum_t::WTOP:
             extract_up_vector_from_segment(vcvertptr, cursegp, r1);
             break;
-        case WRIGHT:
+		case sidenum_t::WRIGHT:
             extract_right_vector_from_segment(vcvertptr, cursegp, r1);
             break;
-        case WBOTTOM:
+		case sidenum_t::WBOTTOM:
             extract_up_vector_from_segment(vcvertptr, cursegp, r1);
             vm_vec_scale(r1, -F1_0 );
             break;
-        case WBACK:
+		case sidenum_t::WBACK:
             extract_forward_vector_from_segment(vcvertptr, cursegp, r1);
             break;
-        case WFRONT:
+		case sidenum_t::WFRONT:
             extract_forward_vector_from_segment(vcvertptr, cursegp, r1);
             vm_vec_scale(r1, -F1_0 );
             break;
         }            
 
-	const vcsegptr_t markedsegp = Markedsegp;
+	const shared_segment &markedsegp = Markedsegp;
 	compute_center_point_on_side(vcvertptr, p4, markedsegp, Markedside);
 
     switch( Markedside ) {
-        case WLEFT:
+		case sidenum_t::WLEFT:
             extract_right_vector_from_segment(vcvertptr, markedsegp, r4);
             extract_up_vector_from_segment(vcvertptr, markedsegp, r4t);
             break;
-        case WTOP:
+		case sidenum_t::WTOP:
             extract_up_vector_from_segment(vcvertptr, markedsegp, r4);
             vm_vec_scale(r4, -F1_0 );
             extract_forward_vector_from_segment(vcvertptr, markedsegp, r4t);
             vm_vec_scale(r4t, -F1_0 );
             break;
-        case WRIGHT:
+		case sidenum_t::WRIGHT:
             extract_right_vector_from_segment(vcvertptr, markedsegp, r4);
             vm_vec_scale(r4, -F1_0 );
             extract_up_vector_from_segment(vcvertptr, markedsegp, r4t);
             break;
-        case WBOTTOM:
+		case sidenum_t::WBOTTOM:
             extract_up_vector_from_segment(vcvertptr, markedsegp, r4);
             extract_forward_vector_from_segment(vcvertptr, markedsegp, r4t);
             break;
-        case WBACK:
+		case sidenum_t::WBACK:
             extract_forward_vector_from_segment(vcvertptr, markedsegp, r4);
             vm_vec_scale(r4, -F1_0 );
             extract_up_vector_from_segment(vcvertptr, markedsegp, r4t);
             break;
-        case WFRONT:
+		case sidenum_t::WFRONT:
             extract_forward_vector_from_segment(vcvertptr, markedsegp, r4);
             extract_up_vector_from_segment(vcvertptr, markedsegp, r4t);
             break;
@@ -269,7 +269,7 @@ int generate_curve( fix r1scale, fix r4scale ) {
 
     if (CurveNumSegs) {
         med_form_bridge_segment( Cursegp, Side_opposite[AttachSide], Markedsegp, Markedside );
-        CurveSegs[CurveNumSegs] = vmsegptr(Markedsegp->children[Markedside]);
+        CurveSegs[CurveNumSegs] = vmsegptr(Markedsegp->shared_segment::children[Markedside]);
         CurveNumSegs++;
 	}
 
@@ -284,14 +284,17 @@ int generate_curve( fix r1scale, fix r4scale ) {
         else return 0;
 }
 
-static inline vms_matrix vm_vec_ang_2_matrix (const vms_vector &v, fixang a) __attribute_warn_unused_result;
+[[nodiscard]]
 static inline vms_matrix vm_vec_ang_2_matrix (const vms_vector &v, fixang a)
 {
 	vms_matrix m;
 	return vm_vec_ang_2_matrix(m, v, a), m;
 }
 
-void generate_banked_curve(fix maxscale, vms_equation coeffs) {
+void generate_banked_curve(const fix maxscale, vms_equation coeffs)
+{
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
     vms_vector vec_dir, tvec, b4r4t;
     vms_vector coord,prev_point;
     fix enddist, nextdist;
@@ -301,8 +304,7 @@ void generate_banked_curve(fix maxscale, vms_equation coeffs) {
 
     if (CurveNumSegs) {
 
-		const vcsegptr_t cursegp = Cursegp;
-		auto &Vertices = LevelSharedVertexState.get_vertices();
+		const shared_segment &cursegp = Cursegp;
 		auto &vcvertptr = Vertices.vcptr;
 		extract_up_vector_from_segment(vcvertptr, cursegp, b4r4t);
     uangle = vm_vec_delta_ang( b4r4t, r4t, r4 );
@@ -368,7 +370,7 @@ void generate_banked_curve(fix maxscale, vms_equation coeffs) {
 void delete_curve() {
 	range_for (auto &i, partial_const_range(CurveSegs, CurveNumSegs))
 	{
-        if (i->segnum != segment_none)
+        if (i->shared_segment::segnum != segment_none)
 			med_delete_segment(vmsegptridx(i));
     }
     Markedsegp = OriginalMarkedSeg;

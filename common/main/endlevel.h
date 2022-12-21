@@ -25,10 +25,10 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #pragma once
 
-#ifdef __cplusplus
 #include <array>
 #include "vecmat.h"
 #include "fwd-segment.h"
+#include "fwd-robot.h"
 #include "gr.h"
 #include "fwd-window.h"
 
@@ -40,40 +40,28 @@ struct d_unique_endlevel_state
 	starfield_type stars;
 };
 
-}
-
+extern grs_bitmap *terrain_bitmap;  //*satellite_bitmap,*station_bitmap,
+extern polygon_model_index exit_modelnum, destroyed_exit_modelnum;
 extern int Endlevel_sequence;
-#ifdef dsx
-namespace dsx {
-window_event_result do_endlevel_frame();
-}
-#endif
-window_event_result stop_endlevel_sequence();
-#ifdef dsx
-namespace dsx {
-window_event_result start_endlevel_sequence();
-}
-#endif
-void render_endlevel_frame(grs_canvas &, fix eye_offset);
+extern vms_matrix surface_orient;
 
-void draw_exit_model(grs_canvas &);
 void free_endlevel_data();
 
-extern grs_bitmap *terrain_bitmap;  //*satellite_bitmap,*station_bitmap,
-extern segnum_t exit_segnum;
+}
+
+#ifdef dsx
+namespace dsx {
+window_event_result do_endlevel_frame(const d_level_shared_robot_info_state &LevelSharedRobotInfoState);
+window_event_result stop_endlevel_sequence();
+window_event_result start_endlevel_sequence();
+void render_endlevel_frame(grs_canvas &, fix eye_offset);
 
 //@@extern vms_vector mine_exit_point;
 //@@extern object external_explosion;
 //@@extern int ext_expl_playing;
 
 //called for each level to load & setup the exit sequence
-#ifdef dsx
-namespace dsx {
 void load_endlevel_data(int level_num);
 
 }
-#endif
-extern unsigned exit_modelnum, destroyed_exit_modelnum;
-extern vms_matrix surface_orient;
-
 #endif

@@ -44,6 +44,9 @@ char copyright[] = "DESCENT II  COPYRIGHT (C) 1994-1996 PARALLAX SOFTWARE CORPOR
 #include <string.h>
 #include <limits.h>
 #include <SDL.h>
+#if DXX_USE_SCREENSHOT_FORMAT_PNG
+#include <png.h>
+#endif
 
 #ifdef __unix__
 #include <unistd.h>
@@ -58,7 +61,6 @@ char copyright[] = "DESCENT II  COPYRIGHT (C) 1994-1996 PARALLAX SOFTWARE CORPOR
 #include "console.h"
 #include "gr.h"
 #include "key.h"
-#include "3d.h"
 #include "bm.h"
 #include "inferno.h"
 #include "dxxerror.h"
@@ -66,7 +68,6 @@ char copyright[] = "DESCENT II  COPYRIGHT (C) 1994-1996 PARALLAX SOFTWARE CORPOR
 #include "game.h"
 #include "u_mem.h"
 #include "screens.h"
-#include "texmap.h"
 #include "texmerge.h"
 #include "menu.h"
 #include "digi.h"
@@ -74,24 +75,22 @@ char copyright[] = "DESCENT II  COPYRIGHT (C) 1994-1996 PARALLAX SOFTWARE CORPOR
 #include "args.h"
 #include "titles.h"
 #include "text.h"
-#include "gauges.h"
 #include "gamefont.h"
 #include "kconfig.h"
 #include "newmenu.h"
 #include "config.h"
 #include "multi.h"
-#include "songs.h"
 #include "gameseq.h"
 #if defined(DXX_BUILD_DESCENT_II)
 #include "gamepal.h"
 #include "movie.h"
 #endif
 #include "playsave.h"
-#include "collide.h"
 #include "newdemo.h"
 #include "joy.h"
 #if !DXX_USE_OGL
 #include "../texmap/scanline.h" //for select_tmap -MM
+#include "texmap.h"
 #endif
 #include "event.h"
 #include "rbaudio.h"
@@ -101,7 +100,6 @@ char copyright[] = "DESCENT II  COPYRIGHT (C) 1994-1996 PARALLAX SOFTWARE CORPOR
 #if DXX_USE_EDITOR
 #include "messagebox.h"
 #include "editor/editor.h"
-#include "editor/kdefs.h"
 #include "ui.h"
 #endif
 #include "vers_id.h"
@@ -109,8 +107,10 @@ char copyright[] = "DESCENT II  COPYRIGHT (C) 1994-1996 PARALLAX SOFTWARE CORPOR
 #include "net_udp.h"
 #endif
 #include "dsx-ns.h"
-#include "compiler-begin.h"
 
+#if DXX_USE_SDLIMAGE
+#include <SDL_image.h>
+#endif
 #if DXX_USE_SDLMIXER
 #include <SDL_mixer.h>
 #endif
@@ -120,9 +120,11 @@ namespace dsx {
 int Screen_mode=-1;					//game screen or editor screen?
 
 #if defined(DXX_BUILD_DESCENT_I)
-int HiresGFXAvailable = 0;
+uint8_t HiresGFXAvailable;
 int MacHog = 0;	// using a Mac hogfile?
 #endif
+
+namespace {
 
 //read help from a file & print to screen
 static void print_commandline_help()
@@ -132,9 +134,19 @@ static void print_commandline_help()
 
 #define DXX_if_defined_placeholder1	,
 #define DXX_if_defined_unwrap(A,...)	A, ## __VA_ARGS__
+	/* If the parameter V, after macro expansion, evaluates to `1`, then
+	 * expand to the parameter F.  Otherwise, expand to nothing.
+	 */
 #define DXX_if_defined(V,F)	DXX_if_defined2(V,F)
+	/* If the parameter V, after macro expansion, evaluates to anything
+	 * other than `1`, then expand to the parameter F.  Otherwise,
+	 * expand to nothing.
+	 */
+#define DXX_if_not_defined_to_1(V,F)	DXX_if_not_defined_to_1_2(V,F)
 #define DXX_if_defined2(V,F)	DXX_if_defined3(DXX_if_defined_placeholder##V, F)
+#define DXX_if_not_defined_to_1_2(V,F)	DXX_if_not_defined_to_1_3(DXX_if_defined_placeholder##V, F)
 #define DXX_if_defined3(V,F)	DXX_if_defined4(F, V 1, 0)
+#define DXX_if_not_defined_to_1_3(V,F)	DXX_if_defined4(F, V 0, 1)
 #define DXX_if_defined4(F,_,V,...)	DXX_if_defined5_##V(F)
 #define DXX_if_defined5_0(F)
 #define DXX_if_defined5_1(F)	DXX_if_defined_unwrap F
@@ -208,6 +220,14 @@ static void print_commandline_help()
 		VERB("                                    5: Auto: if VSync is enabled and ARB_sync is supported, use mode 2, otherwise mode 0\n")	\
 		VERB("  -gl_syncwait <n>              Wait interval (ms) for sync mode 2 (default: " DXX_STRINGIZE(OGL_SYNC_WAIT_DEFAULT) ")\n")	\
 		VERB("  -gl_darkedges                 Re-enable dark edges around filtered textures (as present in earlier versions of the engine)\n")	\
+		DXX_if_defined_01(DXX_USE_STEREOSCOPIC_RENDER, (	\
+		VERB("  -gl_stereo                    Enable OpenGL stereo quad buffering, if available\n")	\
+		VERB("  -gl_stereoview <n>            Select OpenGL stereo viewport mode (experimental; incomplete)\n")	\
+		VERB("                                    1: above/below half-height format\n")	\
+		VERB("                                    2: side/by/side half-width format\n")	\
+		VERB("                                    3: side/by/side half-size format, normal aspect ratio\n") \
+		VERB("                                    4: above/below format with external sync blank interval\n")	\
+		))	\
 	)	\
 	DXX_if_defined_01(DXX_USE_UDP, (	\
 		VERB("\n Multiplayer:\n\n")	\
@@ -263,6 +283,8 @@ static void print_commandline_help()
 	printf(DXX_COMMAND_LINE_HELP(DXX_COMMAND_LINE_HELP_FMT) DXX_COMMAND_LINE_HELP(DXX_COMMAND_LINE_HELP_ARG));
 }
 
+}
+
 int Quitting = 0;
 
 }
@@ -282,9 +304,8 @@ window_event_result standard_handler(const d_event &event)
 	
 		if (wind == Game_wind)
 		{
-			int choice;
 			Quitting = 0;
-			choice=nm_messagebox( NULL, 2, TXT_YES, TXT_NO, TXT_ABORT_GAME );
+			const auto choice = nm_messagebox_str(menu_title{nullptr}, nm_messagebox_tie(TXT_YES, TXT_NO), menu_subtitle{TXT_ABORT_GAME});
 			if (choice != 0)
 				return window_event_result::handled;	// aborted quitting
 			else
@@ -333,7 +354,7 @@ window_event_result standard_handler(const d_event &event)
 				case KEY_ALTED+KEY_ENTER:
 				case KEY_ALTED+KEY_PADENTER:
 					if (Game_wind)
-						if (Game_wind == window_get_front())
+						if (window_get_front() == Game_wind)
 							return window_event_result::ignored;
 					gr_toggle_fullscreen();
 #if SDL_MAJOR_VERSION == 2
@@ -371,7 +392,7 @@ window_event_result standard_handler(const d_event &event)
 					return window_event_result::handled;
 #endif
 				case KEY_SHIFTED + KEY_ESC:
-					con_showup();
+					con_showup(Controls);
 					return window_event_result::handled;
 			}
 			break;
@@ -398,6 +419,29 @@ window_event_result standard_handler(const d_event &event)
 	return window_event_result::ignored;
 }
 
+#if DXX_HAVE_POISON
+d_interface_unique_state::d_interface_unique_state()
+{
+	DXX_MAKE_VAR_UNDEFINED(PilotName);
+}
+#endif
+
+void d_interface_unique_state::update_window_title()
+{
+#if SDL_MAJOR_VERSION == 1
+	if (!PilotName[0u])
+		SDL_WM_SetCaption(DESCENT_VERSION, DXX_SDL_WINDOW_CAPTION);
+	else
+	{
+		const char *const pilot = PilotName;
+		std::array<char, 80> wm_caption_name, wm_caption_iconname;
+		snprintf(wm_caption_name.data(), wm_caption_name.size(), "%s: %s", DESCENT_VERSION, pilot);
+		snprintf(wm_caption_iconname.data(), wm_caption_iconname.size(), "%s: %s", DXX_SDL_WINDOW_CAPTION, pilot);
+		SDL_WM_SetCaption(wm_caption_name.data(), wm_caption_iconname.data());
+	}
+#endif
+}
+
 }
 
 namespace dsx {
@@ -406,12 +450,14 @@ namespace dsx {
 #define DXX_RENAME_IDENTIFIER2(I,N)	I##$##N
 #define DXX_RENAME_IDENTIFIER(I,N)	DXX_RENAME_IDENTIFIER2(I,N)
 #define argc	DXX_RENAME_IDENTIFIER(argc_gc, DXX_git_commit)
-#define argv	DXX_RENAME_IDENTIFIER(argv_gd, DXX_git_describe)
+#define argv	DXX_RENAME_IDENTIFIER(argv_gd$b32, DXX_git_describe)
 
 //	DESCENT by Parallax Software
 //	DESCENT II by Parallax Software
 //	(varies based on preprocessor options)
 //		Descent Main
+
+namespace {
 
 static int main(int argc, char *argv[])
 {
@@ -439,14 +485,15 @@ static int main(int argc, char *argv[])
 		return(0);
 
 #if defined(DXX_BUILD_DESCENT_I)
-	if (! PHYSFSX_contfile_init("descent.hog", 1))
+	const auto descent_hog = make_PHYSFSX_ComputedPathMount("descent.hog", physfs_search_path::append);
 #define DXX_NAME_NUMBER	"1"
 #define DXX_HOGFILE_NAMES	"descent.hog"
 #elif defined(DXX_BUILD_DESCENT_II)
-	if (! PHYSFSX_contfile_init("descent2.hog", 1) && ! PHYSFSX_contfile_init("d2demo.hog", 1))
+	const auto descent_hog = make_PHYSFSX_ComputedPathMount("descent2.hog", "d2demo.hog", physfs_search_path::append);
 #define DXX_NAME_NUMBER	"2"
 #define DXX_HOGFILE_NAMES	"descent2.hog or d2demo.hog"
 #endif
+	if (!descent_hog)
 	{
 #if defined(__unix__) && !defined(__APPLE__)
 #define DXX_HOGFILE_PROGRAM_DATA_DIRECTORY	\
@@ -458,6 +505,9 @@ static int main(int argc, char *argv[])
 #else
 #define DXX_HOGFILE_SHAREPATH_INDENTED
 #endif
+#elif (defined(__APPLE__) && defined(__MACH__))
+#define DXX_HOGFILE_PROGRAM_DATA_DIRECTORY	\
+			      "\t~/Library/Preferences/D" DXX_NAME_NUMBER "X Rebirth\n"
 #else
 #define DXX_HOGFILE_PROGRAM_DATA_DIRECTORY	\
 				  "\tDirectory containing D" DXX_NAME_NUMBER "X\n"
@@ -471,7 +521,7 @@ static int main(int argc, char *argv[])
 #define DXX_MISSING_HOGFILE_ERROR_TEXT	\
 		"Could not find a valid hog file (" DXX_HOGFILE_NAMES ")\nPossible locations are:\n"	\
 		DXX_HOGFILE_PROGRAM_DATA_DIRECTORY	\
-		"\tIn a subdirectory called 'Data'\n"	\
+		"\tIn a subdirectory called 'data'\n"	\
 		DXX_HOGFILE_APPLICATION_BUNDLE	\
 		"Or use the -hogdir option to specify an alternate location."
 		UserError(DXX_MISSING_HOGFILE_ERROR_TEXT);
@@ -493,12 +543,14 @@ static int main(int argc, char *argv[])
 #if defined(DXX_BUILD_DESCENT_I)
 	con_printf(CON_NORMAL, "%s  %s", DESCENT_VERSION, g_descent_build_datetime); // D1X version
 	con_puts(CON_NORMAL, "This is a MODIFIED version of Descent, based on " BASED_VERSION ".");
-	con_printf(CON_NORMAL, "%s\n%s",TXT_COPYRIGHT,TXT_TRADEMARK);
+	con_puts(CON_NORMAL, TXT_COPYRIGHT);
+	con_puts(CON_NORMAL, TXT_TRADEMARK);
 	con_puts(CON_NORMAL, "Copyright (C) 2005-2013 Christian Beckhaeuser, 2013-2017 Kp");
 #elif defined(DXX_BUILD_DESCENT_II)
 	con_printf(CON_NORMAL, "%s%s  %s", DESCENT_VERSION, PHYSFSX_exists(MISSION_DIR "d2x.hog",1) ? "  Vertigo Enhanced" : "", g_descent_build_datetime); // D2X version
 	con_puts(CON_NORMAL, "This is a MODIFIED version of Descent 2, based on " BASED_VERSION ".");
-	con_printf(CON_NORMAL, "%s\n%s",TXT_COPYRIGHT,TXT_TRADEMARK);
+	con_puts(CON_NORMAL, TXT_COPYRIGHT);
+	con_puts(CON_NORMAL, TXT_TRADEMARK);
 	con_puts(CON_NORMAL, "Copyright (C) 1999 Peter Hawkins, 2002 Bradley Bell, 2005-2013 Christian Beckhaeuser, 2013-2017 Kp");
 #endif
 
@@ -522,6 +574,14 @@ static int main(int argc, char *argv[])
 #endif
 			con_printf(CON_VERBOSE, "D" DXX_NAME_NUMBER "X-Rebirth built with libSDL %u.%u.%u; loaded with libSDL %u.%u.%u", vc.major, vc.minor, vc.patch, vl->major, vl->minor, vl->patch);
 		}
+#if DXX_USE_SDLIMAGE
+		{
+			SDL_version vc;
+			SDL_IMAGE_VERSION(&vc);
+			const auto vl = IMG_Linked_Version();
+			con_printf(CON_VERBOSE, "D" DXX_NAME_NUMBER "X-Rebirth built with SDL_image %u.%u.%u; loaded with SDL_image %u.%u.%u", vc.major, vc.minor, vc.patch, vl->major, vl->minor, vl->patch);
+		}
+#endif
 #if DXX_USE_SDLMIXER
 		{
 			SDL_version vc;
@@ -530,6 +590,9 @@ static int main(int argc, char *argv[])
 			con_printf(CON_VERBOSE, "D" DXX_NAME_NUMBER "X-Rebirth built with SDL_mixer %u.%u.%u; loaded with SDL_mixer %u.%u.%u", vc.major, vc.minor, vc.patch, vl->major, vl->minor, vl->patch);
 		}
 #endif
+#if DXX_USE_SCREENSHOT_FORMAT_PNG
+		con_printf(CON_VERBOSE, "D" DXX_NAME_NUMBER "X-Rebirth built with libpng version " PNG_LIBPNG_VER_STRING "; loaded with libpng version %s", png_get_libpng_ver(nullptr));
+#endif
 		con_puts(CON_VERBOSE, TXT_VERBOSE_1);
 	}
 	
@@ -537,7 +600,13 @@ static int main(int argc, char *argv[])
 
 	PHYSFSX_addArchiveContent();
 
-	arch_init();
+	const auto &&arch_atexit_result = arch_init();
+	/* This variable exists for the side effects that occur when it is
+	 * destroyed.  clang-9 fails to recognize those side effects as a
+	 * "use" and warns that the variable is unused.  Cast it to void to
+	 * create a "use" to suppress the warning.
+	 */
+	(void)arch_atexit_result;
 
 #if !DXX_USE_OGL
 	select_tmap(CGameArg.DbgTexMap);
@@ -548,7 +617,11 @@ static int main(int argc, char *argv[])
 #endif
 
 	con_puts(CON_VERBOSE, "Going into graphics mode...");
+#if DXX_USE_OGL
 	gr_set_mode_from_window_size();
+#else
+	gr_set_mode(Game_screen_mode);
+#endif
 
 	// Load the palette stuff. Returns non-zero if error.
 	con_puts(CON_DEBUG, "Initializing palette system...");
@@ -563,7 +636,13 @@ static int main(int argc, char *argv[])
 
 #if defined(DXX_BUILD_DESCENT_II)
 	con_puts(CON_DEBUG, "Initializing movie libraries...");
-	init_movies();		//init movie libraries
+	auto &&loaded_builtin_movies = init_movies();		//init movie libraries
+	/* clang does not recognize that creating the variable for the
+	 * purpose of extending the returned value's lifetime is a use.  Add
+	 * an explicit dummy use to silence its bogus -Wunused-variable
+	 * warning.
+	 */
+	(void)loaded_builtin_movies;
 #endif
 
 	show_titles();
@@ -591,7 +670,7 @@ static int main(int argc, char *argv[])
 #endif
 
 	con_puts(CON_DEBUG, "Doing gamedata_init...");
-	gamedata_init();
+	gamedata_init(LevelSharedRobotInfoState);
 
 #if defined(DXX_BUILD_DESCENT_II)
 #if DXX_USE_EDITOR
@@ -615,20 +694,11 @@ static int main(int argc, char *argv[])
 	con_puts(CON_DEBUG, "Running game...");
 	init_game();
 
-	get_local_player().callsign = {};
-
 #if defined(DXX_BUILD_DESCENT_I)
 	key_flush();
-#elif defined(DXX_BUILD_DESCENT_II)
-	//	If built with editor, option to auto-load a level and quit game
-	//	to write certain data.
-	#ifdef	EDITOR
-	if (!GameArg.EdiAutoLoad.empty()) {
-		Players[0u].callsign = "dummy";
-	} else
-	#endif
 #endif
 	{
+		InterfaceUniqueState.PilotName.fill(0);
 		if (!CGameArg.SysPilot.empty())
 		{
 			char filename[sizeof(PLAYER_DIRECTORY_TEXT) + CALLSIGN_LEN + 4];
@@ -656,7 +726,8 @@ static int main(int argc, char *argv[])
 			}
 			if(PHYSFSX_exists(filename,0))
 			{
-				get_local_player().callsign.copy(b, std::distance(b, &filename[j - 4]));
+				InterfaceUniqueState.PilotName.copy(std::span<const char>(b, std::distance(b, &filename[j - 4])));
+				InterfaceUniqueState.update_window_title();
 				read_player_file();
 				WriteConfigFile();
 			}
@@ -667,14 +738,14 @@ static int main(int argc, char *argv[])
 #if DXX_USE_EDITOR
 	if (!GameArg.EdiAutoLoad.empty()) {
 		/* Any number >= FILENAME_LEN works */
-		Level_names[0].copy_if(GameArg.EdiAutoLoad.c_str(), GameArg.EdiAutoLoad.size());
+		Current_mission->level_names[0].copy_if(GameArg.EdiAutoLoad.c_str(), GameArg.EdiAutoLoad.size());
 		LoadLevel(1, 1);
 	}
 	else
 #endif
 #endif
 	{
-		Game_mode = GM_GAME_OVER;
+		Game_mode = {};
 		DoMenu();
 	}
 
@@ -692,7 +763,6 @@ static int main(int argc, char *argv[])
 	}
 
 	WriteConfigFile();
-	show_order_form();
 
 	con_puts(CON_DEBUG, "Cleanup...");
 	close_game();
@@ -707,20 +777,17 @@ static int main(int argc, char *argv[])
 
 }
 
+}
+
 int main(int argc, char *argv[])
 {
 	mem_init();
 #if DXX_WORDS_NEED_ALIGNMENT
 	prctl(PR_SET_UNALIGN, PR_UNALIGN_NOPRINT, 0, 0, 0);
 #endif
-#if defined(WIN32) || defined(__APPLE__) || defined(__MACH__)
-#if DXX_USE_EDITOR
-	set_warn_func(msgbox_warning);
-#endif
 #ifdef WIN32
 	void d_set_exception_handler();
 	d_set_exception_handler();
-#endif
 #endif
 	return dsx::main(argc, argv);
 }

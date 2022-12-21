@@ -8,17 +8,19 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstring>
 #include <type_traits>
 #include "pstypes.h"
 #include "dxxsconf.h"
 #include "fmtcheck.h"
-#include "cli.h"
-#include "cmd.h"
 #include "d_srcloc.h"
+#ifdef dsx
+#include "kconfig.h"
+#endif
 
-#ifdef __cplusplus
+namespace dcx {
 
 /* Priority levels */
 enum con_priority
@@ -35,8 +37,8 @@ constexpr std::integral_constant<std::size_t, 2048> CON_LINE_LENGTH{};
 
 struct console_buffer
 {
-	char line[CON_LINE_LENGTH];
 	int priority;
+	std::array<char, CON_LINE_LENGTH> line;
 };
 
 /* Define to 1 to capture the __FILE__, __LINE__ of callers to
@@ -66,13 +68,20 @@ void con_printf(con_priority_wrapper level, const char *fmt, ...) __attribute_fo
 #ifdef DXX_CONSTANT_TRUE
 #define DXX_CON_PRINTF_CHECK_TRAILING_NEWLINE(F)	\
 	(DXX_CONSTANT_TRUE(sizeof((F)) > 1 && (F)[sizeof((F)) - 2] == '\n') &&	\
-		(DXX_ALWAYS_ERROR_FUNCTION(dxx_trap_trailing_newline, "trailing literal newline on con_printf"), 0)),
+		(DXX_ALWAYS_ERROR_FUNCTION("trailing literal newline on con_printf"), 0)),
 #else
 #define DXX_CON_PRINTF_CHECK_TRAILING_NEWLINE(C)
 #endif
 #define con_printf(A1,F,...)	\
 	DXX_CON_PRINTF_CHECK_TRAILING_NEWLINE(F)	\
 	dxx_call_printf_checked(con_printf,con_puts,(A1),(F),##__VA_ARGS__)
-void con_showup(void);
 
+}
+
+#ifdef dsx
+namespace dsx {
+
+void con_showup(control_info &Controls);
+
+}
 #endif

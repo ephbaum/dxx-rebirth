@@ -25,15 +25,31 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #pragma once
 
-#ifdef __cplusplus
+#include <limits.h>
+#include <span>
 #include "d2x-rebirth/libmve/mvelib.h"
+#include "dsx-ns.h"
+#include "physfsrwops.h"
 
-#define MOVIE_ABORT_ON  1
-#define MOVIE_ABORT_OFF 0
+namespace dsx {
 
-#define MOVIE_NOT_PLAYED    0   // movie wasn't present
-#define MOVIE_PLAYED_FULL   1   // movie was played all the way through
-#define MOVIE_ABORTED       2   // movie started by was aborted
+enum class play_movie_warn_missing : uint8_t
+{
+	verbose,
+	urgent,
+};
+
+enum class movie_play_status : uint8_t
+{
+	skipped,   // movie wasn't present
+	started,	// movie was present and started; it may or may not have completed
+};
+
+enum class movie_resolution : uint8_t
+{
+	high,
+	low,
+};
 
 #if DXX_USE_OGL
 #define MOVIE_WIDTH  (!GameArg.GfxSkipHiresMovie && grd_curscreen->get_screen_width() < 640 ? static_cast<uint16_t>(640) : grd_curscreen->get_screen_width())
@@ -43,18 +59,35 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #define MOVIE_HEIGHT static_cast<uint16_t>(!GameArg.GfxSkipHiresMovie? 480 : 200)
 #endif
 
-extern int PlayMovie(const char *subtitles, const char *filename, int allow_abort);
-extern int PlayMovies(int num_files, const char *filename[], int graphmode, int allow_abort);
-int InitRobotMovie(const char *filename, MVESTREAM_ptr_t &pMovie);
-int RotateRobot(MVESTREAM_ptr_t &pMovie);
+movie_play_status PlayMovie(std::span<const char> subtitles, const char *filename, play_movie_warn_missing);
+RWops_ptr InitRobotMovie(const char *filename, MVESTREAM_ptr_t &pMovie);
+int RotateRobot(MVESTREAM_ptr_t &pMovie, SDL_RWops *);
 void DeInitRobotMovie(MVESTREAM_ptr_t &pMovie);
 
+struct LoadedMovie
+{
+	std::array<char, PATH_MAX> pathname;
+	LoadedMovie()
+	{
+		pathname[0] = 0;
+	}
+	~LoadedMovie();
+};
+
+struct LoadedMovieWithResolution : LoadedMovie
+{
+	movie_resolution resolution;
+};
+
+struct BuiltinMovies
+{
+	std::array<LoadedMovie, 3> movies;
+};
+
 // find and initialize the movie libraries
-void init_movies();
+[[nodiscard]]
+std::unique_ptr<BuiltinMovies> init_movies();
+[[nodiscard]]
+std::unique_ptr<LoadedMovieWithResolution> init_extra_robot_movie(const char *filename);
 
-void init_extra_robot_movie(const char *filename);
-void close_extra_robot_movie();
-
-extern int MovieHires;      // specifies whether movies use low or high res
-
-#endif
+}

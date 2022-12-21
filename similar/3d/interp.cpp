@@ -21,14 +21,21 @@
 #include "console.h"
 #include "common/3d/globvars.h"
 #include "polyobj.h"
-#include "gr.h"
 #include "byteutil.h"
 #include "u_mem.h"
 
 #include "compiler-range_for.h"
 #include "d_range.h"
+#include "d_zip.h"
+#include "partial_range.h"
 
 namespace dcx {
+
+#if DXX_USE_EDITOR
+int g3d_interp_outline;
+#endif
+
+namespace {
 
 constexpr std::integral_constant<unsigned, 0> OP_EOF{};   //eof
 constexpr std::integral_constant<unsigned, 1> OP_DEFPOINTS{};   //defpoints
@@ -39,19 +46,6 @@ constexpr std::integral_constant<unsigned, 5> OP_RODBM{};   //rod bitmap
 constexpr std::integral_constant<unsigned, 6> OP_SUBCALL{};   //call a subobject
 constexpr std::integral_constant<unsigned, 7> OP_DEFP_START{};   //defpoints with start
 constexpr std::integral_constant<unsigned, 8> OP_GLOW{};   //glow value for next poly
-
-#if DXX_USE_EDITOR
-int g3d_interp_outline;
-#endif
-
-}
-
-namespace dsx {
-
-static int16_t init_model_sub(uint8_t *model_sub_ptr, const uint8_t *model_base_ptr, std::size_t model_size);
-#if defined(DXX_BUILD_DESCENT_I)
-static void validate_model_sub(uint8_t *model_sub_ptr, const uint8_t *model_base_ptr, std::size_t model_size);
-#endif
 
 static inline int16_t *wp(uint8_t *p)
 {
@@ -73,15 +67,7 @@ static inline int16_t w(const uint8_t *p)
 	return *wp(p);
 }
 
-static void rotate_point_list(g3s_point *dest, const vms_vector *src, uint_fast32_t n)
-{
-	while (n--)
-		g3_rotate_point(*dest++,*src++);
-}
-
 constexpr vms_angvec zero_angles = {0,0,0};
-
-namespace {
 
 class interpreter_ignore_op_defpoints
 {
@@ -131,21 +117,24 @@ public:
 	}
 };
 
+}
+
+}
+
 class interpreter_track_model_extent
 {
 protected:
-	const uint8_t *const model_base;
-	const std::size_t model_length;
+	const std::span<const uint8_t> model;
 public:
-	constexpr interpreter_track_model_extent(const uint8_t *const b, const std::size_t l) :
-		model_base(b), model_length(l)
+	constexpr interpreter_track_model_extent(const std::span<const uint8_t> model) :
+		model(model)
 	{
 	}
 	uint8_t truncate_invalid_model(const unsigned line, uint8_t *const p, const std::ptrdiff_t d, const std::size_t size) const
 	{
-		const std::ptrdiff_t offset_from_base = p - model_base;
+		const std::ptrdiff_t offset_from_base = p - model.data();
 		const std::ptrdiff_t offset_of_value = offset_from_base + d;
-		if (offset_of_value >= model_length || offset_of_value + size >= model_length)
+		if (const auto model_length = model.size(); offset_of_value >= model_length || offset_of_value + size >= model_length)
 		{
 			auto &opref = *wp(p);
 			const auto badop = opref;
@@ -153,7 +142,7 @@ public:
 			const unsigned long uml = model_length;
 			const long ofb = offset_from_base;
 			const long oov = offset_of_value;
-			con_printf(CON_URGENT, "%s:%u: warning: invalid polymodel at %p with length %lu; opcode %u at offset %li references invalid offset %li; replacing invalid operation with EOF", __FILE__, line, model_base, uml, badop, ofb, oov);
+			con_printf(CON_URGENT, "%s:%u: warning: invalid polymodel at %p with length %lu; opcode %u at offset %li references invalid offset %li; replacing invalid operation with EOF", __FILE__, line, model.data(), uml, badop, ofb, oov);
 			return 1;
 		}
 		return 0;
@@ -183,6 +172,15 @@ public:
 		throw std::runtime_error(buf);
 	}
 };
+
+namespace dsx {
+
+namespace {
+
+static int16_t init_model_sub(uint8_t *model_sub_ptr, const std::span<const uint8_t> model_base);
+#if defined(DXX_BUILD_DESCENT_I)
+static void validate_model_sub(uint8_t *model_sub_ptr, const std::span<const uint8_t> model_base);
+#endif
 
 class g3_poly_get_color_state :
 	public interpreter_ignore_op_defpoints,
@@ -232,7 +230,8 @@ protected:
 private:
 	void rotate(uint_fast32_t i, const vms_vector *const src, const uint_fast32_t n)
 	{
-		rotate_point_list(&Interp_point_list[i], src, n);
+		for (auto &&[dest, src] : zip(partial_range(Interp_point_list, i, i + n), unchecked_partial_range(src, n)))
+			g3_rotate_point(dest, src);
 	}
 	void set_color_by_model_light(fix g3s_lrgb::*const c, g3s_lrgb &o, const fix color) const
 	{
@@ -240,9 +239,9 @@ private:
 	}
 protected:
 	template <std::size_t N>
-		array<cg3s_point *, N> prepare_point_list(const uint_fast32_t nv, const uint8_t *const p)
+		std::array<cg3s_point *, N> prepare_point_list(const uint_fast32_t nv, const uint8_t *const p)
 		{
-			array<cg3s_point *, N> point_list;
+			std::array<cg3s_point *, N> point_list;
 			for (uint_fast32_t i = 0; i < nv; ++i)
 				point_list[i] = &Interp_point_list[wp(p + 30)[i]];
 			return point_list;
@@ -290,9 +289,9 @@ protected:
 	}
 	void op_subcall(const uint8_t *const p, const glow_values_t *const glow_values)
 	{
-		g3_start_instance_angles(*vp(p + 4), anim_angles ? anim_angles[w(p + 2)] : zero_angles);
+		auto &&ctx = g3_start_instance_angles(*vp(p + 4), anim_angles ? anim_angles[w(p + 2)] : zero_angles);
 		g3_draw_polygon_model(model_bitmaps, Interp_point_list, canvas, anim_angles, model_light, glow_values, p + w(p + 16));
-		g3_done_instance();
+		g3_done_instance(ctx);
 	}
 };
 
@@ -320,23 +319,29 @@ public:
 	{
 		if (nv > MAX_POINTS_PER_POLY)
 			return;
+#if defined(DXX_BUILD_DESCENT_II)
+		fix effective_glow_value;
+		if (glow_values && glow_num < glow_values->size())
+		{
+			effective_glow_value = (*glow_values)[glow_num];
+			if (effective_glow_value == -3)
+				return;
+		}
+		else
+			effective_glow_value = 0;
+#endif
 		if (g3_check_normal_facing(*vp(p+4),*vp(p+16)) > 0)
 		{
-#if defined(DXX_BUILD_DESCENT_II)
-			if (!glow_values || !(glow_num < glow_values->size()) || (*glow_values)[glow_num] != -3)
-#endif
-			{
-				//					DPH: Now we treat this color as 15bpp
 #if defined(DXX_BUILD_DESCENT_I)
 				const uint8_t color = w(p + 28);
 #elif defined(DXX_BUILD_DESCENT_II)
-				const uint8_t color = (glow_values && glow_num < glow_values->size() && (*glow_values)[glow_num] == -2)
+				//					DPH: Now we treat this color as 15bpp
+				const uint8_t color = effective_glow_value == -2
 					? 255
 					: gr_find_closest_color_15bpp(w(p + 28));
 #endif
 				const auto point_list = prepare_point_list<MAX_POINTS_PER_POLY>(nv, p);
-				g3_draw_poly(*grd_curcanv, nv, point_list, color);
-			}
+				g3_draw_poly(canvas, nv, point_list, color);
 		}
 	}
 	static g3s_lrgb get_glow_light(const fix c)
@@ -351,11 +356,11 @@ public:
 			return;
 		//calculate light from surface normal
 		const auto &&light = (glow_values && glow_num < glow_values->size())
-			? get_glow_light((*glow_values)[exchange(glow_num, -1)]) //yes glow
+			? get_glow_light((*glow_values)[std::exchange(glow_num, -1)]) //yes glow
 			: get_noglow_light(p); //no glow
 		//now poke light into l values
-		array<g3s_uvl, MAX_POINTS_PER_POLY> uvl_list;
-		array<g3s_lrgb, MAX_POINTS_PER_POLY> lrgb_list;
+		std::array<g3s_uvl, MAX_POINTS_PER_POLY> uvl_list;
+		std::array<g3s_lrgb, MAX_POINTS_PER_POLY> lrgb_list;
 		const fix average_light = (light.r + light.g + light.b) / 3;
 		range_for (const uint_fast32_t i, xrange(nv))
 		{
@@ -422,8 +427,8 @@ public:
 	{
 		if (nv > MAX_POINTS_PER_POLY)
 			return;
-		array<g3s_uvl, MAX_POINTS_PER_POLY> uvl_list;
-		array<g3s_lrgb, MAX_POINTS_PER_POLY> lrgb_list;
+		std::array<g3s_uvl, MAX_POINTS_PER_POLY> uvl_list;
+		std::array<g3s_lrgb, MAX_POINTS_PER_POLY> lrgb_list;
 		lrgb_list.fill(get_noglow_light(p));
 		range_for (const uint_fast32_t i, xrange(nv))
 			uvl_list[i] = (reinterpret_cast<const g3s_uvl *>(p+30+((nv&~1)+1)*2))[i];
@@ -506,7 +511,7 @@ public:
 	using model_load_state::model_load_state;
 	int16_t init_sub_model(uint8_t *const p) const
 	{
-		return init_model_sub(p, model_base, model_length);
+		return init_model_sub(p, model);
 	}
 	void update_texture(const int16_t t)
 	{
@@ -534,7 +539,7 @@ public:
 	using model_load_state::model_load_state;
 	unsigned init_sub_model(uint8_t *const p) const
 	{
-		validate_model_sub(p, model_base, model_length);
+		validate_model_sub(p, model);
 		return 0;
 	}
 	void update_texture(int16_t)
@@ -542,10 +547,6 @@ public:
 	}
 };
 #endif
-
-constexpr const glow_values_t *g3_draw_morphing_model_state::glow_values;
-
-}
 
 template <typename P, typename State>
 static std::size_t dispatch_polymodel_op(const P p, State &state, const uint_fast32_t op)
@@ -612,8 +613,12 @@ static P iterate_polymodel(P p, State &state)
 
 }
 
+}
+
 #if DXX_WORDS_BIGENDIAN
 namespace dcx {
+
+namespace {
 
 static inline fix *fp(uint8_t *p)
 {
@@ -646,8 +651,6 @@ static void vms_vector_swap(vms_vector &v)
 	fix_swap(v.y);
 	fix_swap(v.z);
 }
-
-namespace {
 
 class swap_polygon_model_data_state : public interpreter_base
 {
@@ -738,7 +741,27 @@ void swap_polygon_model_data(ubyte *data)
 #endif
 
 #if DXX_WORDS_NEED_ALIGNMENT
+
+#define MAX_CHUNKS 100 // increase if insufficent
 namespace dcx {
+
+namespace {
+
+/*
+ * A chunk struct (as used for alignment) contains all relevant data
+ * concerning a piece of data that may need to be aligned.
+ * To align it, we need to copy it to an aligned position,
+ * and update all pointers  to it.
+ * (Those pointers are actually offsets
+ * relative to start of model_data) to it.
+ */
+struct chunk
+{
+	const uint8_t *old_base; // where the offset sets off from (relative to beginning of model_data)
+	uint8_t *new_base; // where the base is in the aligned structure
+	short offset; // how much to add to base to get the address of the offset
+	short correction; // how much the value of the offset must be shifted for alignment
+};
 
 static void add_chunk(const uint8_t *old_base, uint8_t *new_base, int offset,
 	       chunk *chunk_list, int *no_chunks)
@@ -750,8 +773,6 @@ static void add_chunk(const uint8_t *old_base, uint8_t *new_base, int offset,
 	chunk_list[*no_chunks].correction = 0;
 	(*no_chunks)++;
 }
-
-namespace {
 
 class get_chunks_state :
 	public interpreter_ignore_op_defpoints,
@@ -790,8 +811,6 @@ public:
 	}
 };
 
-}
-
 /*
  * finds what chunks the data points to, adds them to the chunk_list, 
  * and returns the length of the current chunk
@@ -801,6 +820,86 @@ int get_chunks(const uint8_t *data, uint8_t *new_data, chunk *list, int *no)
 	get_chunks_state state(data, new_data, list, no);
 	auto p = iterate_polymodel(data, state);
 	return p + 2 - data;
+}
+
+static const uint8_t *old_dest(const chunk &o) // return where chunk is (in unaligned struct)
+{
+	return GET_INTEL_SHORT(&o.old_base[o.offset]) + o.old_base;
+}
+static uint8_t *new_dest(const chunk &o) // return where chunk is (in aligned struct)
+{
+	return GET_INTEL_SHORT(&o.old_base[o.offset]) + o.new_base + o.correction;
+}
+
+/*
+ * find chunk with smallest address
+ */
+static int get_first_chunks_index(chunk *chunk_list, int no_chunks)
+{
+	int first_index = 0;
+	Assert(no_chunks >= 1);
+	for (int i = 1; i < no_chunks; i++)
+		if (old_dest(chunk_list[i]) < old_dest(chunk_list[first_index]))
+			first_index = i;
+	return first_index;
+}
+
+}
+
+void align_polygon_model_data(polymodel *pm)
+{
+	int chunk_len;
+	int total_correction = 0;
+	chunk cur_ch;
+	chunk ch_list[MAX_CHUNKS];
+	int no_chunks = 0;
+	constexpr unsigned SHIFT_SPACE = 500;	// increase if insufficient
+	int tmp_size = pm->model_data_size + SHIFT_SPACE;
+	// where we build the aligned version of pm->model_data
+	const auto tmp = std::make_unique<uint8_t[]>(tmp_size);
+
+	//start with first chunk (is always aligned!)
+	const uint8_t *cur_old = pm->model_data.get();
+	auto cur_new = tmp.get();
+	chunk_len = get_chunks(cur_old, cur_new, ch_list, &no_chunks);
+	memcpy(cur_new, cur_old, chunk_len);
+	while (no_chunks > 0) {
+		int first_index = get_first_chunks_index(ch_list, no_chunks);
+		cur_ch = ch_list[first_index];
+		// remove first chunk from array:
+		no_chunks--;
+		for (int i = first_index; i < no_chunks; i++)
+			ch_list[i] = ch_list[i + 1];
+		// if (new) address unaligned:
+		const uintptr_t u = reinterpret_cast<uintptr_t>(new_dest(cur_ch));
+		if (u % 4L != 0) {
+			// calculate how much to move to be aligned
+			short to_shift = 4 - u % 4L;
+			// correct chunks' addresses
+			cur_ch.correction += to_shift;
+			for (int i = 0; i < no_chunks; i++)
+				ch_list[i].correction += to_shift;
+			total_correction += to_shift;
+			Assert(reinterpret_cast<uintptr_t>(new_dest(cur_ch)) % 4L == 0);
+			Assert(total_correction <= SHIFT_SPACE); // if you get this, increase SHIFT_SPACE
+		}
+		//write (corrected) chunk for current chunk:
+		*(reinterpret_cast<short *>(cur_ch.new_base + cur_ch.offset))
+			= INTEL_SHORT(static_cast<short>(cur_ch.correction + GET_INTEL_SHORT(cur_ch.old_base + cur_ch.offset)));
+		//write (correctly aligned) chunk:
+		cur_old = old_dest(cur_ch);
+		cur_new = new_dest(cur_ch);
+		chunk_len = get_chunks(cur_old, cur_new, ch_list, &no_chunks);
+		memcpy(cur_new, cur_old, chunk_len);
+		//correct submodel_ptr's for pm, too
+		for (auto &sp : pm->submodel_ptrs)
+			if (&pm->model_data[sp] >= cur_old &&
+				&pm->model_data[sp] < cur_old + chunk_len)
+				sp += (cur_new - tmp.get()) - (cur_old - pm->model_data.get());
+	}
+	pm->model_data_size += total_correction;
+	pm->model_data = std::make_unique<uint8_t[]>(pm->model_data_size);
+	memcpy(pm->model_data.get(), tmp.get(), pm->model_data_size);
 }
 
 }
@@ -835,37 +934,45 @@ void g3_draw_morphing_model(grs_canvas &canvas, const uint8_t *const p, grs_bitm
 	iterate_polymodel(p, state);
 }
 
-static int16_t init_model_sub(uint8_t *const model_sub_ptr, const uint8_t *const model_base_ptr, const std::size_t model_size)
+namespace {
+
+static int16_t init_model_sub(uint8_t *const model_sub_ptr, const std::span<const uint8_t> model_base)
 {
-	init_model_sub_state state(model_base_ptr, model_size);
+	init_model_sub_state state(model_base);
 	Assert(++nest_count < 1000);
 	iterate_polymodel(model_sub_ptr, state);
 	return state.highest_texture_num;
 }
 
+}
+
 //init code for bitmap models
-int16_t g3_init_polygon_model(uint8_t *const model_ptr, const std::size_t model_size)
+int16_t g3_init_polygon_model(const std::span<uint8_t> model)
 {
 	#ifndef NDEBUG
 	nest_count = 0;
 	#endif
-	return init_model_sub(model_ptr, model_ptr, model_size);
+	return init_model_sub(model.data(), model);
 }
 
 #if defined(DXX_BUILD_DESCENT_I)
-static void validate_model_sub(uint8_t *const model_sub_ptr, const uint8_t *const model_base_ptr, const std::size_t model_size)
+namespace {
+
+static void validate_model_sub(uint8_t *const model_sub_ptr, const std::span<const uint8_t> model_base)
 {
-	validate_model_sub_state state(model_base_ptr, model_size);
+	validate_model_sub_state state(model_base);
 	assert(++nest_count < 1000);
 	iterate_polymodel(model_sub_ptr, state);
 }
 
-void g3_validate_polygon_model(uint8_t *const model_ptr, const std::size_t model_size)
+}
+
+void g3_validate_polygon_model(const std::span<uint8_t> model)
 {
 #ifndef NDEBUG
 	nest_count = 0;
 #endif
-	return validate_model_sub(model_ptr, model_ptr, model_size);
+	return validate_model_sub(model.data(), model);
 }
 #endif
 

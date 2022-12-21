@@ -27,6 +27,7 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <type_traits>
 
 #include "3d.h"
 #include "dxxerror.h"
@@ -38,15 +39,19 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "textures.h"
 #include "object.h"
 #include "endlevel.h"
-#include "fireball.h"
 #include "render.h"
+#include "player.h"
+#include "segment.h"
 #include "terrain.h"
-
-#include "compiler-make_unique.h"
+#include <memory>
 
 #define GRID_MAX_SIZE   64
 #define GRID_SCALE      i2f(2*20)
 #define HEIGHT_SCALE    f1_0
+
+namespace dcx {
+
+namespace {
 
 static int grid_w,grid_h;
 
@@ -64,20 +69,24 @@ static std::unique_ptr<uint8_t[]> light_array;
 static grs_bitmap *terrain_bm;
 static int terrain_outline=0;
 static int org_i,org_j;
+static void build_light_table();
 
-// LINT: adding function prototypes
-static void build_light_table(void);
+}
+
+}
+
+namespace {
 
 // ------------------------------------------------------------------------
 static void draw_cell(grs_canvas &canvas, const vms_vector &Viewer_eye, const int i, const int j, cg3s_point &p0, cg3s_point &p1, cg3s_point &p2, cg3s_point &p3, int &mine_tiles_drawn)
 {
-	array<cg3s_point *, 3> pointlist;
+	std::array<cg3s_point *, 3> pointlist;
 
 	pointlist[0] = &p0;
 	pointlist[1] = &p1;
 	pointlist[2] = &p3;
-	array<g3s_lrgb, 3> lrgb_list1;
-	array<g3s_uvl, 3> uvl_list1;
+	std::array<g3s_lrgb, 3> lrgb_list1;
+	std::array<g3s_uvl, 3> uvl_list1;
 	lrgb_list1[0].r = lrgb_list1[0].g = lrgb_list1[0].b = uvl_list1[0].l = LIGHTVAL(i,j);
 	lrgb_list1[1].r = lrgb_list1[1].g = lrgb_list1[1].b = uvl_list1[1].l = LIGHTVAL(i,j+1);
 	lrgb_list1[2].r = lrgb_list1[2].g = lrgb_list1[2].b = uvl_list1[2].l = LIGHTVAL(i+1,j);
@@ -87,14 +96,19 @@ static void draw_cell(grs_canvas &canvas, const vms_vector &Viewer_eye, const in
 	uvl_list1[2].u = (i+1)*f1_0/4;   uvl_list1[2].v = (j)*f1_0/4;
 
 	g3_check_and_draw_tmap(canvas, pointlist, uvl_list1, lrgb_list1, *terrain_bm);
-	if (terrain_outline) {
+	std::aligned_union<0, g3_draw_line_context>::type outline_context;
+	static_assert(std::is_trivially_destructible<g3_draw_line_context>::value);
+	const auto draw_terrain_outline = terrain_outline;
+	if (draw_terrain_outline)
+	{
+		const uint8_t color = BM_XRGB(31, 0, 0);
 #if !DXX_USE_OGL
 		const int lsave = Lighting_on;
 		Lighting_on=0;
 #endif
-		const uint8_t color = BM_XRGB(31, 0, 0);
-		g3_draw_line(canvas, *pointlist[0],*pointlist[1], color);
-		g3_draw_line(canvas, *pointlist[2],*pointlist[0], color);
+		auto context = new(&outline_context) g3_draw_line_context(canvas, color);
+		g3_draw_line(*context, *pointlist[0], *pointlist[1]);
+		g3_draw_line(*context, *pointlist[2], *pointlist[0]);
 #if !DXX_USE_OGL
 		Lighting_on=lsave;
 #endif
@@ -102,8 +116,8 @@ static void draw_cell(grs_canvas &canvas, const vms_vector &Viewer_eye, const in
 
 	pointlist[0] = &p1;
 	pointlist[1] = &p2;
-	array<g3s_uvl, 3> uvl_list2;
-	array<g3s_lrgb, 3> lrgb_list2;
+	std::array<g3s_uvl, 3> uvl_list2;
+	std::array<g3s_lrgb, 3> lrgb_list2;
 	lrgb_list2[0].r = lrgb_list2[0].g = lrgb_list2[0].b = uvl_list2[0].l = LIGHTVAL(i,j+1);
 	lrgb_list2[1].r = lrgb_list2[1].g = lrgb_list2[1].b = uvl_list2[1].l = LIGHTVAL(i+1,j+1);
 	lrgb_list2[2].r = lrgb_list2[2].g = lrgb_list2[2].b = uvl_list2[2].l = LIGHTVAL(i+1,j);
@@ -113,15 +127,16 @@ static void draw_cell(grs_canvas &canvas, const vms_vector &Viewer_eye, const in
 	uvl_list2[2].u = (i+1)*f1_0/4;   uvl_list2[2].v = (j)*f1_0/4;
 
 	g3_check_and_draw_tmap(canvas, pointlist, uvl_list2, lrgb_list2, *terrain_bm);
-	if (terrain_outline) {
+	if (draw_terrain_outline)
+	{
 #if !DXX_USE_OGL
 		const int lsave = Lighting_on;
 		Lighting_on=0;
 #endif
-		const uint8_t color = BM_XRGB(31, 0, 0);
-		g3_draw_line(canvas, *pointlist[0],*pointlist[1], color);
-		g3_draw_line(canvas, *pointlist[1],*pointlist[2], color);
-		g3_draw_line(canvas, *pointlist[2],*pointlist[0], color);
+		auto &context = *reinterpret_cast<g3_draw_line_context *>(&outline_context);
+		g3_draw_line(context, *pointlist[0], *pointlist[1]);
+		g3_draw_line(context, *pointlist[1], *pointlist[2]);
+		g3_draw_line(context, *pointlist[2], *pointlist[0]);
 #if !DXX_USE_OGL
 		Lighting_on=lsave;
 #endif
@@ -140,25 +155,20 @@ static void draw_cell(grs_canvas &canvas, const vms_vector &Viewer_eye, const in
 		//draw_exit_model();
 		mine_tiles_drawn=-1;
 		window_rendered_data window;
-		render_mine(canvas, Viewer_eye, exit_segnum, 0, window);
+		render_mine(canvas, Viewer_eye, PlayerUniqueEndlevelState.exit_segnum, 0, window);
 		//if (ext_expl_playing)
 		//	draw_fireball(&external_explosion);
 	}
-
 }
-
-namespace {
 
 class terrain_y_cache
 {
 	static const std::size_t cache_size = 256;
 	std::bitset<cache_size> yc_flags;
-	array<vms_vector, cache_size> y_cache;
+	std::array<vms_vector, cache_size> y_cache;
 public:
 	vms_vector &operator()(uint_fast32_t h);
 };
-
-}
 
 vms_vector &terrain_y_cache::operator()(uint_fast32_t h)
 {
@@ -173,6 +183,8 @@ vms_vector &terrain_y_cache::operator()(uint_fast32_t h)
 		g3_rotate_delta_vec(dyp,tv);
 	}
 	return dyp;
+}
+
 }
 
 void render_terrain(grs_canvas &canvas, const vms_vector &Viewer_eye, const vms_vector &org_point,int org_2dx,int org_2dy)
@@ -341,9 +353,13 @@ void render_terrain(grs_canvas &canvas, const vms_vector &Viewer_eye, const vms_
 
 }
 
+namespace dcx {
+
 void free_height_array()
 {
 	height_array.reset();
+}
+
 }
 
 void load_terrain(const char *filename)
@@ -390,6 +406,9 @@ void load_terrain(const char *filename)
 	build_light_table();
 }
 
+namespace dcx {
+
+namespace {
 
 static void get_pnt(vms_vector &p,int i,int j)
 {
@@ -430,15 +449,10 @@ static fix get_avg_light(int i,int j)
 	return sum/6;
 }
 
-void free_light_table()
-{
-	light_array.reset();
-}
-
 static void build_light_table()
 {
 	std::size_t alloc = grid_w*grid_h;
-	light_array = make_unique<uint8_t[]>(alloc);
+	light_array = std::make_unique<uint8_t[]>(alloc);
 	memset(light_array.get(), 0, alloc);
 	int i,j;
 	fix l, l2, min_l = INT32_MAX, max_l = 0;
@@ -471,4 +485,13 @@ static void build_light_table()
 			LIGHT(i,j) = l2>>8;
 
 		}
+}
+
+}
+
+void free_light_table()
+{
+	light_array.reset();
+}
+
 }

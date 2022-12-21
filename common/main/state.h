@@ -31,13 +31,14 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #define SECRETC_FILENAME	PLAYER_DIRECTORY_STRING("secret.sgc")
 #endif
 
-#ifdef __cplusplus
 #include <cstddef>
 #include "dsx-ns.h"
 #include "fwd-window.h"
+#include "fwd-object.h"
+#include "game.h"
+#include "gameplayopt.h"
 
 extern unsigned state_game_id;
-extern int state_quick_item;
 
 #ifdef dsx
 #include "fwd-player.h"
@@ -72,18 +73,29 @@ enum class blind_save
 	yes,
 };
 
+enum class deny_save_result
+{
+	allowed,
+	denied,
+};
+
+int state_get_game_id(const d_game_unique_state::savegame_file_path &filename);
+
 }
 
 #ifdef dsx
 namespace dsx {
+deny_save_result deny_save_game(fvcobjptr &vcobjptr, const d_level_unique_control_center_state &LevelUniqueControlCenterState);
+deny_save_result deny_save_game(fvcobjptr &vcobjptr, const d_level_unique_control_center_state &LevelUniqueControlCenterState, const d_game_unique_state &GameUniqueState);
+void state_poll_autosave_game(d_game_unique_state &GameUniqueState, const d_level_unique_object_state &LevelUniqueObjectState);
+void state_set_immediate_autosave(d_game_unique_state &GameUniqueState);
+void state_set_next_autosave(d_game_unique_state &GameUniqueState, std::chrono::steady_clock::time_point now, autosave_interval_type interval);
+void state_set_next_autosave(d_game_unique_state &GameUniqueState, autosave_interval_type interval);
 int state_save_all_sub(const char *filename, const char *desc);
 
-int state_get_save_file(char *fname, char * dsc, blind_save);
-int state_get_restore_file(char *fname, blind_save);
-}
-int state_get_game_id(const char *filename);
+d_game_unique_state::save_slot state_get_save_file(grs_canvas &canvas, d_game_unique_state::savegame_file_path &fname, d_game_unique_state::savegame_description *dsc, blind_save);
+d_game_unique_state::save_slot state_get_restore_file(grs_canvas &canvas, d_game_unique_state::savegame_file_path &fname, blind_save);
 
-namespace dsx {
 #if defined(DXX_BUILD_DESCENT_I)
 int state_restore_all_sub(const char *filename);
 static inline void set_pos_from_return_segment(void)
@@ -99,26 +111,18 @@ static inline int state_restore_all(int in_game, secret_restore, std::nullptr_t,
 {
 	return state_restore_all(in_game, nullptr, blind);
 }
-window_event_result StartNewLevelSub(int level_num, int page_in_textures);
+window_event_result StartNewLevelSub(const d_robot_info_array &Robot_info, int level_num, int page_in_textures);
 // Actually does the work to start new level
-static inline window_event_result StartNewLevelSub(int level_num, int page_in_textures, secret_restore)
+static inline window_event_result StartNewLevelSub(const d_robot_info_array &Robot_info, int level_num, int page_in_textures, secret_restore)
 {
-	return StartNewLevelSub(level_num, page_in_textures);
-}
-void init_player_stats_level(player &, object &);
-static inline void init_player_stats_level(player &p, object &o, secret_restore)
-{
-	init_player_stats_level(p, o);
+	return StartNewLevelSub(Robot_info, level_num, page_in_textures);
 }
 #elif defined(DXX_BUILD_DESCENT_II)
 int state_restore_all_sub(const d_level_shared_destructible_light_state &LevelSharedDestructibleLightState, secret_restore, const char *filename);
 void set_pos_from_return_segment(void);
 int state_save_all(secret_save, blind_save);
 int state_restore_all(int in_game, secret_restore, const char *filename_override, blind_save);
-window_event_result StartNewLevelSub(int level_num, int page_in_textures, secret_restore);
-void init_player_stats_level(player &, object &, secret_restore);
+window_event_result StartNewLevelSub(const d_robot_info_array &Robot_info, int level_num, int page_in_textures, secret_restore);
 #endif
 }
-#endif
-
 #endif

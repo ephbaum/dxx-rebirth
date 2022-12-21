@@ -9,15 +9,14 @@
  * Library-independent stub for dynamic selection of sound system
  */
 
+#include <stdexcept>
 #include "dxxerror.h"
 #include "vecmat.h"
-#include "piggy.h"
 #include "config.h"
 #include "digi.h"
 #include "sounds.h"
 #include "console.h"
 #include "rbaudio.h"
-#include "jukebox.h"
 #include "args.h"
 #include <stdlib.h>
 #include <stdio.h>
@@ -33,13 +32,30 @@
 #include "hmp.h"
 #endif
 
-namespace dsx {
+namespace dcx {
 
-#ifndef __PIE__
+int digi_volume = SOUND_MAX_VOLUME;
+
+/* The values for these three defines are arbitrary and can be changed,
+ * provided that they remain unique with respect to each other.
+ */
+#define DXX_STS_MIXER_WITH_POINTER	0
+#define DXX_STS_MIXER_WITH_COPY	1
+#define DXX_STS_NO_MIXER	2
+
+#if DXX_USE_SDLMIXER
+#ifndef DXX_SOUND_TABLE_STYLE
+#ifdef __PIE__
 /* PIE -> paranoid checks
  * No PIE -> prefer speed
  */
-#define DXX_COPY_SOUND_TABLE
+#define DXX_SOUND_TABLE_STYLE	DXX_STS_MIXER_WITH_POINTER
+#else
+#define DXX_SOUND_TABLE_STYLE	DXX_STS_MIXER_WITH_COPY
+#endif
+#endif
+#else
+#define DXX_SOUND_TABLE_STYLE	DXX_STS_NO_MIXER
 #endif
 
 /* Sound system function pointers */
@@ -50,26 +66,94 @@ struct sound_function_table_t
 {
 	int  (*init)();
 	void (*close)();
-#ifndef RELEASE
-	void (*reset)();
-#endif
-	void (*set_channel_volume)(int, int);
-	void (*set_channel_pan)(int, int);
-	int  (*start_sound)(short, fix, int, int, int, int, sound_object *);
-	void (*stop_sound)(int);
-	void (*end_sound)(int);
-	int  (*is_channel_playing)(int);
+	void (*set_channel_volume)(sound_channel, int);
+	void (*set_channel_pan)(sound_channel, sound_pan);
+	sound_channel (*start_sound)(short, fix, sound_pan, int, int, int, sound_object *);
+	void (*stop_sound)(sound_channel);
+	void (*end_sound)(sound_channel);
+	int  (*is_channel_playing)(sound_channel);
 	void (*stop_all_channels)();
 	void (*set_digi_volume)(int);
 };
 
+#if DXX_SOUND_TABLE_STYLE == DXX_STS_MIXER_WITH_POINTER
+[[noreturn]]
+__attribute_cold
+void report_invalid_table()
+{
+	/* Out of line due to length of generated code */
+	throw std::logic_error("invalid sound table pointer");
+}
+#endif
+
+}
+
+}
+
+#if DXX_SOUND_TABLE_STYLE != DXX_STS_MIXER_WITH_COPY
+namespace dsx
+#else
+namespace dcx
+#endif
+{
+
+namespace {
+
+class sound_function_pointers_t
+{
+#if DXX_SOUND_TABLE_STYLE == DXX_STS_MIXER_WITH_COPY
+	sound_function_table_t table;
+#elif DXX_SOUND_TABLE_STYLE == DXX_STS_MIXER_WITH_POINTER
+	const sound_function_table_t *table;
+#endif
+public:
+	inline const sound_function_table_t *operator->();
+	inline sound_function_pointers_t &operator=(const sound_function_table_t &t);
+};
+
+#if DXX_SOUND_TABLE_STYLE == DXX_STS_MIXER_WITH_COPY
+const sound_function_table_t *sound_function_pointers_t::operator->()
+{
+	return &table;
+}
+
+sound_function_pointers_t &sound_function_pointers_t::operator=(const sound_function_table_t &t)
+{
+	table = t;
+	return *this;
+}
+#elif DXX_SOUND_TABLE_STYLE == DXX_STS_MIXER_WITH_POINTER
+sound_function_pointers_t &sound_function_pointers_t::operator=(const sound_function_table_t &t)
+{
+	table = &t;
+	/* Trap bad initial assignment */
+	operator->();
+	return *this;
+}
+#elif DXX_SOUND_TABLE_STYLE == DXX_STS_NO_MIXER
+sound_function_pointers_t &sound_function_pointers_t::operator=(const sound_function_table_t &)
+{
+	return *this;
+}
+#endif
+
+}
+
+static sound_function_pointers_t fptr;
+
+}
+
+namespace dsx {
+
+namespace {
+
+	/* Some of the functions are in dsx, so the definition and
+	 * initializer must be in dsx.
+	 */
 #if DXX_USE_SDLMIXER
 constexpr sound_function_table_t digi_mixer_table{
 	&digi_mixer_init,
 	&digi_mixer_close,
-#ifndef RELEASE
-	&digi_mixer_reset,
-#endif
 	&digi_mixer_set_channel_volume,
 	&digi_mixer_set_channel_pan,
 	&digi_mixer_start_sound,
@@ -84,9 +168,6 @@ constexpr sound_function_table_t digi_mixer_table{
 constexpr sound_function_table_t digi_audio_table{
 	&digi_audio_init,
 	&digi_audio_close,
-#ifndef RELEASE
-	&digi_audio_reset,
-#endif
 	&digi_audio_set_channel_volume,
 	&digi_audio_set_channel_pan,
 	&digi_audio_start_sound,
@@ -97,71 +178,21 @@ constexpr sound_function_table_t digi_audio_table{
 	&digi_audio_set_digi_volume,
 };
 
-class sound_function_pointers_t
-{
-#if DXX_USE_SDLMIXER
-#ifdef DXX_COPY_SOUND_TABLE
-	sound_function_table_t table;
-#else
-	const sound_function_table_t *table;
-#endif
-#endif
-public:
-	__attribute_cold
-	void report_invalid_table() __noreturn;
-	inline const sound_function_table_t *operator->();
-	inline sound_function_pointers_t &operator=(const sound_function_table_t &t);
-};
-
-#if DXX_USE_SDLMIXER
-#ifdef DXX_COPY_SOUND_TABLE
-const sound_function_table_t *sound_function_pointers_t::operator->()
-{
-	return &table;
-}
-
-sound_function_pointers_t &sound_function_pointers_t::operator=(const sound_function_table_t &t)
-{
-	table = t;
-	return *this;
-}
-#else
-void sound_function_pointers_t::report_invalid_table()
-{
-	/* Out of line due to length of generated code */
-	throw std::logic_error("invalid table");
-}
-
+#if DXX_SOUND_TABLE_STYLE == DXX_STS_MIXER_WITH_POINTER
 const sound_function_table_t *sound_function_pointers_t::operator->()
 {
 	if (table != &digi_audio_table && table != &digi_mixer_table)
 		report_invalid_table();
 	return table;
 }
-
-sound_function_pointers_t &sound_function_pointers_t::operator=(const sound_function_table_t &t)
-{
-	table = &t;
-	/* Trap bad initial assignment */
-	operator->();
-	return *this;
-}
-#endif
-#else
+#elif DXX_SOUND_TABLE_STYLE == DXX_STS_NO_MIXER
 const sound_function_table_t *sound_function_pointers_t::operator->()
 {
 	return &digi_audio_table;
 }
-
-sound_function_pointers_t &sound_function_pointers_t::operator=(const sound_function_table_t &)
-{
-	return *this;
-}
 #endif
 
 }
-
-static sound_function_pointers_t fptr;
 
 void digi_select_system()
 {
@@ -182,7 +213,6 @@ void digi_select_system()
 #if defined(DXX_BUILD_DESCENT_I)
 int digi_sample_rate = SAMPLE_RATE_11K;
 #endif
-int digi_volume = SOUND_MAX_VOLUME;
 
 /* Stub functions */
 
@@ -193,22 +223,37 @@ int  digi_init()
 }
 
 void digi_close() { fptr->close(); }
-#ifndef RELEASE
-void digi_reset() { fptr->reset(); }
-#endif
 
-void digi_set_channel_volume(int channel, int volume) { fptr->set_channel_volume(channel, volume); }
-void digi_set_channel_pan(int channel, int pan) { fptr->set_channel_pan(channel, pan); }
+void digi_set_channel_volume(const sound_channel channel, int volume)
+{
+	fptr->set_channel_volume(channel, volume);
+}
 
-int  digi_start_sound(short soundnum, fix volume, int pan, int looping, int loop_start, int loop_end, sound_object *soundobj)
+void digi_set_channel_pan(const sound_channel channel, const sound_pan pan)
+{
+	fptr->set_channel_pan(channel, pan);
+}
+
+sound_channel digi_start_sound(const short soundnum, const fix volume, const sound_pan pan, const int looping, const int loop_start, const int loop_end, sound_object *const soundobj)
 {
 	return fptr->start_sound(soundnum, volume, pan, looping, loop_start, loop_end, soundobj);
 }
 
-void digi_stop_sound(int channel) { fptr->stop_sound(channel); }
-void digi_end_sound(int channel) { fptr->end_sound(channel); }
+void digi_stop_sound(const sound_channel channel)
+{
+	fptr->stop_sound(channel);
+}
 
-int  digi_is_channel_playing(int channel) { return fptr->is_channel_playing(channel); }
+void digi_end_sound(const sound_channel channel)
+{
+	fptr->end_sound(channel);
+}
+
+int  digi_is_channel_playing(const sound_channel channel)
+{
+	return fptr->is_channel_playing(channel);
+}
+
 void digi_stop_all_channels() { fptr->stop_all_channels(); }
 void digi_set_digi_volume(int dvolume) { fptr->set_digi_volume(dvolume); }
 
@@ -235,7 +280,7 @@ int digi_win32_play_midi_song( const char * filename, int loop )
 	if (filename == NULL)
 		return 0;
 
-	if ((cur_hmp = hmp_open(filename)))
+	if ((cur_hmp = std::get<0>(hmp_open(filename))))
 	{
 		/* 
 		 * FIXME: to be implemented as soon as we have some kind or checksum function - replacement for ugly hack in hmp.c for descent.hmp

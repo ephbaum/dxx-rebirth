@@ -22,22 +22,16 @@
 #include "object.h"
 #include "inferno.h"
 #include "game.h"
-#include "screens.h"
 #include "gauges.h"
-#include "physics.h"
-#include "dxxerror.h"
-#include "menu.h"           // For the font.
-#include "collide.h"
 #include "newdemo.h"
 #include "player.h"
 #include "gamefont.h"
-#include "screens.h"
 #include "text.h"
-#include "laser.h"
-#include "args.h"
 #include "playsave.h"
 #include "countarray.h"
+#include "d_levelstate.h"
 
+int HUD_toolong;
 namespace {
 constexpr std::integral_constant<unsigned, 150> HUD_MESSAGE_LENGTH{};
 
@@ -54,14 +48,12 @@ struct hudmsg
 };
 
 struct hudmsg_array_t : public count_array_t<hudmsg, HUD_MAX_NUM_STOR> {};
-}
 
 static hudmsg_array_t HUD_messages;
 
-
-int HUD_toolong = 0;
 static int HUD_color = -1;
 static int HUD_init_message_literal_worth_showing(int class_flag, const char *message);
+}
 
 void HUD_clear_messages()
 {
@@ -114,12 +106,14 @@ void HUD_render_message_frame(grs_canvas &canvas)
 		if (strlen(i->message) > 38)
 			HUD_toolong = 1;
 		for (; i != e; ++i )	{
-			gr_string(canvas, game_font, 0x8000, y, &i->message[0]);
+			gr_string(canvas, game_font, 0x8000, y, &i->message[0u]);
 			y += line_spacing;
 		}
 	}
 }
 }
+
+namespace {
 
 static int is_worth_showing(int class_flag)
 {
@@ -129,6 +123,8 @@ static int is_worth_showing(int class_flag)
 	if (PlayerCfg.MultiMessages && (Game_mode & GM_MULTI) && !(class_flag & HM_MULTI))
 		return 0;
 	return 1;
+}
+
 }
 
 // Call to flash a message on the HUD.  Returns true if message drawn.
@@ -155,6 +151,7 @@ int HUD_init_message_va(int class_flag, const char * format, va_list args)
 	return r;
 }
 
+namespace {
 
 static int HUD_init_message_literal_worth_showing(int class_flag, const char *message)
 {
@@ -212,6 +209,8 @@ static int HUD_init_message_literal_worth_showing(int class_flag, const char *me
 	return 1;
 }
 
+}
+
 int (HUD_init_message)(int class_flag, const char * format, ... )
 {
 	int ret;
@@ -240,20 +239,18 @@ void player_dead_message(grs_canvas &canvas)
 	{
 		if (get_local_player().lives == 1)
 		{
-			int x, y, w, h;
+			int x, y;
 			auto &huge_font = *HUGE_FONT;
-			gr_get_string_size(huge_font, TXT_GAME_OVER, &w, &h, nullptr);
-			const int gw = w;
-			const int gh = h;
-			w += 20;
-			h += 8;
+			const auto &&[gw, gh] = gr_get_string_size(huge_font, TXT_GAME_OVER);
+			const auto w = gw + 20;
+			const auto h = gh + 8;
 			x = (canvas.cv_bitmap.bm_w - w ) / 2;
 			y = (canvas.cv_bitmap.bm_h - h ) / 2;
 		
-			gr_settransblend(canvas, 14, GR_BLEND_NORMAL);
+			gr_settransblend(canvas, gr_fade_level{14}, gr_blend::normal);
 			const uint8_t color = BM_XRGB(0, 0, 0);
 			gr_rect(canvas, x, y, x + w, y + h, color);
-			gr_settransblend(canvas, GR_FADE_OFF, GR_BLEND_NORMAL);
+			gr_settransblend(canvas, GR_FADE_OFF, gr_blend::normal);
 		
 			gr_string(canvas, huge_font, 0x8000, (canvas.cv_bitmap.bm_h - h) / 2 + h / 8, TXT_GAME_OVER, gw, gh);
 		}

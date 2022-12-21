@@ -34,34 +34,29 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "textures.h"
 #include "wall.h"
 #include "object.h"
-#include "gamemine.h"
-#include "dxxerror.h"
 #include "console.h"
-#include "gameseg.h"
 #include "game.h"
 #include "piggy.h"
 #include "texmerge.h"
 #include "paging.h"
-#include "laser.h"
 #include "robot.h"
 #include "vclip.h"
 #include "effects.h"
 #include "fireball.h"
 #include "weapon.h"
 #include "palette.h"
-#include "timer.h"
 #include "text.h"
-#include "cntrlcen.h"
 #include "gauges.h"
 #include "powerup.h"
 #include "fuelcen.h"
-#include "mission.h"
 #include "ai.h"
 
 #include "compiler-range_for.h"
+#include "d_levelstate.h"
 #include "partial_range.h"
 #include "segiter.h"
 
+namespace {
 static void paging_touch_vclip(const vclip &vc, const unsigned line)
 #define paging_touch_vclip(V)	paging_touch_vclip(V, __LINE__)
 {
@@ -72,7 +67,7 @@ static void paging_touch_vclip(const vclip &vc, const unsigned line)
 	} u{};
 	try
 	{
-		new(&u.r) range_type((partial_const_range)(__FILE__, line, "vc.frames", vc.frames, vc.num_frames));
+		new(&u.r) range_type(partial_const_range<partial_range_detail::required_buffer_size<sizeof(__FILE__), sizeof("vc.frames")>>(__FILE__, line, "vc.frames", vc.frames, vc.num_frames));
 		static_assert(std::is_trivially_destructible<range_type>::value, "partial_range destructor not called");
 	}
 	catch (const range_type::partial_range_error &e)
@@ -108,7 +103,7 @@ static void paging_touch_wall_effects(const d_eclip_array &Effects, const Textur
 	}
 }
 
-static void paging_touch_object_effects(const d_eclip_array &Effects, const unsigned tmap_num)
+static void paging_touch_object_effects(const d_eclip_array &Effects, const object_bitmap_index tmap_num)
 {
 	range_for (auto &i, partial_const_range(Effects, Num_effects))
 	{
@@ -119,7 +114,7 @@ static void paging_touch_object_effects(const d_eclip_array &Effects, const unsi
 	}
 }
 
-static void paging_touch_model( int modelnum )
+static void paging_touch_model(const polygon_model_index modelnum)
 {
 	auto &Effects = LevelUniqueEffectsClipState.Effects;
 	auto &Polygon_models = LevelSharedPolygonModelState.Polygon_models;
@@ -153,13 +148,14 @@ static void paging_touch_weapon(const d_vclip_array &Vclip, const weapon_info &w
 			paging_touch_vclip(Vclip[weapon.robot_hit_vclip]);
 	}
 
-	switch(weapon.render_type)
+	switch(weapon.render)
 	{
 	case WEAPON_RENDER_VCLIP:
 		if (weapon.weapon_vclip > -1)
 			paging_touch_vclip(Vclip[weapon.weapon_vclip]);
 		break;
 	case WEAPON_RENDER_NONE:
+	case weapon_info::render_type::laser:
 		break;
 	case WEAPON_RENDER_POLYMODEL:
 		paging_touch_model(weapon.model_num);
@@ -176,9 +172,9 @@ static void paging_touch_weapon(const d_vclip_array &Vclip, const weapon_info_ar
 		paging_touch_weapon(Vclip, Weapon_info[weapon_type]);
 }
 
-const array<sbyte, 13> super_boss_gate_type_list{{0, 1, 8, 9, 10, 11, 12, 15, 16, 18, 19, 20, 22}};
+const std::array<sbyte, 13> super_boss_gate_type_list{{0, 1, 8, 9, 10, 11, 12, 15, 16, 18, 19, 20, 22}};
 
-static void paging_touch_robot(const d_level_shared_robot_info_state::d_robot_info_array &Robot_info, const d_vclip_array &Vclip, const weapon_info_array &Weapon_info, const unsigned ridx)
+static void paging_touch_robot(const d_robot_info_array &Robot_info, const d_vclip_array &Vclip, const weapon_info_array &Weapon_info, const unsigned ridx)
 {
 	auto &ri = Robot_info[ridx];
 	// Page in robot_index
@@ -200,7 +196,7 @@ static void paging_touch_robot(const d_level_shared_robot_info_state::d_robot_in
 	}
 }
 
-static void paging_touch_object(const d_level_shared_robot_info_state::d_robot_info_array &Robot_info, const Textures_array &Textures, const d_vclip_array &Vclip, const weapon_info_array &Weapon_info, const object_base &obj)
+static void paging_touch_object(const d_robot_info_array &Robot_info, const Textures_array &Textures, const d_vclip_array &Vclip, const weapon_info_array &Weapon_info, const object_base &obj)
 {
 	int v;
 
@@ -239,7 +235,7 @@ static void paging_touch_object(const d_level_shared_robot_info_state::d_robot_i
 		default:
 			break;
 	case OBJ_PLAYER:	
-		v = get_explosion_vclip(obj, explosion_vclip_stage::s0);
+		v = get_explosion_vclip(LevelSharedRobotInfoState.Robot_info, obj, explosion_vclip_stage::s0);
 		if ( v > -1 )
 			paging_touch_vclip(Vclip[v]);
 		break;
@@ -248,35 +244,31 @@ static void paging_touch_object(const d_level_shared_robot_info_state::d_robot_i
 		break;
 	case OBJ_CNTRLCEN:
 		paging_touch_weapon(Vclip, Weapon_info, weapon_id_type::CONTROLCEN_WEAPON_NUM);
-		if (Dead_modelnums[obj.rtype.pobj_info.model_num] != -1)
-		{
-			paging_touch_model(Dead_modelnums[obj.rtype.pobj_info.model_num]);
-		}
+		if (const auto m = Dead_modelnums[obj.rtype.pobj_info.model_num]; m != polygon_model_index::None)
+			paging_touch_model(m);
 		break;
 	}
 }
 
-	
-
-static void paging_touch_side(const d_eclip_array &Effects, const Textures_array &Textures, const d_vclip_array &Vclip, const vcsegptr_t segp, int sidenum )
+static void paging_touch_side(const d_eclip_array &Effects, const Textures_array &Textures, const d_vclip_array &Vclip, const cscusegment segp, const sidenum_t sidenum)
 {
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
 	auto &vcwallptr = Walls.vcptr;
-	if (!(WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, segp, segp, sidenum) & WID_RENDER_FLAG))
+	if (!(WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, segp, sidenum) & WALL_IS_DOORWAY_FLAG::render))
 		return;
-	auto &uside = segp->unique_segment::sides[sidenum];
+	auto &uside = segp.u.sides[sidenum];
 	const auto tmap1 = uside.tmap_num;
-	paging_touch_wall_effects(Effects, Textures, Vclip, tmap1);
-	if (const auto tmap2 = uside.tmap_num2)
+	paging_touch_wall_effects(Effects, Textures, Vclip, get_texture_index(tmap1));
+	if (const auto tmap2 = uside.tmap_num2; tmap2 != texture2_value::None)
 	{
 		texmerge_get_cached_bitmap( tmap1, tmap2 );
-		paging_touch_wall_effects(Effects, Textures, Vclip, tmap2 & 0x3FFF);
+		paging_touch_wall_effects(Effects, Textures, Vclip, get_texture_index(tmap2));
 	} else	{
-		PIGGY_PAGE_IN( Textures[tmap1] );
+		PIGGY_PAGE_IN(Textures[get_texture_index(tmap1)]);
 	}
 }
 
-static void paging_touch_robot_maker(const d_level_shared_robot_info_state::d_robot_info_array &Robot_info, const d_vclip_array &Vclip, const weapon_info_array &Weapon_info, const shared_segment &segp)
+static void paging_touch_robot_maker(const d_robot_info_array &Robot_info, const d_vclip_array &Vclip, const weapon_info_array &Weapon_info, const shared_segment &segp)
 {
 	auto &RobotCenters = LevelSharedRobotcenterState.RobotCenters;
 		paging_touch_vclip(Vclip[VCLIP_MORPHING_ROBOT]);
@@ -299,16 +291,17 @@ static void paging_touch_robot_maker(const d_level_shared_robot_info_state::d_ro
 			}
 }
 
-static void paging_touch_segment(const d_eclip_array &Effects, const d_level_shared_robot_info_state::d_robot_info_array &Robot_info, const Textures_array &Textures, const d_vclip_array &Vclip, const weapon_info_array &Weapon_info, const fvcobjptridx &vcobjptridx, const fvcsegptr &vcsegptr, const vcsegptr_t segp)
+static void paging_touch_segment(const d_eclip_array &Effects, const d_robot_info_array &Robot_info, const Textures_array &Textures, const d_vclip_array &Vclip, const weapon_info_array &Weapon_info, const fvcobjptridx &vcobjptridx, const fvcsegptr &vcsegptr, const cscusegment segp)
 {
-	if ( segp->special == SEGMENT_IS_ROBOTMAKER )
+	if (segp.s.special == segment_special::robotmaker)
 		paging_touch_robot_maker(Robot_info, Vclip, Weapon_info, segp);
 
-	for (int sn=0;sn<MAX_SIDES_PER_SEGMENT;sn++) {
+	for (const auto sn : MAX_SIDES_PER_SEGMENT)
+	{
 		paging_touch_side(Effects, Textures, Vclip, segp, sn);
 	}
 
-	range_for (const auto objp, objects_in(*segp, vcobjptridx, vcsegptr))
+	range_for (const object &objp, objects_in(segp, vcobjptridx, vcsegptr))
 		paging_touch_object(Robot_info, Textures, Vclip, Weapon_info, objp);
 }
 
@@ -324,17 +317,21 @@ static void paging_touch_walls(const Textures_array &Textures, const wall_animat
 		}
 	}
 }
+}
 
 namespace dsx {
 void paging_touch_all(const d_vclip_array &Vclip)
 {
 	auto &Effects = LevelUniqueEffectsClipState.Effects;
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &WallAnims = GameSharedState.WallAnims;
 	auto &vcobjptridx = Objects.vcptridx;
 	pause_game_world_time p;
 
 #if defined(DXX_BUILD_DESCENT_I)
-	show_boxed_message(TXT_LOADING, 0);
+	gr_set_default_canvas();
+	show_boxed_message(*grd_curcanv, TXT_LOADING);
+	gr_flip();
 #endif
 	auto &Robot_info = LevelSharedRobotInfoState.Robot_info;
 	range_for (const auto &&segp, vcsegptr)

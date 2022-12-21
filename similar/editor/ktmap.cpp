@@ -24,7 +24,6 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
  */
 
 #include <string.h>
-#include "inferno.h"
 #include "editor.h"
 #include "editor/esegment.h"
 #include "kdefs.h"
@@ -36,12 +35,9 @@ int AssignTexture(void)
    autosave_mine( mine_filename );
 	undo_status[Autosave_count] = "Assign Texture UNDONE.";
 
-	Cursegp->unique_segment::sides[Curside].tmap_num = CurrentTexture;
-
-	New_segment.unique_segment::sides[Curside].tmap_num = CurrentTexture;
-
-//	propagate_light_intensity(Cursegp, Curside, CurrentTexture, 0); 
-																					 
+	const auto t1 = build_texture1_value(CurrentTexture);
+	Cursegp->unique_segment::sides[Curside].tmap_num = t1;
+	New_segment.unique_segment::sides[Curside].tmap_num = t1;
 	Update_flags |= UF_WORLD_CHANGED;
 
 	return 1;
@@ -50,26 +46,23 @@ int AssignTexture(void)
 //	Assign CurrentTexture to Curside in *Cursegp
 int AssignTexture2(void)
 {
-	int texnum, orient, ctexnum, newtexnum;
-
    autosave_mine( mine_filename );
 	undo_status[Autosave_count] = "Assign Texture 2 UNDONE.";
 
-	{
 		const unique_segment &useg = *Cursegp;
 		auto &uside = useg.sides[Curside];
 		const auto tmap_num2 = uside.tmap_num2;
-		texnum = tmap_num2 & 0x3FFF;
-		orient = ((tmap_num2 & 0xC000) >> 14) & 3;
-	}
-	ctexnum = CurrentTexture;
-	
-	if ( ctexnum == texnum )	{
-		orient = (orient+1) & 3;
-		newtexnum = (orient<<14) | texnum;
+	const auto ctexnum = CurrentTexture;
+	texture2_value newtexnum;
+	texture2_rotation_high orient;
+	if (ctexnum == get_texture_index(tmap_num2))
+	{
+		orient = get_texture_rotation_high(tmap_num2);
+		++ orient;
 	} else {
-		newtexnum = ctexnum;
+		orient = texture2_rotation_high::Normal;
 	}
+	newtexnum = build_texture2_value(ctexnum, orient);
 
 	Cursegp->unique_segment::sides[Curside].tmap_num2 = newtexnum;
 	New_segment.unique_segment::sides[Curside].tmap_num2 = newtexnum;
@@ -84,9 +77,8 @@ int ClearTexture2(void)
    autosave_mine( mine_filename );
 	undo_status[Autosave_count] = "Clear Texture 2 UNDONE.";
 
-	Cursegp->unique_segment::sides[Curside].tmap_num2 = 0;
-
-	New_segment.unique_segment::sides[Curside].tmap_num2 = 0;
+	Cursegp->unique_segment::sides[Curside].tmap_num2 = texture2_value::None;
+	New_segment.unique_segment::sides[Curside].tmap_num2 = texture2_value::None;
 
 	Update_flags |= UF_WORLD_CHANGED;
 

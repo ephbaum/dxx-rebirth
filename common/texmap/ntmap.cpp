@@ -35,10 +35,10 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "rle.h"
 #include "scanline.h"
 #include "u_mem.h"
-
+#include "d_zip.h"
 #include "dxxsconf.h"
 #include "dsx-ns.h"
-#include "compiler-integer_sequence.h"
+#include <utility>
 
 namespace dcx {
 
@@ -59,20 +59,20 @@ unsigned char *write_buffer;
 
 fix fx_l, fx_u, fx_v, fx_z, fx_du_dx, fx_dv_dx, fx_dz_dx, fx_dl_dx;
 int fx_xleft, fx_xright, fx_y;
-const unsigned char *pixptr;
+const color_palette_index *pixptr;
 uint8_t Transparency_on = 0;
 uint8_t tmap_flat_color;
 
 int	Interpolation_method;	// 0 = choose best method
 // -------------------------------------------------------------------------------------
 template <std::size_t... N>
-static inline constexpr const array<fix, 1 + sizeof...(N)> init_fix_recip_table(index_sequence<0, N...>)
+static inline constexpr const std::array<fix, 1 + sizeof...(N)> init_fix_recip_table(std::index_sequence<0, N...>)
 {
 	/* gcc 4.5 fails on bare initializer list */
-	return array<fix, 1 + sizeof...(N)>{{F1_0, (F1_0 / N)...}};
+	return std::array<fix, 1 + sizeof...(N)>{{F1_0, (F1_0 / N)...}};
 }
 
-constexpr array<fix, FIX_RECIP_TABLE_SIZE> fix_recip_table = init_fix_recip_table(make_tree_index_sequence<FIX_RECIP_TABLE_SIZE>());
+constexpr std::array<fix, FIX_RECIP_TABLE_SIZE> fix_recip_table = init_fix_recip_table(std::make_index_sequence<FIX_RECIP_TABLE_SIZE>());
 
 // -------------------------------------------------------------------------------------
 //	Initialize interface variables to assembler.
@@ -355,7 +355,7 @@ static void ntmap_scanline_lighted(const grs_bitmap &srcb, int y, fix xleft, fix
 			fx_xleft = f2i(xleft);
 
 			tmap_flat_color = 1;
-			cur_tmap_scanline_flat();
+			c_tmap_scanline_flat();
 #else
 			Int3();	//	Illegal, called an editor only routine!
 #endif
@@ -573,7 +573,7 @@ static void ntmap_scanline_lighted_linear(const grs_bitmap &srcb, int y, fix xle
 					fx_xleft = 0;
 				//end addition -adb
 				
-				cur_tmap_scanline_lin_nolight();
+				c_tmap_scanline_lin_nolight();
 				break;
 			case 1:
 				if (lleft < F1_0/2)
@@ -608,14 +608,14 @@ static void ntmap_scanline_lighted_linear(const grs_bitmap &srcb, int y, fix xle
 				fx_l = lleft;
 				dl_dx = fixmul(lright - lleft,recip_dx);
 				fx_dl_dx = dl_dx;
-				cur_tmap_scanline_lin();
+				c_tmap_scanline_lin();
 				break;
 			case 2:
 #ifdef EDITOR_TMAP
 				fx_xright = f2i(xright);
 				fx_xleft = f2i(xleft);
 				tmap_flat_color = 1;
-				cur_tmap_scanline_flat();
+				c_tmap_scanline_flat();
 #else
 				Int3();	//	Illegal, called an editor only routine!
 #endif
@@ -789,18 +789,18 @@ static void ntexture_map_lighted_linear(const grs_bitmap &srcb, const g3ds_tmap 
 // -------------------------------------------------------------------------------------
 // Interface from Matt's data structures to Mike's texture mapper.
 // -------------------------------------------------------------------------------------
-void draw_tmap(grs_canvas &canvas, const grs_bitmap &rbp, uint_fast32_t nverts, const g3s_point *const *vertbuf)
+void draw_tmap(grs_canvas &canvas, const grs_bitmap &rbp, const std::span<const g3s_point *const> vertbuf)
 {
 	//	These variables are used in system which renders texture maps which lie on one scanline as a line.
 	// fix	div_numerator;
 	int	lighting_on_save = Lighting_on;
 
-	Assert(nverts <= MAX_TMAP_VERTS);
+	assert(vertbuf.size() <= MAX_TMAP_VERTS);
 
 	const grs_bitmap *bp = &rbp;
 	//	If no transparency and seg depth is large, render as flat shaded.
 	if ((Current_seg_depth > Max_linear_depth) && ((bp->get_flag_mask(3)) == 0)) {
-		draw_tmap_flat(canvas, rbp, nverts, vertbuf);
+		draw_tmap_flat(canvas, rbp, vertbuf);
 		return;
 	}
 
@@ -813,27 +813,25 @@ void draw_tmap(grs_canvas &canvas, const grs_bitmap &rbp, uint_fast32_t nverts, 
 
 	// Setup texture map in Tmap1
 	g3ds_tmap Tmap1;
-	Tmap1.nv = nverts;						// Initialize number of vertices
+	Tmap1.nv = vertbuf.size();						// Initialize number of vertices
 
 // 	div_numerator = DivNum;	//f1_0*3;
 
-	for (int i=0; i<nverts; i++) {
-		g3ds_vertex	*tvp = &Tmap1.verts[i];
-		auto vp = vertbuf[i];
-
-		tvp->x2d = vp->p3_sx;
-		tvp->y2d = vp->p3_sy;
+	for (auto &&[vp, tvp] : zip(vertbuf, Tmap1.verts))
+	{
+		tvp.x2d = vp->p3_sx;
+		tvp.y2d = vp->p3_sy;
 
 		//	Check for overflow on fixdiv.  Will overflow on vp->z <= something small.  Allow only as low as 256.
 		auto clipped_p3_z = std::max(256, vp->p3_z);
-		tvp->z = fixdiv(F1_0*12, clipped_p3_z);
-		tvp->u = vp->p3_u << 6; //* bp->bm_w;
-		tvp->v = vp->p3_v << 6; //* bp->bm_h;
+		tvp.z = fixdiv(F1_0*12, clipped_p3_z);
+		tvp.u = vp->p3_u << 6; //* bp->bm_w;
+		tvp.v = vp->p3_v << 6; //* bp->bm_h;
 
 		Assert(Lighting_on < 3);
 
 		if (Lighting_on)
-			tvp->l = vp->p3_l * NUM_LIGHTING_LEVELS;
+			tvp.l = vp->p3_l * NUM_LIGHTING_LEVELS;
 	}
 
 
@@ -843,12 +841,17 @@ void draw_tmap(grs_canvas &canvas, const grs_bitmap &rbp, uint_fast32_t nverts, 
 		switch (Interpolation_method) {	// 0 = choose, 1 = linear, 2 = /8 perspective, 3 = full perspective
 			case 0:								// choose best interpolation
 				if (Current_seg_depth > Max_perspective_depth)
+				{
 				case 1:								// linear interpolation
 					ntexture_map_lighted_linear(*bp, Tmap1);
+				}
 				else
+				{
+					[[fallthrough]];
 				case 2:								// perspective every 8th pixel interpolation
 				case 3:								// perspective every pixel interpolation
 					ntexture_map_lighted(*bp, Tmap1);
+				}
 				break;
 			default:
 				Assert(0);				// Illegal value for Interpolation_method, must be 0,1,2,3

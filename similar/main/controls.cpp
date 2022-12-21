@@ -26,9 +26,7 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #include <algorithm>
 #include <stdlib.h>
-#include "key.h"
 #include "joy.h"
-#include "timer.h"
 #include "dxxerror.h"
 #include "inferno.h"
 #include "game.h"
@@ -37,21 +35,17 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "weapon.h"
 #include "bm.h"
 #include "controls.h"
-#include "render.h"
-#include "args.h"
 #include "palette.h"
-#include "mouse.h"
 #include "kconfig.h"
 #if defined(DXX_BUILD_DESCENT_II)
 #include "laser.h"
 #include "multi.h"
 #include "vclip.h"
 #include "fireball.h"
+#include "d_levelstate.h"
 
 //look at keyboard, mouse, joystick, CyberMan, whatever, and set 
 //physics vars rotvel, velocity
-
-fix Afterburner_charge=f1_0;
 
 #define AFTERBURNER_USE_SECS	3				//use up in 3 seconds
 #define DROP_DELTA_TIME			(f1_0/15)	//drop 3 per second
@@ -61,7 +55,12 @@ using std::min;
 using std::max;
 
 namespace dsx {
-void read_flying_controls(object &obj)
+
+#if defined(DXX_BUILD_DESCENT_II)
+fix Afterburner_charge;
+#endif
+
+void read_flying_controls(object &obj, control_info &Controls)
 {
 	fix	forward_thrust_time;
 
@@ -77,13 +76,14 @@ void read_flying_controls(object &obj)
 			return false;
 		auto &gmobj = *gimobj;
 		const auto gmid = get_weapon_id(gmobj);
-		const auto speed = Weapon_info[gmid].speed[Difficulty_level];
+		const auto speed = Weapon_info[gmid].speed[GameUniqueState.Difficulty_level];
 		vms_angvec rotangs;
 		//this is a horrible hack.  guided missile stuff should not be
 		//handled in the middle of a routine that is dealing with the player
 
 		vm_vec_zero(obj.mtype.phys_info.rotthrust);
 
+		const auto Seismic_tremor_magnitude = LevelUniqueSeismicState.Seismic_tremor_magnitude;
 		rotangs.p = Controls.pitch_time / 2 + Seismic_tremor_magnitude/64;
 		rotangs.b = Controls.bank_time / 2 + Seismic_tremor_magnitude/16;
 		rotangs.h = Controls.heading_time / 2 + Seismic_tremor_magnitude/64;

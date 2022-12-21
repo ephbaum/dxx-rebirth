@@ -11,11 +11,24 @@
  *
  */
 
+#include "object.h"
 #include "player.h"
 #include "physfsx.h"
 #include "compiler-range_for.h"
 
 namespace dsx {
+
+#if defined(DXX_BUILD_DESCENT_II)
+const player &get_player_controlling_guidebot(const d_unique_buddy_state & /* reserved for future use */, const valptridx<player>::array_managed_type &Players)
+{
+	/* One day, the game may support letting someone other than player 0
+	 * control the guidebot.  For now, only player 0 will ever control
+	 * it.
+	 */
+	return Players.front();
+}
+#endif
+
 void player_rw_swap(player_rw *p, int swap)
 {
 	if (!swap)
@@ -58,7 +71,7 @@ void player_rw_swap(player_rw *p, int swap)
  */
 void player_ship_read(player_ship *ps, PHYSFS_File *fp)
 {
-	ps->model_num = PHYSFSX_readInt(fp);
+	ps->model_num = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(fp));
 	ps->expl_vclip_num = PHYSFSX_readInt(fp);
 	ps->mass = PHYSFSX_readFix(fp);
 	ps->drag = PHYSFSX_readFix(fp);

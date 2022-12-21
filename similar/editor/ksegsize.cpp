@@ -24,7 +24,6 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
  */
 
 #include <stdlib.h>
-#include "inferno.h"
 #include "editor.h"
 #include "editor/esegment.h"
 #include "dxxerror.h"
@@ -39,20 +38,24 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #define ZDIM	2
 
 #define	MAX_MODIFIED_VERTICES	32
-static array<int, MAX_MODIFIED_VERTICES>		Modified_vertices;
+namespace {
+static std::array<vertnum_t, MAX_MODIFIED_VERTICES>		Modified_vertices;
 int		Modified_vertex_index = 0;
+}
 
 namespace dsx {
+
+namespace {
 
 // ------------------------------------------------------------------------------------------
 static void validate_modified_segments(void)
 {
-	int	v0;
-	visited_segment_bitarray_t modified_segments;
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Vertices = LevelSharedVertexState.get_vertices();
+	visited_segment_bitarray_t modified_segments;
 	auto &vcvertptr = Vertices.vcptr;
 	for (int v=0; v<Modified_vertex_index; v++) {
-		v0 = Modified_vertices[v];
+		const auto v0 = Modified_vertices[v];
 
 		range_for (const auto &&segp, vmsegptridx)
 		{
@@ -65,7 +68,8 @@ static void validate_modified_segments(void)
 					{
 						modified_segments[segp] = true;
 						validate_segment(vcvertptr, segp);
-						for (unsigned s=0; s<MAX_SIDES_PER_SEGMENT; s++) {
+						for (const auto s : MAX_SIDES_PER_SEGMENT)
+						{
 							Num_tilings = 1;
 							assign_default_uvs_to_side(segp, s);
 						}
@@ -78,8 +82,9 @@ static void validate_modified_segments(void)
 
 // ------------------------------------------------------------------------------------------
 //	Scale vertex *vertp by vector *vp, scaled by scale factor scale_factor
-static void scale_vert_aux(const unsigned vertex_ind, const vms_vector &vp, const fix scale_factor)
+static void scale_vert_aux(const vertnum_t vertex_ind, const vms_vector &vp, const fix scale_factor)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vmvertptr = Vertices.vmptr;
 	auto &vertp = *vmvertptr(vertex_ind);
@@ -93,12 +98,12 @@ static void scale_vert_aux(const unsigned vertex_ind, const vms_vector &vp, cons
 }
 
 // ------------------------------------------------------------------------------------------
-static void scale_vert(const shared_segment &sp, const unsigned vertex_ind, const vms_vector &vp, const fix scale_factor)
+static void scale_vert(const shared_segment &sp, const vertnum_t vertex_ind, const vms_vector &vp, const fix scale_factor)
 {
 	auto &verts = sp.verts;
 	switch (SegSizeMode) {
 		case SEGSIZEMODE_FREE:
-			if (is_free_vertex(vertex_ind))
+			if (is_free_vertex(vcsegptr, vertex_ind))
 				scale_vert_aux(vertex_ind, vp, scale_factor);
 			break;
 		case SEGSIZEMODE_ALL:
@@ -111,8 +116,10 @@ static void scale_vert(const shared_segment &sp, const unsigned vertex_ind, cons
 			break;
 		}
 		case SEGSIZEMODE_EDGE: {
+			auto &sv = Side_to_verts[Curside];
+			const auto edge = Curedge;
 			range_for (const int v, xrange(2u))
-				if (verts[Side_to_verts[Curside][(Curedge+v)%4]] == vertex_ind)
+				if (verts[sv[next_side_vertex(edge, v)]] == vertex_ind)
 					scale_vert_aux(vertex_ind, vp, scale_factor);
 			break;
 		}
@@ -127,13 +134,12 @@ static void scale_vert(const shared_segment &sp, const unsigned vertex_ind, cons
 }
 
 // ------------------------------------------------------------------------------------------
-static void scale_free_verts(const vmsegptr_t sp, const vms_vector &vp, int side, fix scale_factor)
+static void scale_free_verts(const shared_segment &sp, const vms_vector &vp, const sidenum_t side, fix scale_factor)
 {
-	int		vertex_ind;
 	range_for (auto &v, Side_to_verts[side])
 	{
-		vertex_ind = sp->verts[v];
-		if (SegSizeMode || is_free_vertex(vertex_ind))
+		const auto vertex_ind = sp.verts[v];
+		if (SegSizeMode || is_free_vertex(vcsegptr, vertex_ind))
 			scale_vert(sp, vertex_ind, vp, scale_factor);
 	}
 
@@ -142,7 +148,7 @@ static void scale_free_verts(const vmsegptr_t sp, const vms_vector &vp, int side
 
 // -----------------------------------------------------------------------------
 //	Make segment *sp bigger in dimension dimension by amount amount.
-static void med_scale_segment_new(const vmsegptr_t sp, int dimension, fix amount)
+static void med_scale_segment_new(const shared_segment &sp, const int dimension, const fix amount)
 {
 	vms_matrix	mat;
 
@@ -151,21 +157,21 @@ static void med_scale_segment_new(const vmsegptr_t sp, int dimension, fix amount
 	med_extract_matrix_from_segment(sp, mat);
 
 	const vms_vector *vec;
-	unsigned side0, side1;
+	sidenum_t side0, side1;
 	switch (dimension) {
 		case XDIM:
-			side0 = WLEFT;
-			side1 = WRIGHT;
+			side0 = sidenum_t::WLEFT;
+			side1 = sidenum_t::WRIGHT;
 			vec = &mat.rvec;
 			break;
 		case YDIM:
-			side0 = WBOTTOM;
-			side1 = WTOP;
+			side0 = sidenum_t::WBOTTOM;
+			side1 = sidenum_t::WTOP;
 			vec = &mat.uvec;
 			break;
 		case ZDIM:
-			side0 = WFRONT;
-			side1 = WBACK;
+			side0 = sidenum_t::WFRONT;
+			side1 = sidenum_t::WBACK;
 			vec = &mat.fvec;
 			break;
 		default:
@@ -180,11 +186,12 @@ static void med_scale_segment_new(const vmsegptr_t sp, int dimension, fix amount
 // ------------------------------------------------------------------------------------------
 //	Extract a vector from a segment.  The vector goes from the start face to the end face.
 //	The point on each face is the average of the four points forming the face.
-static void extract_vector_from_segment_side(const vmsegptr_t sp, const unsigned side, vms_vector &vp, const unsigned vla, const unsigned vlb, const unsigned vra, const unsigned vrb)
+static void extract_vector_from_segment_side(const shared_segment &sp, const sidenum_t side, vms_vector &vp, const side_relative_vertnum vla, const side_relative_vertnum vlb, const side_relative_vertnum vra, const side_relative_vertnum vrb)
 {
-	auto &sv = Side_to_verts[side];
-	auto &verts = sp->verts;
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Vertices = LevelSharedVertexState.get_vertices();
+	auto &sv = Side_to_verts[side];
+	auto &verts = sp.verts;
 	auto &vcvertptr = Vertices.vcptr;
 	const auto v1 = vm_vec_sub(vcvertptr(verts[sv[vra]]), vcvertptr(verts[sv[vla]]));
 	const auto v2 = vm_vec_sub(vcvertptr(verts[sv[vrb]]), vcvertptr(verts[sv[vlb]]));
@@ -192,29 +199,34 @@ static void extract_vector_from_segment_side(const vmsegptr_t sp, const unsigned
 	vm_vec_scale(vp, F1_0/2);
 }
 
+}
+
 // ------------------------------------------------------------------------------------------
 //	Extract the right vector from segment *sp, return in *vp.
 //	The forward vector is defined to be the vector from the the center of the left face of the segment
 // to the center of the right face of the segment.
-void med_extract_right_vector_from_segment_side(const vmsegptr_t sp, int sidenum, vms_vector &vp)
+void med_extract_right_vector_from_segment_side(const shared_segment &sp, const sidenum_t sidenum, vms_vector &vp)
 {
-	extract_vector_from_segment_side(sp, sidenum, vp, 3, 2, 0, 1);
+	extract_vector_from_segment_side(sp, sidenum, vp, side_relative_vertnum::_3, side_relative_vertnum::_2, side_relative_vertnum::_0, side_relative_vertnum::_1);
 }
 
 // ------------------------------------------------------------------------------------------
 //	Extract the up vector from segment *sp, return in *vp.
 //	The forward vector is defined to be the vector from the the center of the bottom face of the segment
 // to the center of the top face of the segment.
-void med_extract_up_vector_from_segment_side(const vmsegptr_t sp, int sidenum, vms_vector &vp)
+void med_extract_up_vector_from_segment_side(const shared_segment &sp, const sidenum_t sidenum, vms_vector &vp)
 {
-	extract_vector_from_segment_side(sp, sidenum, vp, 1, 2, 0, 3);
+	extract_vector_from_segment_side(sp, sidenum, vp, side_relative_vertnum::_1, side_relative_vertnum::_2, side_relative_vertnum::_0, side_relative_vertnum::_3);
 }
 
+namespace {
 
 // -----------------------------------------------------------------------------
 //	Increase the size of Cursegp in dimension dimension by amount
 static int segsize_common(int dimension, fix amount)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	vms_vector	uvec, rvec, fvec, scalevec;
 
 	Degenerate_segment_found = 0;
@@ -223,7 +235,6 @@ static int segsize_common(int dimension, fix amount)
 
 	med_extract_up_vector_from_segment_side(Cursegp, Curside, uvec);
 	med_extract_right_vector_from_segment_side(Cursegp, Curside, rvec);
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
 	extract_forward_vector_from_segment(vcvertptr, Cursegp, fvec);
 
@@ -243,22 +254,22 @@ static int segsize_common(int dimension, fix amount)
 	//	For all segments to which Cursegp is connected, propagate tmap (uv coordinates) from the connected
 	//	segment back to Cursegp.  This will meaningfully propagate uv coordinates to all sides which havve
 	//	an incident edge.  It will also do some sides more than once.  And it is probably just not what you want.
-	array<int, MAX_SIDES_PER_SEGMENT> propagated = {};
-	for (int i=0; i<MAX_SIDES_PER_SEGMENT; i++)
+	per_side_array<int> propagated{};
+	for (const auto i : MAX_SIDES_PER_SEGMENT)
 	{
 		const auto c = Cursegp->children[i];
 		if (IS_CHILD(c))
 		{
 			range_for (auto &s, propagated)
 				++s;
-                        propagated[static_cast<int>(Side_opposite[i])]--;
+			-- propagated[Side_opposite[i]];
 			med_propagate_tmaps_to_segments(vmsegptridx(c), Cursegp, 1);
 		}
 	}
 
 	//	Now, for all sides that were not adjacent to another side, and therefore did not get tmaps
 	//	propagated to them, treat as a back side.
-	for (int i=0; i<MAX_SIDES_PER_SEGMENT; i++)
+	for (const auto i : MAX_SIDES_PER_SEGMENT)
 		if (!propagated[i]) {
 			med_propagate_tmaps_to_back_side(Cursegp, i, 1);
 		}
@@ -268,6 +279,8 @@ static int segsize_common(int dimension, fix amount)
 	Update_flags |= UF_WORLD_CHANGED;
 	mine_changed = 1;
 	return 1;
+}
+
 }
 
 // -----------------------------------------------------------------------------
@@ -376,25 +389,27 @@ int ToggleSegSizeMode(void)
 	return 1;
 }
 
+namespace {
+
 //	---------------------------------------------------------------------------
 static int	PerturbCursideCommon(fix amount)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	int			saveSegSizeMode = SegSizeMode;
 	vms_vector	fvec, rvec, uvec;
-	fix			fmag, rmag, umag;
 	SegSizeMode = SEGSIZEMODE_CURSIDE;
 
 	Modified_vertex_index = 0;
 
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
 	extract_forward_vector_from_segment(vcvertptr, Cursegp, fvec);
 	extract_right_vector_from_segment(vcvertptr, Cursegp, rvec);
 	extract_up_vector_from_segment(vcvertptr, Cursegp, uvec);
 
-	fmag = vm_vec_mag(fvec);
-	rmag = vm_vec_mag(rvec);
-	umag = vm_vec_mag(uvec);
+	const auto fmag = vm_vec_mag(fvec);
+	const auto rmag = vm_vec_mag(rvec);
+	const auto umag = vm_vec_mag(uvec);
 
 	range_for (const auto v, Side_to_verts[Curside])
 	{
@@ -419,6 +434,8 @@ static int	PerturbCursideCommon(fix amount)
 	mine_changed = 1;
 
 	return 1;
+}
+
 }
 
 //	---------------------------------------------------------------------------

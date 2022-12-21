@@ -26,13 +26,13 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include <memory>
 #include "dxxsconf.h"
 #include "dsx-ns.h"
-#include "compiler-exchange.h"
+#include <utility>
 
 #define MEM_K 1.5	// Dynamic array growth factor
 
 #ifdef DEBUG_BIAS_MEMORY_ALLOCATIONS
-#include "compiler-array.h"
-#define DXX_DEBUG_BIAS_MEMORY_ALLOCATION (sizeof(array<double, 2>))
+#include <array>
+#define DXX_DEBUG_BIAS_MEMORY_ALLOCATION (sizeof(std::array<double, 2>))
 #else
 #define DXX_DEBUG_BIAS_MEMORY_ALLOCATION (0)
 #endif
@@ -95,15 +95,8 @@ static inline void mem_init(void)
 template <typename T>
 T *MALLOC(T *&r, std::size_t count, const char *var, const char *file, unsigned line)
 {
-	static_assert(std::is_pod<T>::value, "MALLOC cannot allocate non-POD");
+	static_assert(std::is_integral<T>::value, "MALLOC cannot allocate non-integral");
 	return r = reinterpret_cast<T *>(mem_malloc(count * sizeof(T), var, file, line));
-}
-
-template <typename T>
-T *CALLOC(T *&r, std::size_t count, const char *var, const char *file, unsigned line)
-{
-	static_assert(std::is_pod<T>::value, "CALLOC cannot allocate non-POD");
-	return r = reinterpret_cast<T *>(mem_calloc(count, sizeof(T), var, file, line));
 }
 
 #define d_malloc(size)      mem_malloc((size),"Unknown", __FILE__,__LINE__ )
@@ -111,8 +104,8 @@ T *CALLOC(T *&r, std::size_t count, const char *var, const char *file, unsigned 
 template <typename T>
 static inline void d_free(T *&ptr)
 {
-	static_assert((std::is_same<T, void>::value || std::is_pod<T>::value), "d_free cannot free non-POD");
-	mem_free(exchange(ptr, nullptr));
+	static_assert((std::is_same<T, void>::value || std::is_integral<T>::value), "d_free cannot free non-integral");
+	mem_free(std::exchange(ptr, nullptr));
 }
 
 template <typename T>
@@ -137,11 +130,11 @@ class RAIIdmem : public std::unique_ptr<T, RAIIdmem_deleter<T>>
 {
 	typedef std::unique_ptr<T, RAIIdmem_deleter<T>> base_ptr;
 public:
-	static_assert(std::is_pod<typename base_ptr::element_type>::value, "RAIIdmem cannot manage non-POD");
-	DXX_INHERIT_CONSTRUCTORS(RAIIdmem, base_ptr);
+	static_assert(std::is_integral<typename base_ptr::element_type>::value, "RAIIdmem cannot manage non-integral");
+	using base_ptr::base_ptr;
 };
 
-/* Disallow C-style arrays of known bound.  Use RAIIdmem<array<T, N>>
+/* Disallow C-style arrays of known bound.  Use RAIIdmem<std::array<T, N>>
  * for this case.
  */
 template <typename T, std::size_t N>
@@ -158,21 +151,7 @@ RAIIdmem<T> &MALLOC(RAIIdmem<T> &r, std::size_t count, const char *var, const ch
 	return r.reset(MALLOC<typename RAIIdmem<T>::element_type>(p, count, var, file, line)), r;
 }
 
-template <typename T>
-RAIIdmem<T[]> &MALLOC(RAIIdmem<T[]> &r, const std::size_t count, const char *const var, const char *const file, const unsigned line)
-{
-	return MALLOC<T[]>(r, count, var, file, line);
-}
-
-template <typename T>
-void CALLOC(RAIIdmem<T> &r, std::size_t count, const char *var, const char *file, unsigned line)
-{
-	typename RAIIdmem<T>::pointer p;
-	r.reset(CALLOC<typename RAIIdmem<T>::element_type>(p, count, var, file, line));
-}
-
 #define MALLOC( var, type, count )	(MALLOC<type>(var, (count),#var, __FILE__,__LINE__ ))
-#define CALLOC( var, type, count )	(CALLOC<type>(var, (count),#var, __FILE__,__LINE__ ))
 
 }
 

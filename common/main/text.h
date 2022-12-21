@@ -28,7 +28,7 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "dxxsconf.h"
 
 #ifdef __cplusplus
-#include "compiler-array.h"
+#include <array>
 
 //Symbolic constants for all the strings
 
@@ -1248,21 +1248,21 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 	)
 
 #define NET_DUMP_STRINGS(u)	(	\
-	((u) == DUMP_CLOSED) ? TXT_NET_GAME_CLOSED :	\
-	((u) == DUMP_FULL) ? TXT_NET_GAME_FULL	:	\
-	((u) == DUMP_ENDLEVEL) ? TXT_NET_GAME_BETWEEN	:	\
-	((u) == DUMP_DORK) ? TXT_NET_GAME_NSELECT	:	\
-	((u) == DUMP_ABORTED) ? TXT_NET_GAME_NSTART	:	\
-	((u) == DUMP_CONNECTED) ? TXT_NET_GAME_CONNECT	:	\
-	((u) == DUMP_LEVEL) ? TXT_NET_GAME_WRONGLEV	:	\
+	((u) == kick_player_reason::closed) ? TXT_NET_GAME_CLOSED :	\
+	((u) == kick_player_reason::full) ? TXT_NET_GAME_FULL	:	\
+	((u) == kick_player_reason::endlevel) ? TXT_NET_GAME_BETWEEN	:	\
+	((u) == kick_player_reason::dork) ? TXT_NET_GAME_NSELECT	:	\
+	((u) == kick_player_reason::aborted) ? TXT_NET_GAME_NSTART	:	\
+	((u) == kick_player_reason::connected) ? TXT_NET_GAME_CONNECT	:	\
+	((u) == kick_player_reason::level) ? TXT_NET_GAME_WRONGLEV	:	\
 	(dxx_text_ensure_simple_expr(&(u), TXT_NET_GAME_CLOSED))	\
 	)
 #define MENU_DIFFICULTY_TEXT(u)	(	\
-	((u) == 0) ? TXT_DIFFICULTY_1	:	\
-	((u) == 1) ? TXT_DIFFICULTY_2	:	\
-	((u) == 2) ? TXT_DIFFICULTY_3	:	\
-	((u) == 3) ? TXT_DIFFICULTY_4	:	\
-	((u) == 4) ? TXT_DIFFICULTY_5	:	\
+	((u) == Difficulty_level_type::_0) ? TXT_DIFFICULTY_1	:	\
+	((u) == Difficulty_level_type::_1) ? TXT_DIFFICULTY_2	:	\
+	((u) == Difficulty_level_type::_2) ? TXT_DIFFICULTY_3	:	\
+	((u) == Difficulty_level_type::_3) ? TXT_DIFFICULTY_4	:	\
+	((u) == Difficulty_level_type::_4) ? TXT_DIFFICULTY_5	:	\
 		 /* &u is ill-formed when u is a literal number */	\
 	(dxx_text_ensure_simple_expr(NULL, TXT_DIFFICULTY_1))	\
 	)
@@ -1276,29 +1276,35 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 	)
 
 void decode_text_line(char *text_line); // decryption for bitmaps.tbl
-void decode_text(char *text, int len);  // decryption for briefings, etc.
+void decode_text(char *text, unsigned len);  // decryption for briefings, etc.
 #ifdef dsx
 namespace dsx {
 void load_text(void);
-
-}
-#endif
-#if defined(DXX_BUILD_DESCENT_I) || defined(DXX_BUILD_DESCENT_II)
 #ifndef USE_BUILTIN_ENGLISH_TEXT_STRINGS
 //Array of pointers to text
-extern array<const char *, N_TEXT_STRINGS> Text_string;
+extern std::array<const char *, N_TEXT_STRINGS> Text_string;
 #endif
 
-static inline const char *dxx_gettext(unsigned expr, const char *fmt) __attribute_format_arg(2);
-static inline const char *dxx_gettext(unsigned expr, const char *fmt)
-{
 #ifdef USE_BUILTIN_ENGLISH_TEXT_STRINGS
-	(void)expr;
-	return fmt;
+/* Verify that A is convertible to the right type, then discard it.
+ *
+ * This path requires compiler support for statement expressions, since
+ * the expression must evaluate to the target string.  For optimal
+ * format string checking, the target string must not be behind a
+ * function call, since that will convert the expression from
+ * `const char[]` to `const char *` and, for some versions of gcc,
+ * cause the string to be considered a non-literal, even if the input B
+ * is a literal.
+ */
+#define dxx_gettext(A,B)	({ unsigned dxx_gettext = A;(void)dxx_gettext; B; })
 #else
-	(void)fmt;
+__attribute_format_arg(2)
+static constexpr const char *dxx_gettext(unsigned expr, const char *)
+{
 	return Text_string[expr];
+}
 #endif
+
 }
 #endif
 

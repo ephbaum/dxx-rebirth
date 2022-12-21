@@ -36,26 +36,19 @@
 #include <algorithm>
 #include <errno.h>
 #include <SDL.h>
-#include "hudmsg.h"
 #include "game.h"
-#include "text.h"
 #include "gr.h"
 #include "gamefont.h"
-#include "grdef.h"
 #include "palette.h"
 #include "u_mem.h"
 #include "dxxerror.h"
 #include "inferno.h"
-#include "screens.h"
 #include "strutil.h"
 #include "args.h"
-#include "key.h"
 #include "physfsx.h"
 #include "internal.h"
-#include "render.h"
 #include "console.h"
 #include "config.h"
-#include "playsave.h"
 #include "vers_id.h"
 
 #if defined(__APPLE__) && defined(__MACH__)
@@ -66,22 +59,20 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <SDL_syswm.h>
-#else
-#include <GL/glu.h>
 #endif
 #endif
 
 #include "ogl_sync.h"
+#include <memory>
 
-#include "compiler-make_unique.h"
-
+using std::min;
 using std::max;
 
 namespace dcx {
 
 static int ogl_brightness_r, ogl_brightness_g, ogl_brightness_b;
 
-#if DXX_USE_OGLES
+#if DXX_USE_OGLES && SDL_MAJOR_VERSION == 1
 static int sdl_video_flags;
 
 #ifdef RPI
@@ -134,7 +125,7 @@ void gr_set_mode_from_window_size()
 
 }
 
-#if DXX_USE_OGLES
+#if DXX_USE_OGLES && SDL_MAJOR_VERSION == 1 
 static EGLDisplay eglDisplay=EGL_NO_DISPLAY;
 static EGLConfig eglConfig;
 static EGLSurface eglSurface=EGL_NO_SURFACE;
@@ -158,12 +149,12 @@ static bool TestEGLError(const char* pszLocation)
 }
 #endif
 
-namespace dsx {
+namespace dcx {
 
 void ogl_swap_buffers_internal(void)
 {
 	sync_helper.before_swap();
-#if DXX_USE_OGLES
+#if DXX_USE_OGLES && SDL_MAJOR_VERSION == 1
 	eglSwapBuffers(eglDisplay, eglSurface);
 #else
 #if SDL_MAJOR_VERSION == 1
@@ -174,6 +165,10 @@ void ogl_swap_buffers_internal(void)
 #endif
 	sync_helper.after_swap();
 }
+
+}
+
+namespace dsx {
 
 #ifdef RPI
 
@@ -314,7 +309,7 @@ static int rpi_setup_element(int x, int y, Uint32 video_flags, int update)
 
 #endif // RPI
 
-#if DXX_USE_OGLES
+#if DXX_USE_OGLES && SDL_MAJOR_VERSION == 1
 static void ogles_destroy()
 {
 	if( eglDisplay != EGL_NO_DISPLAY ) {
@@ -343,7 +338,7 @@ static void ogles_destroy()
 
 static int ogl_init_window(int w, int h)
 {
-#if DXX_USE_OGLES
+#if DXX_USE_OGLES && SDL_MAJOR_VERSION == 1
 	SDL_SysWMinfo info;
 	Window    x11Window = 0;
 	Display*  x11Display = 0;
@@ -406,7 +401,7 @@ static int ogl_init_window(int w, int h)
 		SDL_SetWindowSize(SDLWindow, w, h);
 #endif
 
-#if DXX_USE_OGLES
+#if DXX_USE_OGLES && SDL_MAJOR_VERSION == 1
 #ifndef RPI
 	// NOTE: on the RPi, the EGL stuff is not connected to the X11 window,
 	//       so there is no need to destroy and recreate this
@@ -414,7 +409,7 @@ static int ogl_init_window(int w, int h)
 #endif
 
 	SDL_VERSION(&info.version);
-	
+
 	if (SDL_GetWMInfo(&info) > 0) {
 		if (info.subsystem == SDL_SYSWM_X11) {
 			x11Display = info.info.x11.display;
@@ -424,11 +419,13 @@ static int ogl_init_window(int w, int h)
 	}
 
 	if (eglDisplay == EGL_NO_DISPLAY) {
+		const EGLNativeDisplayType desiredEGLDisplay =
 #ifdef RPI
-		eglDisplay = eglGetDisplay((EGLNativeDisplayType)EGL_DEFAULT_DISPLAY);
+		EGL_DEFAULT_DISPLAY;
 #else
-		eglDisplay = eglGetDisplay((EGLNativeDisplayType)x11Display);
+		x11Display;
 #endif
+		eglDisplay = eglGetDisplay(desiredEGLDisplay);
 		if (eglDisplay == EGL_NO_DISPLAY) {
 			con_printf(CON_URGENT, "EGL: Error querying EGL Display");
 		}
@@ -457,7 +454,7 @@ static int ogl_init_window(int w, int h)
 #ifdef RPI
 		eglSurface = eglCreateWindowSurface(eglDisplay, eglConfig, static_cast<EGLNativeWindowType>(&nativewindow), winAttribs);
 #else
-		eglSurface = eglCreateWindowSurface(eglDisplay, eglConfig, static_cast<NativeWindowType>(x11Window), winAttribs);
+		eglSurface = eglCreateWindowSurface(eglDisplay, eglConfig, x11Window, winAttribs);
 #endif
 		if ((!TestEGLError("eglCreateWindowSurface")) || eglSurface == EGL_NO_SURFACE) {
 			con_printf(CON_URGENT, "EGL: Error creating window surface");
@@ -596,6 +593,7 @@ namespace dsx {
 
 static void ogl_tune_for_current(void)
 {
+#if !DXX_USE_OGLES
 	const auto gl_vendor = reinterpret_cast<const char *>(glGetString(GL_VENDOR));
 	const auto gl_renderer = reinterpret_cast<const char *>(glGetString(GL_RENDERER));
 	const auto gl_version = reinterpret_cast<const char *>(glGetString(GL_VERSION));
@@ -635,6 +633,7 @@ static void ogl_tune_for_current(void)
 		con_puts(CON_VERBOSE, "DXX-Rebirth: OpenGL: anisotropic texture filter not supported");
 		CGameCfg.TexAnisotropy = false;
 	}
+#endif
 }
 
 }
@@ -643,7 +642,7 @@ namespace dcx {
 
 #if SDL_MAJOR_VERSION == 1
 // returns possible (fullscreen) resolutions if any.
-uint_fast32_t gr_list_modes(array<screen_mode, 50> &gsmodes)
+uint_fast32_t gr_list_modes(std::array<screen_mode, 50> &gsmodes)
 {
 	SDL_Rect** modes;
 	int modesnum = 0;
@@ -724,7 +723,6 @@ int gr_set_mode(screen_mode mode)
 	grd_curscreen->set_screen_width_height(w, h);
 	grd_curscreen->sc_aspect = fixdiv(grd_curscreen->get_screen_width() * GameCfg.AspectX, grd_curscreen->get_screen_height() * GameCfg.AspectY);
 	gr_init_canvas(grd_curscreen->sc_canvas, gr_new_bm_data, bm_mode::ogl, w, h);
-	gr_set_default_canvas();
 
 	ogl_init_window(w,h);//platform specific code
 	ogl_extensions_init();
@@ -795,6 +793,12 @@ void gr_set_attributes(void)
 	}
 	SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, buffers);
 	SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, samples);
+#else
+#if SDL_MAJOR_VERSION == 2
+	SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 1);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#endif
 #endif
 	ogl_smash_texture_list_internal();
 	gr_remap_color_fonts();
@@ -826,6 +830,8 @@ int gr_init()
 	ogl_init_load_library();
 #endif
 
+	gr_set_attributes();
+
 #if SDL_MAJOR_VERSION == 1
 	if (!CGameCfg.WindowMode && !CGameArg.SysWindow)
 		sdl_video_flags|=SDL_FULLSCREEN;
@@ -839,6 +845,9 @@ int gr_init()
 		sdl_window_flags |= SDL_WINDOW_BORDERLESS;
 	if (!CGameCfg.WindowMode && !CGameArg.SysWindow)
 		sdl_window_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+#if defined(__APPLE__) && defined(__MACH__)
+	sdl_window_flags |= SDL_WINDOW_ALLOW_HIGHDPI;
+#endif
 	const auto mode = Game_screen_mode;
 	const auto SDLWindow = SDL_CreateWindow(DESCENT_VERSION, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, SM_W(mode), SM_H(mode), sdl_window_flags);
 	if (!SDLWindow)
@@ -850,11 +859,9 @@ int gr_init()
 		SDL_SetWindowIcon(SDLWindow, window_icon);
 #endif
 
-	gr_set_attributes();
-
 	ogl_init_texture_list_internal();
 
-	grd_curscreen = make_unique<grs_screen>();
+	grd_curscreen = std::make_unique<grs_screen>();
 	*grd_curscreen = {};
 	grd_curscreen->sc_canvas.cv_bitmap.bm_data = NULL;
 
@@ -899,7 +906,7 @@ void gr_close()
 		OpenGL_LoadLibrary(false, OglLibPath);
 #endif
 
-#if DXX_USE_OGLES
+#if DXX_USE_OGLES && SDL_MAJOR_VERSION == 1
 	ogles_destroy();
 #ifdef RPI
 	con_printf(CON_DEBUG, "RPi: cleanuing up");
@@ -917,9 +924,9 @@ void gr_close()
 
 namespace dcx {
 
-void ogl_upixelc(const grs_bitmap &cv_bitmap, unsigned x, unsigned y, unsigned c)
+void ogl_upixelc(const grs_bitmap &cv_bitmap, unsigned x, unsigned y, const color_palette_index c)
 {
-	array<GLfloat, 2> vertices = {{
+	std::array<GLfloat, 2> vertices = {{
 		(x + cv_bitmap.bm_x) / static_cast<float>(last_width),
 		static_cast<GLfloat>(1.0 - (y + cv_bitmap.bm_y) / static_cast<float>(last_height))
 	}};
@@ -944,7 +951,7 @@ void ogl_upixelc(const grs_bitmap &cv_bitmap, unsigned x, unsigned y, unsigned c
 	glDisableClientState(GL_COLOR_ARRAY);
 }
 
-unsigned char ogl_ugpixel(const grs_bitmap &bitmap, unsigned x, unsigned y)
+color_palette_index ogl_ugpixel(const grs_bitmap &bitmap, unsigned x, unsigned y)
 {
 	ubyte buf[4];
 
@@ -959,7 +966,7 @@ unsigned char ogl_ugpixel(const grs_bitmap &bitmap, unsigned x, unsigned y)
 	return gr_find_closest_color(buf[0]/4, buf[1]/4, buf[2]/4);
 }
 
-void ogl_urect(grs_canvas &canvas, const int left, const int top, const int right, const int bot, const int c)
+void ogl_urect(grs_canvas &canvas, const int left, const int top, const int right, const int bot, const color_palette_index c)
 {
 	GLfloat xo, yo, xf, yf, color_r, color_g, color_b, color_a;
 
@@ -982,13 +989,13 @@ void ogl_urect(grs_canvas &canvas, const int left, const int top, const int righ
 	else
 		color_a = 1.0 - static_cast<float>(canvas.cv_fade_level) / (static_cast<float>(GR_FADE_LEVELS) - 1.0);
 
-	array<GLfloat, 16> color_array;
+	std::array<GLfloat, 16> color_array;
 	color_array[0] = color_array[4] = color_array[8] = color_array[12] = color_r;
 	color_array[1] = color_array[5] = color_array[9] = color_array[13] = color_g;
 	color_array[2] = color_array[6] = color_array[10] = color_array[14] = color_b;
 	color_array[3] = color_array[7] = color_array[11] = color_array[15] = color_a;
 
-	array<GLfloat, 8> vertices;
+	std::array<GLfloat, 8> vertices;
 	vertices[0] = xo;
 	vertices[1] = yo;
 	vertices[2] = xo;
@@ -1027,7 +1034,7 @@ void ogl_ulinec(grs_canvas &canvas, const int left, const int top, const int rig
  
 	OGL_DISABLE(TEXTURE_2D);
 
-	array<GLfloat, 4> vertices = {{
+	std::array<GLfloat, 4> vertices = {{
 		xo,
 		yo,
 		xf,
@@ -1046,22 +1053,43 @@ static int do_pal_step;
 
 void ogl_do_palfx(void)
 {
-	GLfloat color_array[] = { last_r, last_g, last_b, 1.0, last_r, last_g, last_b, 1.0, last_r, last_g, last_b, 1.0, last_r, last_g, last_b, 1.0 };
-
 	OGL_DISABLE(TEXTURE_2D);
 
 	glEnableClientState(GL_VERTEX_ARRAY);
 	glEnableClientState(GL_COLOR_ARRAY);
- 
-	if (do_pal_step)
+
+	GLfloat alast_r = last_r;
+	GLfloat alast_g = last_g;
+	GLfloat alast_b = last_b;
+	
+	if (!do_pal_step) {
+		return;
+	}
+	else if (last_r <= 0 && last_g <= 0 && last_b <= 0) 
+	{
+		// scale negative effect by 2.5 to match D1/D2 on GL
+		// also make values positive to actually have an effect
+		alast_r = last_r * -2.5;
+		alast_g = last_g * -2.5;
+		alast_b = last_b * -2.5;
+		
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_ZERO,GL_ONE_MINUS_SRC_COLOR);
+	} 
+	else
 	{
 		glEnable(GL_BLEND);
 		glBlendFunc(GL_ONE,GL_ONE);
 	}
-	else
-		return;
 
-	array<GLfloat, 8> vertices = {{
+	GLfloat color_array[] = { 
+		alast_r, alast_g, alast_b, 1.0,
+		alast_r, alast_g, alast_b, 1.0,
+		alast_r, alast_g, alast_b, 1.0,
+		alast_r, alast_g, alast_b, 1.0
+	};
+
+	std::array<GLfloat, 8> vertices = {{
 		0, 0, 0, 1, 1, 1, 1, 0
 	}};
 	glVertexPointer(2, GL_FLOAT, 0, vertices.data());
@@ -1076,15 +1104,23 @@ void ogl_do_palfx(void)
 static int ogl_brightness_ok;
 static int old_b_r, old_b_g, old_b_b;
 
+inline int gr_apply_gamma_clamp(int v)
+{
+	if (v >= 0)
+		return max(v + gr_palette_gamma, 0);
+	else
+		return min(v + gr_palette_gamma, 0);
+}
+
 void gr_palette_step_up(int r, int g, int b)
 {
 	old_b_r = ogl_brightness_r;
 	old_b_g = ogl_brightness_g;
 	old_b_b = ogl_brightness_b;
 
-	ogl_brightness_r = max(r + gr_palette_gamma, 0);
-	ogl_brightness_g = max(g + gr_palette_gamma, 0);
-	ogl_brightness_b = max(b + gr_palette_gamma, 0);
+	ogl_brightness_r = gr_apply_gamma_clamp(r);
+	ogl_brightness_g = gr_apply_gamma_clamp(g);
+	ogl_brightness_b = gr_apply_gamma_clamp(b);
 
 	if (!ogl_brightness_ok)
 	{
@@ -1105,10 +1141,8 @@ void gr_palette_load( palette_array_t &pal )
 	copy_bound_palette(gr_current_pal, pal);
 
 	gr_palette_step_up(0, 0, 0); // make ogl_setbrightness_internal get run so that menus get brightened too.
-	init_computed_colors();
+	reset_computed_colors();
 }
-
-#define GL_BGR_EXT 0x80E0
 
 struct TGA_header
 {
@@ -1123,18 +1157,12 @@ void write_bmp(PHYSFS_File *const TGAFile, const unsigned w, const unsigned h)
 {
 	TGA_header TGA;
 	GLbyte HeightH,HeightL,WidthH,WidthL;
-	RAIIdmem<uint8_t[]> buf;
 	const unsigned buffer_size_TGA = w * h * 3;
-	CALLOC(buf, uint8_t[], buffer_size_TGA);
+	const auto buf = std::make_unique<uint8_t[]>(buffer_size_TGA);
 
-	RAIIdmem<uint8_t[]> rgbaBuf;
-	CALLOC(rgbaBuf, uint8_t[], w * h * 4);
-	glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgbaBuf.get());
-	for(unsigned int pixel = 0; pixel < w * h; pixel++) {
-		buf[pixel * 3] = rgbaBuf[pixel * 4 + 2];
-		buf[pixel * 3 + 1] = rgbaBuf[pixel * 4 + 1];
-		buf[pixel * 3 + 2] = rgbaBuf[pixel * 4];
-	}
+	glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, buf.get());
+	for (const auto pixel : xrange(w * h))
+		std::swap(buf[pixel * 3], buf[pixel * 3 + 2]);
 
 	HeightH = static_cast<GLbyte>(h / 256);
 	HeightL = static_cast<GLbyte>(h % 256);

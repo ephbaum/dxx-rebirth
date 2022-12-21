@@ -41,19 +41,13 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "physfsx.h"
 #include "switch.h"
 #include "game.h"
-#include "newmenu.h"
-#if DXX_USE_EDITOR
-#include "editor/editor.h"
-#include "editor/esegment.h"
-#include "d_range.h"
-#endif
 #include "fuelcen.h"
 #include "hash.h"
-#include "key.h"
 #include "piggy.h"
 #include "gamesave.h"
 #include "compiler-poison.h"
 #include "compiler-range_for.h"
+#include "d_levelstate.h"
 #include "partial_range.h"
 
 #define REMOVE_EXT(s)  (*(strchr( (s), '.' ))='\0')
@@ -61,68 +55,75 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 int New_file_format_load = 1; // "new file format" is everything newer than d1 shareware
 
 namespace dsx {
+namespace {
+
+static segment_special build_segment_special_from_untrusted(uint8_t untrusted)
+{
+	switch (untrusted)
+	{
+		case static_cast<uint8_t>(segment_special::nothing):
+		case static_cast<uint8_t>(segment_special::fuelcen):
+		case static_cast<uint8_t>(segment_special::repaircen):
+		case static_cast<uint8_t>(segment_special::controlcen):
+		case static_cast<uint8_t>(segment_special::robotmaker):
+#if defined(DXX_BUILD_DESCENT_II)
+		case static_cast<uint8_t>(segment_special::goal_blue):
+		case static_cast<uint8_t>(segment_special::goal_red):
+#endif
+			return segment_special{untrusted};
+		default:
+			return segment_special::nothing;
+	}
+}
+
+static materialization_center_number build_materialization_center_number_from_untrusted(uint8_t untrusted)
+{
+	if (decltype(d_level_shared_robotcenter_state::RobotCenters)::valid_index(untrusted))
+		return materialization_center_number{untrusted};
+	else
+		return materialization_center_number::None;
+}
+
+static station_number build_station_number_from_untrusted(uint8_t untrusted)
+{
+	if (decltype(d_level_unique_fuelcenter_state::Station)::valid_index(untrusted))
+		return station_number{untrusted};
+	else
+		return station_number::None;
+}
 
 /*
  * reads a segment2 structure from a PHYSFS_File
  */
-static void segment2_read(shared_segment &s2, unique_segment &u2, PHYSFS_File *fp)
+static void segment2_read(const msmusegment s2, PHYSFS_File *fp)
 {
-	s2.special = PHYSFSX_readByte(fp);
-	s2.matcen_num = PHYSFSX_readByte(fp);
-	/* station_idx overwritten by caller */
-	PHYSFSX_readByte(fp);
+	s2.s.special = build_segment_special_from_untrusted(PHYSFSX_readByte(fp));
+	s2.s.matcen_num = build_materialization_center_number_from_untrusted(PHYSFSX_readByte(fp));
+	/* station_idx is overwritten by the caller in some cases, but set
+	 * it here for compatibility with how the game previously worked */
+	s2.s.station_idx = build_station_number_from_untrusted(PHYSFSX_readByte(fp));
 	const auto s2_flags = PHYSFSX_readByte(fp);
 #if defined(DXX_BUILD_DESCENT_I)
 	(void)s2_flags;	// descent 2 ambient sound handling
-	if (s2.special >= MAX_CENTER_TYPES)
-		s2.special = SEGMENT_IS_NOTHING; // remove goals etc.
 #elif defined(DXX_BUILD_DESCENT_II)
-	s2.s2_flags = s2_flags;
+	s2.s.s2_flags = s2_flags;
 #endif
-	u2.static_light = PHYSFSX_readFix(fp);
+	s2.u.static_light = PHYSFSX_readFix(fp);
+}
 }
 
 #if defined(DXX_BUILD_DESCENT_I)
 #elif defined(DXX_BUILD_DESCENT_II)
-fix Level_shake_frequency = 0, Level_shake_duration = 0;
-segnum_t Secret_return_segment;
-vms_matrix Secret_return_orient;
 
 int d1_pig_present = 0; // can descent.pig from descent 1 be loaded?
-
-/* returns nonzero if d1_tmap_num references a texture which isn't available in d2. */
-int d1_tmap_num_unique(short d1_tmap_num) {
-	switch (d1_tmap_num) {
-	case   0: case   2: case   4: case   5: case   6: case   7: case   9:
-	case  10: case  11: case  12: case  17: case  18:
-	case  20: case  21: case  25: case  28:
-	case  38: case  39: case  41: case  44: case  49:
-	case  50: case  55: case  57: case  88:
-	case 132: case 141: case 147:
-	case 154: case 155: case 158: case 159:
-	case 160: case 161: case 167: case 168: case 169:
-	case 170: case 171: case 174: case 175: case 185:
-	case 193: case 194: case 195: case 198: case 199:
-	case 200: case 202: case 210: case 211:
-	case 220: case 226: case 227: case 228: case 229: case 230:
-	case 240: case 241: case 242: case 243: case 246:
-	case 250: case 251: case 252: case 253: case 257: case 258: case 259:
-	case 260: case 263: case 266: case 283: case 298:
-	case 315: case 317: case 319: case 320: case 321:
-	case 330: case 331: case 332: case 333: case 349:
-	case 351: case 352: case 353: case 354:
-	case 355: case 357: case 358: case 359:
-	case 362: case 370: return 1;
-	default: return 0;
-	}
-}
 
 /* Converts descent 1 texture numbers to descent 2 texture numbers.
  * Textures from d1 which are unique to d1 have extra spaces around "return".
  * If we can load the original d1 pig, we make sure this function is bijective.
  * This function was updated using the file config/convtabl.ini from devil 2.2.
  */
-short convert_d1_tmap_num(short d1_tmap_num) {
+uint16_t convert_d1_tmap_num(const uint16_t d1_tmap_num)
+{
 	switch (d1_tmap_num) {
 	case 0: case 2: case 4: case 5:
 		// all refer to grey rock001 (exception to bijectivity rule)
@@ -324,6 +325,7 @@ short convert_d1_tmap_num(short d1_tmap_num) {
 	case 368: return 395;
 	case 369: return 396;
 	case 370:  return  d1_pig_present ? 195 : 392; // mntr04d (devil: -1)
+	case 570: return 635;
 	// range 371..584 handled by default case (wall01 and door frames)
 	default:
 		// ranges:
@@ -394,437 +396,20 @@ struct me mine_editor;
 // -----------------------------------------------------------------------------
 //loads from an already-open file
 // returns 0=everything ok, 1=old version, -1=error
-namespace dsx {
-int load_mine_data(PHYSFS_File *LoadFile)
-{
-	auto &TmapInfo = LevelUniqueTmapInfoState.TmapInfo;
-	char old_tmap_list[MAX_TEXTURES][FILENAME_LEN];
-	int 	translate;
-	char 	*temptr;
-	int	mine_start = PHYSFS_tell(LoadFile);
-
-	fuelcen_reset();
-
-#if DXX_USE_EDITOR
-	// Create a new mine to initialize things.
-	//texpage_goto_first();
-	create_new_mine();
-	#endif
-
-	//===================== READ FILE INFO ========================
-
-	// These are the default values... version and fileinfo_sizeof
-	// don't have defaults.
-	mine_fileinfo.header_offset     =   -1;
-	mine_fileinfo.header_size       =   sizeof(mine_header);
-	mine_fileinfo.editor_offset     =   -1;
-	mine_fileinfo.editor_size       =   sizeof(mine_editor);
-	mine_fileinfo.vertex_offset     =   -1;
-	mine_fileinfo.vertex_howmany    =   0;
-	mine_fileinfo.vertex_sizeof     =   sizeof(vms_vector);
-	mine_fileinfo.segment_offset    =   -1;
-	mine_fileinfo.segment_howmany   =   0;
-	mine_fileinfo.segment_sizeof    =   sizeof(segment);
-	mine_fileinfo.newseg_verts_offset     =   -1;
-	mine_fileinfo.newseg_verts_howmany    =   0;
-	mine_fileinfo.newseg_verts_sizeof     =   sizeof(vms_vector);
-	mine_fileinfo.group_offset		  =	-1;
-	mine_fileinfo.group_howmany	  =	0;
-	mine_fileinfo.group_sizeof		  =	sizeof(group);
-	mine_fileinfo.texture_offset    =   -1;
-	mine_fileinfo.texture_howmany   =   0;
- 	mine_fileinfo.texture_sizeof    =   FILENAME_LEN;  // num characters in a name
- 	mine_fileinfo.walls_offset		  =	-1;
-	mine_fileinfo.walls_howmany	  =	0;
-	mine_fileinfo.walls_sizeof		  =	sizeof(wall);  
- 	mine_fileinfo.triggers_offset	  =	-1;
-	mine_fileinfo.triggers_howmany  =	0;
-	mine_fileinfo.triggers_sizeof	  =	sizeof(trigger);  
-	mine_fileinfo.object_offset		=	-1;
-	mine_fileinfo.object_howmany		=	1;
-	mine_fileinfo.object_sizeof		=	sizeof(object);  
-
-#if defined(DXX_BUILD_DESCENT_II)
-	mine_fileinfo.level_shake_frequency		=	0;
-	mine_fileinfo.level_shake_duration		=	0;
-
-	//	Delta light stuff for blowing out light sources.
-//	if (mine_top_fileinfo.fileinfo_version >= 19) {
-		mine_fileinfo.dl_indices_offset		=	-1;
-		mine_fileinfo.dl_indices_howmany		=	0;
-		mine_fileinfo.dl_indices_sizeof		=	sizeof(dl_index);  
-
-		mine_fileinfo.delta_light_offset		=	-1;
-		mine_fileinfo.delta_light_howmany		=	0;
-		mine_fileinfo.delta_light_sizeof		=	sizeof(delta_light);  
-
-//	}
-
-	mine_fileinfo.segment2_offset		= -1;
-	mine_fileinfo.segment2_howmany	= 0;
-	mine_fileinfo.segment2_sizeof    = 0;
-#endif
-
-	// Read in mine_top_fileinfo to get size of saved fileinfo.
-	
-	mine_top_fileinfo = {};
-
-	if (PHYSFSX_fseek( LoadFile, mine_start, SEEK_SET ))
-		Error( "Error moving to top of file in gamemine.c" );
-
-	if (PHYSFS_read( LoadFile, &mine_top_fileinfo, sizeof(mine_top_fileinfo), 1 )!=1)
-		Error( "Error reading mine_top_fileinfo in gamemine.c" );
-
-	if (mine_top_fileinfo.fileinfo_signature != 0x2884)
-		return -1;
-
-	// Check version number
-	if (mine_top_fileinfo.fileinfo_version < COMPATIBLE_VERSION )
-		return -1;
-
-	// Now, Read in the fileinfo
-	if (PHYSFSX_fseek( LoadFile, mine_start, SEEK_SET ))
-		Error( "Error seeking to top of file in gamemine.c" );
-
-	if (PHYSFS_read( LoadFile, &mine_fileinfo, mine_top_fileinfo.fileinfo_sizeof, 1 )!=1)
-		Error( "Error reading mine_fileinfo in gamemine.c" );
-
-#if defined(DXX_BUILD_DESCENT_II)
-	if (mine_top_fileinfo.fileinfo_version < 18) {
-		Level_shake_frequency = 0;
-		Level_shake_duration = 0;
-		Secret_return_segment = segment_first;
-		Secret_return_orient = vmd_identity_matrix;
-	} else {
-		Level_shake_frequency = mine_fileinfo.level_shake_frequency << 12;
-		Level_shake_duration = mine_fileinfo.level_shake_duration << 12;
-		Secret_return_segment = mine_fileinfo.secret_return_segment;
-		Secret_return_orient = mine_fileinfo.secret_return_orient;
-	}
-#endif
-
-	//===================== READ HEADER INFO ========================
-
-	// Set default values.
-	mine_header.num_vertices        =   0;
-	mine_header.num_segments        =   0;
-
-	if (mine_fileinfo.header_offset > -1 )
-	{
-		if (PHYSFSX_fseek( LoadFile, mine_fileinfo.header_offset, SEEK_SET ))
-			Error( "Error seeking to header_offset in gamemine.c" );
-	
-		if (PHYSFS_read( LoadFile, &mine_header, mine_fileinfo.header_size, 1 )!=1)
-			Error( "Error reading mine_header in gamemine.c" );
-	}
-
-	//===================== READ EDITOR INFO ==========================
-
-	// Set default values
-	mine_editor.current_seg         =   0;
-	mine_editor.newsegment_offset   =   -1; // To be written
-	mine_editor.newsegment_size     =   sizeof(segment);
-	mine_editor.Curside             =   0;
-	mine_editor.Markedsegp          =   -1;
-	mine_editor.Markedside          =   0;
-
-	if (mine_fileinfo.editor_offset > -1 )
-	{
-		if (PHYSFSX_fseek( LoadFile, mine_fileinfo.editor_offset, SEEK_SET ))
-			Error( "Error seeking to editor_offset in gamemine.c" );
-	
-		if (PHYSFS_read( LoadFile, &mine_editor, mine_fileinfo.editor_size, 1 )!=1)
-			Error( "Error reading mine_editor in gamemine.c" );
-	}
-
-	//===================== READ TEXTURE INFO ==========================
-
-	if ( (mine_fileinfo.texture_offset > -1) && (mine_fileinfo.texture_howmany > 0))
-	{
-		if (PHYSFSX_fseek( LoadFile, mine_fileinfo.texture_offset, SEEK_SET ))
-			Error( "Error seeking to texture_offset in gamemine.c" );
-
-		for (int i=0; i< mine_fileinfo.texture_howmany; i++ )
-		{
-			if (PHYSFS_read( LoadFile, &old_tmap_list[i], mine_fileinfo.texture_sizeof, 1 )!=1)
-				Error( "Error reading old_tmap_list[i] in gamemine.c" );
-		}
-	}
-
-	//=============== GENERATE TEXTURE TRANSLATION TABLE ===============
-
-	translate = 0;
-	
-	Assert (NumTextures < MAX_TEXTURES);
-
-	{
-		hashtable ht;
-		// Remove all the file extensions in the textures list
-	
-		for (uint_fast32_t i = 0; i < NumTextures;i++)	{
-			temptr = strchr(&TmapInfo[i].filename[0u], '.');
-			if (temptr) *temptr = '\0';
-			hashtable_insert( &ht, &TmapInfo[i].filename[0u], i );
-		}
-	
-		// For every texture, search through the texture list
-		// to find a matching name.
-		for (int j=0;j<mine_fileinfo.texture_howmany;j++) {
-			// Remove this texture name's extension
-			temptr = strchr(old_tmap_list[j], '.');
-			if (temptr) *temptr = '\0';
-	
-			tmap_xlate_table[j] = hashtable_search( &ht,old_tmap_list[j]);
-			if (tmap_xlate_table[j]	< 0 )	{
-				;
-			}
-			if (tmap_xlate_table[j] != j ) translate = 1;
-		}
-	}
-
-	//====================== READ VERTEX INFO ==========================
-
-	// New check added to make sure we don't read in too many vertices.
-	if ( mine_fileinfo.vertex_howmany > MAX_VERTICES )
-		mine_fileinfo.vertex_howmany = MAX_VERTICES;
-
-	if ( (mine_fileinfo.vertex_offset > -1) && (mine_fileinfo.vertex_howmany > 0))
-	{
-		if (PHYSFSX_fseek( LoadFile, mine_fileinfo.vertex_offset, SEEK_SET ))
-			Error( "Error seeking to vertex_offset in gamemine.c" );
-
-		auto &Vertices = LevelSharedVertexState.get_vertices();
-		range_for (auto &i, partial_range(Vertices, mine_fileinfo.vertex_howmany))
-		{
-			// Set the default values for this vertex
-			i.x = 1;
-			i.y = 1;
-			i.z = 1;
-
-			if (PHYSFS_read(LoadFile, &i, mine_fileinfo.vertex_sizeof, 1) != 1)
-				Error( "Error reading Vertices[i] in gamemine.c" );
-		}
-	}
-
-	//==================== READ SEGMENT INFO ===========================
-
-	// New check added to make sure we don't read in too many segments.
-	if ( mine_fileinfo.segment_howmany > MAX_SEGMENTS ) {
-		mine_fileinfo.segment_howmany = MAX_SEGMENTS;
-#if defined(DXX_BUILD_DESCENT_II)
-		mine_fileinfo.segment2_howmany = MAX_SEGMENTS;
-#endif
-	}
-
-	// [commented out by mk on 11/20/94 (weren't we supposed to hit final in October?) because it looks redundant.  I think I'll test it now...]  fuelcen_reset();
-
-	auto &Walls = LevelUniqueWallSubsystemState.Walls;
-	auto &vcwallptr = Walls.vcptr;
-	if ( (mine_fileinfo.segment_offset > -1) && (mine_fileinfo.segment_howmany > 0))	{
-
-		if (PHYSFSX_fseek( LoadFile, mine_fileinfo.segment_offset,SEEK_SET ))
-
-			Error( "Error seeking to segment_offset in gamemine.c" );
-
-		Segments.set_count(mine_fileinfo.segment_howmany);
-
-		for (segnum_t ii = 0; ii < mine_fileinfo.segment_howmany; ++ii)
-		{
-			const auto &i = vmsegptridx(ii);
-
-			// Set the default values for this segment (clear to zero )
-			//memset( &Segments[i], 0, sizeof(segment) );
-
-#if defined(DXX_BUILD_DESCENT_II)
-			if (mine_top_fileinfo.fileinfo_version >= 20)
-			{
-				/*
-				 * The format of v20 segment once matched `struct segment`, but
-				 * this was not enforced with a `static_assert` or even
-				 * commented.  The layout of `struct segment` has since changed
-				 * at least five times.  See commit
-				 * 2665869c24855040837b1864daedd4cc13ab1793 for details.
-				 */
-				Error("Sorry, v20 segment support is broken.");
-			}
-			else
-#endif
-			if (mine_top_fileinfo.fileinfo_version >= 16)
-			{
-				Error("Sorry, v16 segment support is broken.");
-#if 0
-				v16_segment v16_seg;
-
-				Assert(mine_fileinfo.segment_sizeof == sizeof(v16_seg));
-
-#if defined(DXX_BUILD_DESCENT_I)
-				*i = v16_seg;
-#elif defined(DXX_BUILD_DESCENT_II)
-				i->segnum = v16_seg.segnum;
-				// -- Segments[i].pad = v16_seg.pad;
-
-				for (int j=0; j<MAX_SIDES_PER_SEGMENT; j++)
-					i->sides[j] = v16_seg.sides[j];
-
-				for (int j=0; j<MAX_SIDES_PER_SEGMENT; j++)
-					i->children[j] = v16_seg.children[j];
-
-				for (int j=0; j<MAX_VERTICES_PER_SEGMENT; j++)
-					i->verts[j] = v16_seg.verts[j];
-
-				i->special = v16_seg.special;
-				i->station_idx = v16_seg.value;
-				i->s2_flags = 0;
-				i->matcen_num = v16_seg.matcen_num;
-				i->static_light = v16_seg.static_light;
-#endif
-#endif
-				fuelcen_activate(i);
-			}
-			else 
-				Error("Invalid mine version");
-
-			i->objects = object_none;
-#if DXX_USE_EDITOR
-			i->group = -1;
-			#endif
-
-			if (translate == 1)
-				for (int j=0;j<MAX_SIDES_PER_SEGMENT;j++) {
-					unsigned short orient;
-					auto &iusidej = i->unique_segment::sides[j];
-					const auto tmap_xlate = iusidej.tmap_num;
-					iusidej.tmap_num = tmap_xlate_table[tmap_xlate];
-					const auto render = (WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, i, i, j) & WID_RENDER_FLAG);
-					if (render)
-						if (iusidej.tmap_num < 0)	{
-							Int3();
-							iusidej.tmap_num = NumTextures-1;
-						}
-					orient = iusidej.tmap_num2 & (~TMAP_NUM_MASK);
-					if (const auto tmap2_xlate = iusidej.tmap_num2 & TMAP_NUM_MASK)
-					{
-						int xlated_tmap = tmap_xlate_table[tmap2_xlate];
-
-						iusidej.tmap_num2 = xlated_tmap | orient;
-						if (render)
-							if (xlated_tmap <= 0)	{
-								Int3();
-								iusidej.tmap_num2 = NumTextures-1;
-							}
-					}
-				}
-		}
-
-#if defined(DXX_BUILD_DESCENT_II)
-		if (mine_top_fileinfo.fileinfo_version >= 20)
-			range_for (const auto &&segp, vmsegptridx)
-			{
-				segment2_read(segp, segp, LoadFile);
-				fuelcen_activate(segp);
-			}
-#endif
-	}
-
-	//===================== READ NEWSEGMENT INFO =====================
-
-#if DXX_USE_EDITOR
-
-	{		// Default segment created.
-		med_create_new_segment({DEFAULT_X_SIZE, DEFAULT_Y_SIZE, DEFAULT_Z_SIZE});		// New_segment = Segments[0];
-		//memset( &New_segment, 0, sizeof(segment) );
-	}
-
-	if (mine_editor.newsegment_offset > -1)
-	{
-		if (PHYSFSX_fseek( LoadFile, mine_editor.newsegment_offset,SEEK_SET ))
-			Error( "Error seeking to newsegment_offset in gamemine.c" );
-		Error("Sorry, v20 segment support is broken.");
-	}
-
-	auto &Vertices = LevelSharedVertexState.get_vertices();
-	if ( (mine_fileinfo.newseg_verts_offset > -1) && (mine_fileinfo.newseg_verts_howmany > 0))
-	{
-		if (PHYSFSX_fseek( LoadFile, mine_fileinfo.newseg_verts_offset, SEEK_SET ))
-			Error( "Error seeking to newseg_verts_offset in gamemine.c" );
-		auto &vmvertptr = Vertices.vmptr;
-		for (unsigned i = 0; i < mine_fileinfo.newseg_verts_howmany; ++i)
-		{
-			// Set the default values for this vertex
-			auto &v = *vmvertptr(NEW_SEGMENT_VERTICES+i);
-			v.x = 1;
-			v.y = 1;
-			v.z = 1;
-			if (PHYSFS_read(LoadFile, &v, mine_fileinfo.newseg_verts_sizeof, 1) != 1)
-				Error( "Error reading Vertices[NEW_SEGMENT_VERTICES+i] in gamemine.c" );
-
-			New_segment.verts[i] = NEW_SEGMENT_VERTICES+i;
-		}
-	}
-
-	#endif
-															
-	//========================= UPDATE VARIABLES ======================
-
-#if DXX_USE_EDITOR
-
-	// Setting to Markedsegp to NULL ignores Curside and Markedside, which
-	// we want to do when reading in an old file.
-	
- 	Markedside = mine_editor.Markedside;
-	Curside = mine_editor.Curside;
-	range_for (const int i, xrange(10u))
-		Groupside[i] = mine_editor.Groupside[i];
-
-	Cursegp = mine_editor.current_seg != -1 ? imsegptridx(static_cast<segnum_t>(mine_editor.current_seg)) : imsegptridx(segment_first);
-	Markedsegp = mine_editor.Markedsegp != -1 ? imsegptridx(static_cast<segnum_t>(mine_editor.Markedsegp)) : segment_none;
-
-	num_groups = 0;
-	current_group = -1;
-
-	#endif
-
-	LevelSharedVertexState.Num_vertices = mine_fileinfo.vertex_howmany;
-	Vertices.set_count(LevelSharedVertexState.Num_vertices);
-	LevelSharedSegmentState.Num_segments = mine_fileinfo.segment_howmany;
-	Segments.set_count(LevelSharedSegmentState.Num_segments);
-
-	reset_objects(LevelUniqueObjectState, 1);		//one object, the player
-
-#if DXX_USE_EDITOR
-	Vertices.set_count(MAX_SEGMENT_VERTICES);
-	Segments.set_count(MAX_SEGMENTS);
-	set_vertex_counts();
-	Vertices.set_count(LevelSharedVertexState.Num_vertices);
-	Segments.set_count(LevelSharedSegmentState.Num_segments);
-
-	warn_if_concave_segments();
-	#endif
-
-#if DXX_USE_EDITOR
-	validate_segment_all(LevelSharedSegmentState);
-	#endif
-
-	//create_local_segment_data();
-
-	//gamemine_find_textures();
-
-	if (mine_top_fileinfo.fileinfo_version < MINE_VERSION )
-		return 1;		//old version
-	else
-		return 0;
-
-}
-}
 #endif
 
 #define COMPILED_MINE_VERSION 0
 
-static void read_children(shared_segment &segp, const unsigned bit_mask, PHYSFS_File *const LoadFile)
+namespace {
+
+static void read_children(shared_segment &segp, const sidemask_t bit_mask, PHYSFS_File *const LoadFile)
 {
-	for (int bit=0; bit<MAX_SIDES_PER_SEGMENT; bit++) {
-		if (bit_mask & (1 << bit)) {
-			segp.children[bit] = PHYSFSX_readShort(LoadFile);
+	for (const auto bit : MAX_SIDES_PER_SEGMENT)
+	{
+		if (bit_mask & build_sidemask(bit))
+		{
+			const auto s = segnum_t{static_cast<uint16_t>(PHYSFSX_readShort(LoadFile))};
+			segp.children[bit] = (imsegidx_t::check_nothrow_index(s) || s == segment_exit) ? s : segment_none;
 		} else
 			segp.children[bit] = segment_none;
 	}
@@ -833,35 +418,46 @@ static void read_children(shared_segment &segp, const unsigned bit_mask, PHYSFS_
 static void read_verts(shared_segment &segp, PHYSFS_File *const LoadFile)
 {
 	// Read short Segments[segnum].verts[MAX_VERTICES_PER_SEGMENT]
-	range_for (auto &i, segp.verts)
-		i = PHYSFSX_readShort(LoadFile);
-}
-
-static void read_special(shared_segment &segp, const unsigned bit_mask, PHYSFS_File *const LoadFile)
-{
-	if (bit_mask & (1 << MAX_SIDES_PER_SEGMENT)) {
-		// Read ubyte	Segments[segnum].special
-		segp.special = PHYSFSX_readByte(LoadFile);
-		// Read byte	Segments[segnum].matcen_num
-		segp.matcen_num = PHYSFSX_readByte(LoadFile);
-		// Read short	Segments[segnum].value
-		segp.station_idx = PHYSFSX_readShort(LoadFile);
-	} else {
-		segp.special = 0;
-		segp.matcen_num = -1;
-		segp.station_idx = station_none;
+	range_for (auto &v, segp.verts)
+	{
+		const std::size_t i = PHYSFSX_readShort(LoadFile);
+		if (i >= MAX_VERTICES)
+			throw std::invalid_argument("vertex number too large");
+		v = static_cast<vertnum_t>(i);
 	}
 }
 
-namespace dsx {
-int load_mine_data_compiled(PHYSFS_File *LoadFile)
+static void read_special(shared_segment &segp, const sidemask_t bit_mask, PHYSFS_File *const LoadFile)
 {
+	if (bit_mask & build_sidemask(MAX_SIDES_PER_SEGMENT))
+	{
+		// Read ubyte	Segments[segnum].special
+		segp.special = build_segment_special_from_untrusted(PHYSFSX_readByte(LoadFile));
+		// Read byte	Segments[segnum].matcen_num
+		segp.matcen_num = build_materialization_center_number_from_untrusted(PHYSFSX_readByte(LoadFile));
+		// Read short	Segments[segnum].value
+		segp.station_idx = build_station_number_from_untrusted(PHYSFSX_readShort(LoadFile));
+	} else {
+		segp.special = segment_special::nothing;
+		segp.matcen_num = materialization_center_number::None;
+		segp.station_idx = station_number::None;
+	}
+}
+
+}
+
+namespace dsx {
+
+int load_mine_data_compiled(PHYSFS_File *LoadFile, const char *const Gamesave_current_filename)
+{
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	ubyte   compiled_version;
 	short   temp_short;
-	ushort  temp_ushort = 0;
-	ubyte   bit_mask;
 
 #if defined(DXX_BUILD_DESCENT_II)
+	LevelSharedSeismicState.Level_shake_frequency = 0;
+	LevelSharedSeismicState.Level_shake_duration = 0;
 	d1_pig_present = PHYSFSX_exists(D1_PIGFILE,1);
 #endif
 	if (!strcmp(strchr(Gamesave_current_filename, '.'), ".sdl"))
@@ -886,13 +482,14 @@ int load_mine_data_compiled(PHYSFS_File *LoadFile)
 	compiled_version = PHYSFSX_readByte(LoadFile);
 	(void)compiled_version;
 
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	DXX_POISON_VAR(Vertices, 0xfc);
-	if (New_file_format_load)
-		LevelSharedVertexState.Num_vertices = PHYSFSX_readShort(LoadFile);
-	else
-		LevelSharedVertexState.Num_vertices = PHYSFSX_readInt(LoadFile);
-	assert(LevelSharedVertexState.Num_vertices <= MAX_VERTICES);
+	const unsigned Num_vertices = New_file_format_load
+		? PHYSFSX_readShort(LoadFile)
+		: PHYSFSX_readInt(LoadFile);
+	assert(Num_vertices <= MAX_VERTICES);
+#if DXX_USE_EDITOR
+	LevelSharedVertexState.Num_vertices = Num_vertices;
+#endif
 
 	DXX_POISON_VAR(Segments, 0xfc);
 	if (New_file_format_load)
@@ -901,96 +498,101 @@ int load_mine_data_compiled(PHYSFS_File *LoadFile)
 		LevelSharedSegmentState.Num_segments = PHYSFSX_readInt(LoadFile);
 	assert(LevelSharedSegmentState.Num_segments <= MAX_SEGMENTS);
 
-	range_for (auto &i, partial_range(Vertices, LevelSharedVertexState.Num_vertices))
+	range_for (auto &i, partial_range(Vertices, Num_vertices))
 		PHYSFSX_readVector(LoadFile, i);
 
 	const auto Num_segments = LevelSharedSegmentState.Num_segments;
-	for (segnum_t segnum=0; segnum < Num_segments; segnum++ )	{
-		const auto segp = vmsegptr(segnum);
+	/* Editor builds need both the segment index and segment pointer.
+	 * Non-editor builds need only the segment pointer.
+	 */
+#if DXX_USE_EDITOR
+#define dxx_segment_iteration_factory vmptridx
+#else
+#define dxx_segment_iteration_factory vmptr
+#endif
+	for (auto &&segpi : partial_range(Segments.dxx_segment_iteration_factory, Num_segments))
+#undef dxx_segment_iteration_factory
+	{
+		const msmusegment segp = segpi;
 
 #if DXX_USE_EDITOR
-		segp->segnum = segnum;
-		segp->group = 0;
+		segp.s.segnum = segpi;
+		segp.s.group = 0;
 		#endif
 
-		if (New_file_format_load)
-			bit_mask = PHYSFSX_readByte(LoadFile);
-		else
-			bit_mask = 0x7f; // read all six children and special stuff...
+		const sidemask_t children_mask = New_file_format_load
+			? static_cast<sidemask_t>(PHYSFSX_readByte(LoadFile))
+			: sidemask_t{0x7f};	// read all six children and special stuff...
 
 		if (Gamesave_current_version == 5) { // d2 SHAREWARE level
-			read_special(segp,bit_mask,LoadFile);
+			read_special(segp, children_mask, LoadFile);
 			read_verts(segp,LoadFile);
-			read_children(segp,bit_mask,LoadFile);
+			read_children(segp, children_mask, LoadFile);
 		} else {
-			read_children(segp,bit_mask,LoadFile);
+			read_children(segp, children_mask, LoadFile);
 			read_verts(segp,LoadFile);
 			if (Gamesave_current_version <= 1) { // descent 1 level
-				read_special(segp,bit_mask,LoadFile);
+				read_special(segp, children_mask, LoadFile);
 			}
 		}
 
-		segp->objects = object_none;
+		segp.u.objects = object_none;
 
 		if (Gamesave_current_version <= 5) { // descent 1 thru d2 SHAREWARE level
 			// Read fix	Segments[segnum].static_light (shift down 5 bits, write as short)
-			temp_ushort = PHYSFSX_readShort(LoadFile);
-			segp->static_light	= static_cast<fix>(temp_ushort) << 4;
-			//PHYSFS_read( LoadFile, &Segments[segnum].static_light, sizeof(fix), 1 );
+			const uint16_t temp_static_light = PHYSFSX_readShort(LoadFile);
+			segp.u.static_light = static_cast<fix>(temp_static_light) << 4;
 		}
 
 		// Read the walls as a 6 byte array
-		if (New_file_format_load)
-			bit_mask = PHYSFSX_readByte(LoadFile);
-		else
-			bit_mask = 0x3f; // read all six sides
-		for (int sidenum=0; sidenum<MAX_SIDES_PER_SEGMENT; sidenum++) {
-			ubyte byte_wallnum;
-
-			auto &sside = segp->shared_segment::sides[sidenum];
-			if (bit_mask & (1 << sidenum)) {
-				byte_wallnum = PHYSFSX_readByte(LoadFile);
+		const sidemask_t wall_mask = New_file_format_load
+			? static_cast<sidemask_t>(PHYSFSX_readByte(LoadFile))
+			: sidemask_t{0x3f}; // read all six sides
+		for (const auto sidenum : MAX_SIDES_PER_SEGMENT)
+		{
+			auto &sside = segp.s.sides[sidenum];
+			if (wall_mask & build_sidemask(sidenum))
+			{
+				const uint8_t byte_wallnum = PHYSFSX_readByte(LoadFile);
 				if ( byte_wallnum == 255 )
 					sside.wall_num = wall_none;
 				else
-					sside.wall_num = byte_wallnum;
+					sside.wall_num = wallnum_t{byte_wallnum};
 			} else
 					sside.wall_num = wall_none;
 		}
 
-		for (int sidenum=0; sidenum<MAX_SIDES_PER_SEGMENT; sidenum++ ) {
-			auto &uside = segp->unique_segment::sides[sidenum];
-			if (segp->children[sidenum] == segment_none || segp->shared_segment::sides[sidenum].wall_num != wall_none)	{
+		for (const auto sidenum : MAX_SIDES_PER_SEGMENT)
+		{
+			auto &uside = segp.u.sides[sidenum];
+			if (segp.s.children[sidenum] == segment_none || segp.s.sides[sidenum].wall_num != wall_none)	{
 				// Read short Segments[segnum].sides[sidenum].tmap_num;
-				temp_ushort = PHYSFSX_readShort(LoadFile);
+				const uint16_t temp_tmap1_num = PHYSFSX_readShort(LoadFile);
 #if defined(DXX_BUILD_DESCENT_I)
-				uside.tmap_num = convert_tmap(temp_ushort & 0x7fff);
+				uside.tmap_num = build_texture1_value(convert_tmap(temp_tmap1_num & 0x7fff));
 
-				if (New_file_format_load && !(temp_ushort & 0x8000))
-					uside.tmap_num2 = 0;
+				if (New_file_format_load && !(temp_tmap1_num & 0x8000))
+					uside.tmap_num2 = texture2_value::None;
 				else {
 					// Read short Segments[segnum].sides[sidenum].tmap_num2;
-					uside.tmap_num2 = PHYSFSX_readShort(LoadFile);
-					uside.tmap_num2 =
-						(convert_tmap(uside.tmap_num2 & 0x3fff)) |
-						(uside.tmap_num2 & 0xc000);
+					const auto tmap_num2 = texture2_value{static_cast<uint16_t>(PHYSFSX_readShort(LoadFile))};
+					uside.tmap_num2 = build_texture2_value(convert_tmap(get_texture_index(tmap_num2)), get_texture_rotation_high(tmap_num2));
 				}
 #elif defined(DXX_BUILD_DESCENT_II)
-				if (New_file_format_load) {
-					uside.tmap_num = temp_ushort & 0x7fff;
-				} else
-					uside.tmap_num = temp_ushort;
+				const uint16_t masked_temp_tmap1_num = New_file_format_load ? (temp_tmap1_num & 0x7fff) : temp_tmap1_num;
+				uside.tmap_num = build_texture1_value(masked_temp_tmap1_num);
 
 				if (Gamesave_current_version <= 1)
-					uside.tmap_num = convert_d1_tmap_num(uside.tmap_num);
+					uside.tmap_num = build_texture1_value(convert_d1_tmap_num(get_texture_index(uside.tmap_num)));
 
-				if (New_file_format_load && !(temp_ushort & 0x8000))
-					uside.tmap_num2 = 0;
+				if (New_file_format_load && !(temp_tmap1_num & 0x8000))
+					uside.tmap_num2 = texture2_value::None;
 				else {
 					// Read short Segments[segnum].sides[sidenum].tmap_num2;
-					uside.tmap_num2 = PHYSFSX_readShort(LoadFile);
-					if (Gamesave_current_version <= 1 && uside.tmap_num2 != 0)
-						uside.tmap_num2 = convert_d1_tmap_num(uside.tmap_num2);
+					const auto tmap_num2 = static_cast<texture2_value>(PHYSFSX_readShort(LoadFile));
+					uside.tmap_num2 = (Gamesave_current_version <= 1 && tmap_num2 != texture2_value::None)
+						? build_texture2_value(convert_d1_tmap_num(get_texture_index(tmap_num2)), get_texture_rotation_high(tmap_num2))
+						: tmap_num2;
 				}
 #endif
 
@@ -1000,19 +602,18 @@ int load_mine_data_compiled(PHYSFS_File *LoadFile)
 					i.u = static_cast<fix>(temp_short) << 5;
 					temp_short = PHYSFSX_readShort(LoadFile);
 					i.v = static_cast<fix>(temp_short) << 5;
-					temp_ushort = PHYSFSX_readShort(LoadFile);
-					i.l = static_cast<fix>(temp_ushort) << 1;
-					//PHYSFS_read( LoadFile, &i.l, sizeof(fix), 1 );
+					const uint16_t temp_light = PHYSFSX_readShort(LoadFile);
+					i.l = static_cast<fix>(temp_light) << 1;
 				}
 			} else {
-				uside.tmap_num = 0;
-				uside.tmap_num2 = 0;
+				uside.tmap_num = texture1_value::None;
+				uside.tmap_num2 = texture2_value::None;
 				uside.uvls = {};
 			}
 		}
 	}
 
-	Vertices.set_count(LevelSharedVertexState.Num_vertices);
+	Vertices.set_count(Num_vertices);
 	Segments.set_count(Num_segments);
 
 	validate_segment_all(LevelSharedSegmentState);			// Fill in side type and normals.
@@ -1020,7 +621,7 @@ int load_mine_data_compiled(PHYSFS_File *LoadFile)
 	range_for (const auto &&pi, vmsegptridx)
 	{
 		if (Gamesave_current_version > 5)
-			segment2_read(pi, pi, LoadFile);
+			segment2_read(pi, LoadFile);
 		fuelcen_activate(pi);
 	}
 

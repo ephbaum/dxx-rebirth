@@ -41,12 +41,12 @@
 
 #include "dxxsconf.h"
 #include "snddecom.h"
-#include "compiler-array.h"
+#include <array>
 
-const array<int, 16> index_table{{
+const std::array<int, 16> index_table{{
 	-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8
 }};
-const array<int, 89> step_table{{
+const std::array<int, 89> step_table{{
 	7, 8, 9, 10, 11, 12, 13, 14,
 		      16,  17,	19,  21,  23,  25,  28,
 		      31,  34,	37,  41,  45,  50,  55,

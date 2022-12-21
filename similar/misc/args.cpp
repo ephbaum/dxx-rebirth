@@ -22,7 +22,6 @@
 #include "strutil.h"
 #include "digi.h"
 #include "game.h"
-#include "gauges.h"
 #include "console.h"
 #include "mission.h"
 #if DXX_USE_UDP
@@ -34,22 +33,19 @@
 
 namespace dcx {
 CArg CGameArg;
-constexpr std::integral_constant<std::size_t, 1000> MAX_ARGS{};
-typedef std::vector<std::string> Arglist;
 
 namespace {
 
+constexpr std::integral_constant<std::size_t, 1000> MAX_ARGS{};
+typedef std::vector<std::string> Arglist;
+
 class ini_entry
 {
-	std::string m_filename;
 public:
+	const std::string filename;
 	ini_entry(std::string &&f) :
-		m_filename(std::move(f))
+		filename(std::move(f))
 	{
-	}
-	const std::string &filename() const
-	{
-		return m_filename;
 	}
 };
 
@@ -68,19 +64,13 @@ public:
 class missing_parameter : public argument_exception
 {
 public:
-	missing_parameter(std::string &&a) :
-		argument_exception(std::move(a))
-	{
-	}
+	using argument_exception::argument_exception;
 };
 
 class unhandled_argument : public argument_exception
 {
 public:
-	unhandled_argument(std::string &&a) :
-		argument_exception(std::move(a))
-	{
-	}
+	using argument_exception::argument_exception;
 };
 
 class conversion_failure : public argument_exception
@@ -97,11 +87,9 @@ class nesting_depth_exceeded
 {
 };
 
-}
-
 static void AppendIniArgs(const char *filename, Arglist &Args)
 {
-	if (auto f = PHYSFSX_openReadBuffered(filename))
+	if (auto f = PHYSFSX_openReadBuffered(filename).first)
 	{
 		PHYSFSX_gets_line_t<1024> line;
 		while (Args.size() < MAX_ARGS && PHYSFSX_fgets(line, f))
@@ -153,9 +141,6 @@ static void arg_port_number(Arglist::iterator &pp, Arglist::const_iterator end, 
 static void InitGameArg()
 {
 	CGameArg.SysMaxFPS = MAXIMUM_FPS;
-#if defined(DXX_BUILD_DESCENT_II)
-	GameArg.SndDigiSampleRate = SAMPLE_RATE_22K;
-#endif
 #if DXX_USE_UDP
 	CGameArg.MplUdpHostAddr = UDP_MANUAL_ADDR_DEFAULT;
 #if DXX_USE_TRACKER
@@ -168,6 +153,9 @@ static void InitGameArg()
 #if DXX_USE_OGL
 	CGameArg.OglSyncMethod = OGL_SYNC_METHOD_DEFAULT;
 	CGameArg.OglSyncWait = OGL_SYNC_WAIT_DEFAULT;
+#if DXX_USE_STEREOSCOPIC_RENDER
+	CGameArg.OglStereo = false;
+#endif
 	CGameArg.DbgGlIntensity4Ok 	= true;
 	CGameArg.DbgGlLuminance4Alpha4Ok = true;
 	CGameArg.DbgGlRGBA2Ok = true;
@@ -178,16 +166,28 @@ static void InitGameArg()
 
 }
 
+}
+
 namespace dsx {
 
 Arg GameArg;
+
+namespace {
+
+static void InitGameArg()
+{
+#if defined(DXX_BUILD_DESCENT_II)
+	GameArg.SndDigiSampleRate = SAMPLE_RATE_22K;
+#endif
+	::dcx::InitGameArg();
+}
 
 static void ReadCmdArgs(Inilist &ini, Arglist &Args);
 
 static void ReadIniArgs(Inilist &ini)
 {
 	Arglist Args;
-	AppendIniArgs(ini.back().filename().c_str(), Args);
+	AppendIniArgs(ini.back().filename.c_str(), Args);
 	ReadCmdArgs(ini, Args);
 	ini.pop_back();
 }
@@ -296,6 +296,12 @@ static void ReadCmdArgs(Inilist &ini, Arglist &Args)
 			CGameArg.OglSyncWait = arg_integer(pp, end);
 		else if (!d_stricmp(p, "-gl_darkedges"))
 			CGameArg.OglDarkEdges = true;
+#if DXX_USE_STEREOSCOPIC_RENDER
+		else if (!d_stricmp(p, "-gl_stereo"))
+			CGameArg.OglStereo = true;
+		else if (!d_stricmp(p, "-gl_stereoview"))
+			CGameArg.OglStereoView = arg_integer(pp, end);
+#endif
 #endif
 
 	// Multiplayer Options
@@ -349,9 +355,15 @@ static void ReadCmdArgs(Inilist &ini, Arglist &Args)
 	// Debug Options
 
 		else if (!d_stricmp(p, "-debug"))
-			CGameArg.DbgVerbose 	= CON_DEBUG;
+		{
+			if (CGameArg.DbgVerbose < CON_DEBUG)
+				CGameArg.DbgVerbose = CON_DEBUG;
+		}
 		else if (!d_stricmp(p, "-verbose"))
-			CGameArg.DbgVerbose 	= CON_VERBOSE;
+		{
+			if (CGameArg.DbgVerbose < CON_VERBOSE)
+				CGameArg.DbgVerbose = CON_VERBOSE;
+		}
 
 		else if (!d_stricmp(p, "-no-grab"))
 			CGameArg.DbgForbidConsoleGrab = true;
@@ -413,7 +425,11 @@ static void ReadCmdArgs(Inilist &ini, Arglist &Args)
 
 }
 
+}
+
 namespace dcx {
+
+namespace {
 
 static void PostProcessGameArg()
 {
@@ -444,11 +460,13 @@ static std::string ConstructIniStackExplanation(const Inilist &ini)
 	result += " while processing \"";
 	for (;;)
 	{
-		result += i->filename();
+		result += i->filename;
 		if (++ i == e)
 			return result += "\"";
 		result += "\"\n    included from \"";
 	}
+}
+
 }
 
 }

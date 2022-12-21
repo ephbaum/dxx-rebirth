@@ -29,28 +29,49 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #include <physfs.h>
 #include "vecmat.h"
-#include "weapon.h"
+#include "fwd-weapon.h"
 
 #ifdef __cplusplus
 #include <algorithm>
 #include "pack.h"
 #include "dxxsconf.h"
-#include "compiler-array.h"
 #include "objnum.h"
 #include "player-callsign.h"
 
 #if defined(DXX_BUILD_DESCENT_I) || defined(DXX_BUILD_DESCENT_II)
+#include "fwd-segment.h"
 #include "player-flags.h"
 #include "valptridx.h"
+#include <array>
 
 namespace dcx {
+
+enum class player_connection_status : uint8_t
+{
+	disconnected,
+	playing,
+	waiting,
+	died_in_mine,
+	found_secret,
+	escape_tunnel,
+	end_menu,
+};
+
+struct d_player_unique_endlevel_state
+{
+	segnum_t transition_segnum;
+	segnum_t exit_segnum;
+};
+
+extern d_player_unique_endlevel_state PlayerUniqueEndlevelState;
+
 // When this structure changes, increment the constant
 // SAVE_FILE_VERSION in playsave.c
 struct player : public prohibit_void_ptr<player>
 {
 	// Who am I data
 	callsign_t callsign;   // The callsign of this player, for net purposes.
-	sbyte   connected;              // Is the player connected or not?
+	player_connection_status connected;              // Is the player connected or not?
 	objnum_t     objnum;                 // What object number this player is. (made an int by mk because it's very often referenced)
 
 	//  -- make sure you're 4 byte aligned now!
@@ -67,12 +88,8 @@ struct player : public prohibit_void_ptr<player>
 
 	short   num_kills_level;        // Number of kills this level
 	short   num_kills_total;        // Number of kills total
-	short   num_robots_level;       // Number of initial robots this level
-	short   num_robots_total;       // Number of robots total
-	ushort  hostages_total;         // Total number of hostages.
-	ubyte   hostages_level;         // Number of hostages on this level.
-	sbyte   hours_level;            // Hours played (since time_total can only go up to 9 hours)
-	sbyte   hours_total;            // Hours played (since time_total can only go up to 9 hours)
+	uint8_t hours_level;            // Hours played (since time_total can only go up to 9 hours)
+	uint8_t hours_total;            // Hours played (since time_total can only go up to 9 hours)
 };
 
 DXX_VALPTRIDX_DEFINE_SUBTYPE_TYPEDEFS(player, player);
@@ -87,7 +104,7 @@ struct player_rw
 	// Who am I data
 	callsign_t callsign;   // The callsign of this player, for net purposes.
 	ubyte   net_address[6];         // The network address of the player.
-	sbyte   connected;              // Is the player connected or not?
+	uint8_t connected;              // Is the player connected or not?
 	int     objnum;                 // What object number this player is. (made an int by mk because it's very often referenced)
 	int     n_packets_got;          // How many packets we got from them
 	int     n_packets_sent;         // How many packets we sent to them
@@ -111,7 +128,7 @@ struct player_rw
 	ushort  secondary_weapon_flags; // bit set indicates the player has this weapon.
 #endif
 	union {
-		array<uint16_t, MAX_PRIMARY_WEAPONS> obsolete_primary_ammo;
+		std::array<uint16_t, MAX_PRIMARY_WEAPONS> obsolete_primary_ammo;
 		struct {
 			uint16_t laser_ammo;
 			uint16_t vulcan_ammo;
@@ -165,13 +182,13 @@ namespace dcx {
 
 struct player_ship
 {
-	int     model_num;
+	polygon_model_index model_num;
 	int     expl_vclip_num;
 	fix     mass,drag;
 	fix     max_thrust,reverse_thrust,brakes;       //low_thrust
 	fix     wiggle;
 	fix     max_rotthrust;
-	array<vms_vector, N_PLAYER_GUNS> gun_points;
+	enumerated_array<vms_vector, N_PLAYER_GUNS, gun_num_t> gun_points;
 };
 
 }

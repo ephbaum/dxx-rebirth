@@ -26,14 +26,12 @@ namespace {
 
 struct rod_4point
 {
-	array<cg3s_point *, 4> point_list;
-	array<g3s_point, 4> points;
+	std::array<cg3s_point *, 4> point_list;
+	std::array<g3s_point, 4> points;
 };
 
-}
-
 //compute the corners of a rod.  fills in vertbuf.
-static int calc_rod_corners(rod_4point &rod_point_group, const g3s_point &bot_point,fix bot_width,const g3s_point &top_point,fix top_width)
+static clipping_code calc_rod_corners(rod_4point &rod_point_group, const g3s_point &bot_point,fix bot_width,const g3s_point &top_point,fix top_width)
 {
 	//compute vector from one point to other, do cross product with vector
 	//from eye to get perpendiclar
@@ -87,14 +85,16 @@ static int calc_rod_corners(rod_4point &rod_point_group, const g3s_point &bot_po
 
 	//now code the four points
 
-	ubyte codes_and = 0xff;
+	clipping_code codes_and{0xff};
 	range_for (auto &i, rod_points)
 	{
 		codes_and &= g3_code_point(i);
 	//clear flags for new points (not projected)
-		i.p3_flags = 0;
+		i.p3_flags = {};
 	}
 	return codes_and;
+}
+
 }
 
 //draw a bitmap object that is always facing you
@@ -102,17 +102,17 @@ static int calc_rod_corners(rod_4point &rod_point_group, const g3s_point &bot_po
 void g3_draw_rod_tmap(grs_canvas &canvas, grs_bitmap &bitmap, const g3s_point &bot_point, fix bot_width, const g3s_point &top_point, fix top_width, g3s_lrgb light)
 {
 	rod_4point rod;
-	if (calc_rod_corners(rod,bot_point,bot_width,top_point,top_width))
+	if (calc_rod_corners(rod, bot_point, bot_width, top_point, top_width) != clipping_code::None)
 		return;
 
 	const fix average_light = static_cast<unsigned>(light.r+light.g+light.b)/3;
-	const array<g3s_uvl, 4> uvl_list{{
+	const std::array<g3s_uvl, 4> uvl_list{{
 		{ 0x0200, 0x0200, average_light },
 		{ 0xfe00, 0x0200, average_light },
 		{ 0xfe00, 0xfe00, average_light },
 		{ 0x0200, 0xfe00, average_light }
 	}};
-	const array<g3s_lrgb, 4> lrgb_list{{
+	const std::array<g3s_lrgb, 4> lrgb_list{{
 		light,
 		light,
 		light,
@@ -129,20 +129,20 @@ void g3_draw_bitmap(grs_canvas &canvas, const vms_vector &pos, fix width, fix he
 {
 	g3s_point pnt;
 	fix w,h;
-	if (g3_rotate_point(pnt,pos) & CC_BEHIND)
+	if ((g3_rotate_point(pnt, pos) & clipping_code::behind) != clipping_code::None)
 		return;
 	g3_project_point(pnt);
-	if (pnt.p3_flags & PF_OVERFLOW)
+	if (pnt.p3_flags & projection_flag::overflow)
 		return;
 #ifndef __powerc
-	fix t;
-	if (checkmuldiv(&t,width,Canv_w2,pnt.p3_z))
-		w = fixmul(t,Matrix_scale.x);
+	const auto pz = pnt.p3_z;
+	if (const auto ox = checkmuldiv(width, Canv_w2, pz))
+		w = fixmul(*ox, Matrix_scale.x);
 	else
 		return;
 
-	if (checkmuldiv(&t,height,Canv_h2,pnt.p3_z))
-		h = fixmul(t,Matrix_scale.y);
+	if (const auto oy = checkmuldiv(height, Canv_h2, pz))
+		h = fixmul(*oy, Matrix_scale.y);
 	else
 		return;
 #else
@@ -153,7 +153,7 @@ void g3_draw_bitmap(grs_canvas &canvas, const vms_vector &pos, fix width, fix he
 	h = fixmul(fl2f(((f2fl(height)*fCanv_h2) / fz)), Matrix_scale.y);
 #endif
 	const fix blob0y = pnt.p3_sy - h, blob1x = pnt.p3_sx + w;
-	const array<grs_point, 3> blob_vertices{{
+	const std::array<grs_point, 3> blob_vertices{{
 		{pnt.p3_sx - w, blob0y},
 		{blob1x, blob0y},
 		{blob1x, pnt.p3_sy + h},
@@ -161,7 +161,5 @@ void g3_draw_bitmap(grs_canvas &canvas, const vms_vector &pos, fix width, fix he
 	scale_bitmap(bm, blob_vertices, 0, canvas.cv_bitmap);
 }
 #endif
-
-
 
 }

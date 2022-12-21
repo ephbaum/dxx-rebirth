@@ -29,7 +29,6 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "pstypes.h"
 #include "strutil.h"
 #include "console.h"
-#include "key.h"
 #include "gr.h"
 #include "palette.h"
 #include "newmenu.h"
@@ -43,23 +42,19 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "object.h"
 #include "game.h"
 #include "gameseg.h"
-#include "screens.h"
 #include "wall.h"
 #include "gamemine.h"
 #include "robot.h"
 #include "bm.h"
-#include "menu.h"
 #include "fireball.h"
 #include "switch.h"
 #include "fuelcen.h"
 #include "cntrlcen.h"
 #include "powerup.h"
-#include "hostage.h"
 #include "weapon.h"
 #include "player.h"
 #include "newdemo.h"
 #include "gameseq.h"
-#include "automap.h"
 #include "polyobj.h"
 #include "text.h"
 #include "gamefont.h"
@@ -72,50 +67,12 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "textures.h"
 #include "d_enumerate.h"
 #include "d_range.h"
-
-#include "dxxsconf.h"
+#include "vclip.h"
 #include "compiler-range_for.h"
+#include "d_levelstate.h"
+#include "d_underlying_value.h"
+#include "d_zip.h"
 #include "partial_range.h"
-
-#if defined(DXX_BUILD_DESCENT_I)
-#if DXX_USE_EDITOR
-const char Shareware_level_names[NUM_SHAREWARE_LEVELS][12] = {
-	"level01.rdl",
-	"level02.rdl",
-	"level03.rdl",
-	"level04.rdl",
-	"level05.rdl",
-	"level06.rdl",
-	"level07.rdl"
-};
-
-const char Registered_level_names[NUM_REGISTERED_LEVELS][12] = {
-	"level08.rdl",
-	"level09.rdl",
-	"level10.rdl",
-	"level11.rdl",
-	"level12.rdl",
-	"level13.rdl",
-	"level14.rdl",
-	"level15.rdl",
-	"level16.rdl",
-	"level17.rdl",
-	"level18.rdl",
-	"level19.rdl",
-	"level20.rdl",
-	"level21.rdl",
-	"level22.rdl",
-	"level23.rdl",
-	"level24.rdl",
-	"level25.rdl",
-	"level26.rdl",
-	"level27.rdl",
-	"levels1.rdl",
-	"levels2.rdl",
-	"levels3.rdl"
-};
-#endif
-#endif
 
 char Gamesave_current_filename[PATH_MAX];
 
@@ -142,6 +99,7 @@ int Gamesave_num_org_robots = 0;
 //--unused-- grs_bitmap * Gamesave_saved_bitmap = NULL;
 
 #if DXX_USE_EDITOR
+namespace {
 // Return true if this level has a name of the form "level??"
 // Note that a pathspec can appear at the beginning of the filename.
 static int is_real_level(const char *filename)
@@ -152,7 +110,7 @@ static int is_real_level(const char *filename)
 		return 0;
 
 	return !d_strnicmp(&filename[len-11], "level");
-
+}
 }
 #endif
 
@@ -160,9 +118,11 @@ static int is_real_level(const char *filename)
 
 int Gamesave_num_players=0;
 
+namespace dsx {
 #if defined(DXX_BUILD_DESCENT_I)
-#define MAX_POLYGON_MODELS_NEW 167
-static array<char[FILENAME_LEN], MAX_POLYGON_MODELS_NEW> Save_pof_names;
+namespace {
+
+using savegame_pof_names_type = enumerated_array<char[FILENAME_LEN], 167, polygon_model_index>;
 
 static int convert_vclip(const d_vclip_array &Vclip, int vc)
 {
@@ -175,22 +135,31 @@ static int convert_vclip(const d_vclip_array &Vclip, int vc)
 static int convert_wclip(int wc) {
 	return (wc < Num_wall_anims) ? wc : wc % Num_wall_anims;
 }
+
+}
+
 int convert_tmap(int tmap)
 {
 	if (tmap == -1)
 		return tmap;
     return (tmap >= NumTextures) ? tmap % NumTextures : tmap;
 }
-static int convert_polymod(int polymod) {
+
+namespace {
+static unsigned convert_polymod(const unsigned N_polygon_models, const unsigned polymod)
+{
     return (polymod >= N_polygon_models) ? polymod % N_polygon_models : polymod;
 }
+}
 #elif defined(DXX_BUILD_DESCENT_II)
-static array<char[FILENAME_LEN], MAX_POLYGON_MODELS> Save_pof_names;
+namespace {
+using savegame_pof_names_type = enumerated_array<char[FILENAME_LEN], MAX_POLYGON_MODELS, polygon_model_index>;
+}
 #endif
 
-namespace dsx {
+namespace {
 
-static void verify_object(const d_vclip_array &Vclip, object &obj)
+static void verify_object(const d_level_shared_robot_info_state &LevelSharedRobotInfoState, const d_vclip_array &Vclip, object &obj, const savegame_pof_names_type &Save_pof_names)
 {
 	auto &Robot_info = LevelSharedRobotInfoState.Robot_info;
 	obj.lifeleft = IMMORTAL_TIME;		//all loaded object are immortal, for now
@@ -210,7 +179,7 @@ static void verify_object(const d_vclip_array &Vclip, object &obj)
 		{
 			auto &ri = Robot_info[get_robot_id(obj)];
 #if defined(DXX_BUILD_DESCENT_II)
-			assert(ri.model_num != -1);
+			assert(ri.model_num != polygon_model_index::None);
 				//if you fail this assert, it means that a robot in this level
 				//hasn't been loaded, possibly because he's marked as
 				//non-shareware.  To see what robot number, print obj.id.
@@ -235,16 +204,16 @@ static void verify_object(const d_vclip_array &Vclip, object &obj)
 			//@@if (Robot_info[obj.id].flags & RIF_BIG_RADIUS)
 			//@@	obj.size = (obj.size*3)/2;
 
-			//@@if (obj.control_type==CT_AI && Robot_info[obj.id].attack_type)
+			//@@if (obj.control_source==CT_AI && Robot_info[obj.id].attack_type)
 			//@@	obj.size = obj.size*3/4;
 		}
 
 #if defined(DXX_BUILD_DESCENT_II)
 		if (get_robot_id(obj) == 65)						//special "reactor" robots
-			obj.movement_type = MT_NONE;
+			obj.movement_source = object::movement_type::None;
 #endif
 
-		if (obj.movement_type == MT_PHYSICS)
+		if (obj.movement_source == object::movement_type::physics)
 		{
 			auto &ri = Robot_info[get_robot_id(obj)];
 			obj.mtype.phys_info.mass = ri.mass;
@@ -254,9 +223,9 @@ static void verify_object(const d_vclip_array &Vclip, object &obj)
 	else {		//Robots taken care of above
 		if (obj.render_type == RT_POLYOBJ)
 		{
-			char *name = Save_pof_names[obj.rtype.pobj_info.model_num];
-			for (uint_fast32_t i = 0;i < N_polygon_models;i++)
-				if (!d_stricmp(Pof_names[i],name)) {		//found it!	
+			const auto name = Save_pof_names[obj.rtype.pobj_info.model_num];
+			for (auto &&[i, candidate_name] : enumerate(partial_range(LevelSharedPolygonModelState.Pof_names, LevelSharedPolygonModelState.N_polygon_models)))
+				if (!d_stricmp(candidate_name, name)) {		//found it!	
 					obj.rtype.pobj_info.model_num = i;
 					break;
 				}
@@ -269,7 +238,7 @@ static void verify_object(const d_vclip_array &Vclip, object &obj)
 			set_powerup_id(Powerup_info, Vclip, obj, POW_SHIELD_BOOST);
 			Assert( obj.render_type != RT_POLYOBJ );
 		}
-		obj.control_type = CT_POWERUP;
+		obj.control_source = object::control_type::powerup;
 		obj.size = Powerup_info[get_powerup_id(obj)].size;
 		obj.ctype.powerup_info.creation_time = 0;
 	}
@@ -301,7 +270,7 @@ static void verify_object(const d_vclip_array &Vclip, object &obj)
 	if (obj.type == OBJ_CNTRLCEN)
 	{
 		obj.render_type = RT_POLYOBJ;
-		obj.control_type = CT_CNTRLCEN;
+		obj.control_source = object::control_type::cntrlcen;
 
 #if defined(DXX_BUILD_DESCENT_I)
 		// Make model number is correct...	
@@ -329,7 +298,7 @@ static void verify_object(const d_vclip_array &Vclip, object &obj)
 		//Assert(obj == Player);
 
 		if (&obj == ConsoleObject)
-			init_player_object();
+			init_player_object(LevelSharedPolygonModelState, obj);
 		else
 			if (obj.render_type == RT_POLYOBJ)	//recover from Matt's pof file matchup bug
 				obj.rtype.pobj_info.model_num = Player_ship->model_num;
@@ -343,10 +312,8 @@ static void verify_object(const d_vclip_array &Vclip, object &obj)
 	if (obj.type == OBJ_HOSTAGE)
 	{
 		obj.render_type = RT_HOSTAGE;
-		obj.control_type = CT_POWERUP;
+		obj.control_source = object::control_type::powerup;
 	}
-}
-
 }
 
 //static gs_skip(int len,PHYSFS_File *file)
@@ -356,27 +323,75 @@ static void verify_object(const d_vclip_array &Vclip, object &obj)
 //}
 
 //reads one object of the given version from the given file
-namespace dsx {
 static void read_object(const vmobjptr_t obj,PHYSFS_File *f,int version)
 {
-	const auto poison_obj = reinterpret_cast<uint8_t *>(&*obj);
-	const auto signature = obj_get_signature();
-	DXX_POISON_MEMORY(poison_obj, sizeof(*obj), 0xfd);
-	obj->signature = signature;
+	DXX_POISON_MEMORY(std::span<object>(&*obj, 1), 0xfd);
+	obj->signature = object_signature_t{0};
 	set_object_type(*obj, PHYSFSX_readByte(f));
 	obj->id             = PHYSFSX_readByte(f);
 
+	if (obj->type == OBJ_ROBOT)
+	{
 #if defined(DXX_BUILD_DESCENT_I)
-	if (obj->type == OBJ_ROBOT && get_robot_id(obj) > 23) {
-		set_robot_id(obj, get_robot_id(obj) % 24);
-	}
+		const auto id = get_robot_id(obj);
+		if (id > 23)
+			set_robot_id(obj, id % 24);
 #endif
-	obj->control_type   = PHYSFSX_readByte(f);
-	set_object_movement_type(*obj, PHYSFSX_readByte(f));
-	obj->render_type    = PHYSFSX_readByte(f);
+		obj->matcen_creator = 0;
+	}
+	{
+		uint8_t ctype = PHYSFSX_readByte(f);
+		switch (typename object::control_type{ctype})
+		{
+			case object::control_type::None:
+			case object::control_type::ai:
+			case object::control_type::explosion:
+			case object::control_type::flying:
+			case object::control_type::slew:
+			case object::control_type::flythrough:
+			case object::control_type::weapon:
+			case object::control_type::repaircen:
+			case object::control_type::morph:
+			case object::control_type::debris:
+			case object::control_type::powerup:
+			case object::control_type::light:
+			case object::control_type::remote:
+			case object::control_type::cntrlcen:
+				break;
+			default:
+				ctype = static_cast<uint8_t>(object::control_type::None);
+				break;
+		}
+		obj->control_source = typename object::control_type{ctype};
+	}
+	{
+		uint8_t mtype = PHYSFSX_readByte(f);
+		switch (typename object::movement_type{mtype})
+		{
+			case object::movement_type::None:
+			case object::movement_type::physics:
+			case object::movement_type::spinning:
+				break;
+			default:
+				mtype = static_cast<uint8_t>(object::movement_type::None);
+				break;
+		}
+		obj->movement_source = typename object::movement_type{mtype};
+	}
+	const uint8_t render_type = PHYSFSX_readByte(f);
+	if (valid_render_type(render_type))
+		obj->render_type = render_type_t{render_type};
+	else
+	{
+		LevelError("Level contains bogus render type %#x for object %p; using none instead", render_type, &*obj);
+		obj->render_type = RT_NONE;
+	}
 	obj->flags          = PHYSFSX_readByte(f);
 
-	obj->segnum         = PHYSFSX_readShort(f);
+	{
+		const auto s = segnum_t{static_cast<uint16_t>(PHYSFSX_readShort(f))};
+		obj->segnum = vmsegidx_t::check_nothrow_index(s) ? s : segment_none;
+	}
 	obj->attached_obj   = object_none;
 
 	PHYSFSX_readVector(f, obj->pos);
@@ -385,15 +400,18 @@ static void read_object(const vmobjptr_t obj,PHYSFS_File *f,int version)
 	obj->size           = PHYSFSX_readFix(f);
 	obj->shields        = PHYSFSX_readFix(f);
 
-	PHYSFSX_readVector(f, obj->last_pos);
+	{
+		vms_vector last_pos;
+		PHYSFSX_readVector(f, last_pos);
+	}
 
 	obj->contains_type  = PHYSFSX_readByte(f);
 	obj->contains_id    = PHYSFSX_readByte(f);
 	obj->contains_count = PHYSFSX_readByte(f);
 
-	switch (obj->movement_type) {
+	switch (obj->movement_source) {
 
-		case MT_PHYSICS:
+		case object::movement_type::physics:
 
 			PHYSFSX_readVector(f, obj->mtype.phys_info.velocity);
 			PHYSFSX_readVector(f, obj->mtype.phys_info.thrust);
@@ -410,27 +428,46 @@ static void read_object(const vmobjptr_t obj,PHYSFS_File *f,int version)
 
 			break;
 
-		case MT_SPINNING:
+		case object::movement_type::spinning:
 
 			PHYSFSX_readVector(f, obj->mtype.spin_rate);
 			break;
 
-		case MT_NONE:
+		case object::movement_type::None:
 			break;
 
 		default:
 			Int3();
 	}
 
-	switch (obj->control_type) {
+	switch (obj->control_source) {
 
-		case CT_AI: {
+		case object::control_type::ai: {
 			obj->ctype.ai_info.behavior				= static_cast<ai_behavior>(PHYSFSX_readByte(f));
 
-			range_for (auto &i, obj->ctype.ai_info.flags)
-				i = PHYSFSX_readByte(f);
-
-			obj->ctype.ai_info.hide_segment			= PHYSFSX_readShort(f);
+			std::array<int8_t, 11> ai_info_flags{};
+			PHYSFS_read(f, &ai_info_flags[0], 1, 11);
+			{
+				const uint8_t gun_num = ai_info_flags[0];
+				obj->ctype.ai_info.CURRENT_GUN = (gun_num < MAX_GUNS) ? robot_gun_number{gun_num} : robot_gun_number{};
+			}
+			obj->ctype.ai_info.CURRENT_STATE = build_ai_state_from_untrusted(ai_info_flags[1]).value();
+			obj->ctype.ai_info.GOAL_STATE = build_ai_state_from_untrusted(ai_info_flags[2]).value();
+			obj->ctype.ai_info.PATH_DIR = ai_info_flags[3];
+#if defined(DXX_BUILD_DESCENT_I)
+			obj->ctype.ai_info.SUBMODE = ai_info_flags[4];
+#elif defined(DXX_BUILD_DESCENT_II)
+			obj->ctype.ai_info.SUB_FLAGS = ai_info_flags[4];
+#endif
+			obj->ctype.ai_info.GOALSIDE = build_sidenum_from_untrusted(ai_info_flags[5]).value();
+			obj->ctype.ai_info.CLOAKED = ai_info_flags[6];
+			obj->ctype.ai_info.SKIP_AI_COUNT = ai_info_flags[7];
+			obj->ctype.ai_info.REMOTE_OWNER = ai_info_flags[8];
+			obj->ctype.ai_info.REMOTE_SLOT_NUM = ai_info_flags[9];
+			{
+				const auto s = segnum_t{static_cast<uint16_t>(PHYSFSX_readShort(f))};
+				obj->ctype.ai_info.hide_segment = imsegidx_t::check_nothrow_index(s) ? s : segment_none;
+			}
 			obj->ctype.ai_info.hide_index			= PHYSFSX_readShort(f);
 			obj->ctype.ai_info.path_length			= PHYSFSX_readShort(f);
 			obj->ctype.ai_info.cur_path_index		= PHYSFSX_readShort(f);
@@ -443,7 +480,7 @@ static void read_object(const vmobjptr_t obj,PHYSFS_File *f,int version)
 			break;
 		}
 
-		case CT_EXPLOSION:
+		case object::control_type::explosion:
 
 			obj->ctype.expl_info.spawn_time		= PHYSFSX_readFix(f);
 			obj->ctype.expl_info.delete_time		= PHYSFSX_readFix(f);
@@ -452,7 +489,7 @@ static void read_object(const vmobjptr_t obj,PHYSFS_File *f,int version)
 
 			break;
 
-		case CT_WEAPON:
+		case object::control_type::weapon:
 
 			//do I really need to read these?  Are they even saved to disk?
 
@@ -466,12 +503,12 @@ static void read_object(const vmobjptr_t obj,PHYSFS_File *f,int version)
 
 			break;
 
-		case CT_LIGHT:
+		case object::control_type::light:
 
 			obj->ctype.light_info.intensity = PHYSFSX_readFix(f);
 			break;
 
-		case CT_POWERUP:
+		case object::control_type::powerup:
 
 			if (version >= 25)
 				obj->ctype.powerup_info.count = PHYSFSX_readInt(f);
@@ -480,7 +517,11 @@ static void read_object(const vmobjptr_t obj,PHYSFS_File *f,int version)
 
 			if (obj->type == OBJ_POWERUP)
 			{
-				/* Hostages have control type CT_POWERUP, but object
+				/* Objects loaded from a level file were not ejected by
+				 * the player.
+				 */
+				obj->ctype.powerup_info.flags = 0;
+				/* Hostages have control type object::control_type::powerup, but object
 				 * type OBJ_HOSTAGE.  Hostages are never weapons, so
 				 * prevent checking their IDs.
 				 */
@@ -499,20 +540,20 @@ static void read_object(const vmobjptr_t obj,PHYSFS_File *f,int version)
 			break;
 
 
-		case CT_NONE:
-		case CT_FLYING:
-		case CT_DEBRIS:
+		case object::control_type::None:
+		case object::control_type::flying:
+		case object::control_type::debris:
 			break;
 
-		case CT_SLEW:		//the player is generally saved as slew
+		case object::control_type::slew:		//the player is generally saved as slew
 			break;
 
-		case CT_CNTRLCEN:
+		case object::control_type::cntrlcen:
 			break;
 
-		case CT_MORPH:
-		case CT_FLYTHROUGH:
-		case CT_REPAIRCEN:
+		case object::control_type::morph:
+		case object::control_type::flythrough:
+		case object::control_type::repaircen:
 		default:
 			Int3();
 	
@@ -527,11 +568,13 @@ static void read_object(const vmobjptr_t obj,PHYSFS_File *f,int version)
 		case RT_POLYOBJ: {
 			int tmo;
 
+			obj->rtype.pobj_info.model_num = build_polygon_model_index_from_untrusted(
 #if defined(DXX_BUILD_DESCENT_I)
-			obj->rtype.pobj_info.model_num		= convert_polymod(PHYSFSX_readInt(f));
+				convert_polymod(LevelSharedPolygonModelState.N_polygon_models, PHYSFSX_readInt(f))
 #elif defined(DXX_BUILD_DESCENT_II)
-			obj->rtype.pobj_info.model_num		= PHYSFSX_readInt(f);
+				PHYSFSX_readInt(f)
 #endif
+			);
 
 			range_for (auto &i, obj->rtype.pobj_info.anim_angles)
 				PHYSFSX_readAngleVec(&i, f);
@@ -589,8 +632,10 @@ static void read_object(const vmobjptr_t obj,PHYSFS_File *f,int version)
 
 }
 }
+}
 
 #if DXX_USE_EDITOR
+namespace {
 static int PHYSFSX_writeMatrix(PHYSFS_File *file, const vms_matrix &m)
 {
 	if (PHYSFSX_writeVector(file, m.rvec) < 1 ||
@@ -608,9 +653,11 @@ static int PHYSFSX_writeAngleVec(PHYSFS_File *file, const vms_angvec &v)
 		return 0;
 	return 1;
 }
+}
 
 //writes one object to the given file
 namespace dsx {
+namespace {
 static void write_object(const object &obj, short version, PHYSFS_File *f)
 {
 #if defined(DXX_BUILD_DESCENT_I)
@@ -619,8 +666,8 @@ static void write_object(const object &obj, short version, PHYSFS_File *f)
 	PHYSFSX_writeU8(f, obj.type);
 	PHYSFSX_writeU8(f, obj.id);
 
-	PHYSFSX_writeU8(f, obj.control_type);
-	PHYSFSX_writeU8(f, obj.movement_type);
+	PHYSFSX_writeU8(f, static_cast<uint8_t>(obj.control_source));
+	PHYSFSX_writeU8(f, static_cast<uint8_t>(obj.movement_source));
 	PHYSFSX_writeU8(f, obj.render_type);
 	PHYSFSX_writeU8(f, obj.flags);
 
@@ -632,15 +679,15 @@ static void write_object(const object &obj, short version, PHYSFS_File *f)
 	PHYSFSX_writeFix(f, obj.size);
 	PHYSFSX_writeFix(f, obj.shields);
 
-	PHYSFSX_writeVector(f, obj.last_pos);
+	PHYSFSX_writeVector(f, obj.pos);
 
 	PHYSFSX_writeU8(f, obj.contains_type);
 	PHYSFSX_writeU8(f, obj.contains_id);
 	PHYSFSX_writeU8(f, obj.contains_count);
 
-	switch (obj.movement_type) {
+	switch (obj.movement_source) {
 
-		case MT_PHYSICS:
+		case object::movement_type::physics:
 
 	 		PHYSFSX_writeVector(f, obj.mtype.phys_info.velocity);
 			PHYSFSX_writeVector(f, obj.mtype.phys_info.thrust);
@@ -657,26 +704,39 @@ static void write_object(const object &obj, short version, PHYSFS_File *f)
 
 			break;
 
-		case MT_SPINNING:
+		case object::movement_type::spinning:
 
 			PHYSFSX_writeVector(f, obj.mtype.spin_rate);
 			break;
 
-		case MT_NONE:
+		case object::movement_type::None:
 			break;
 
 		default:
 			Int3();
 	}
 
-	switch (obj.control_type) {
+	switch (obj.control_source) {
 
-		case CT_AI: {
+		case object::control_type::ai: {
 			PHYSFSX_writeU8(f, static_cast<uint8_t>(obj.ctype.ai_info.behavior));
 
-			range_for (auto &i, obj.ctype.ai_info.flags)
-				PHYSFSX_writeU8(f, i);
-
+			std::array<int8_t, 11> ai_info_flags{};
+			ai_info_flags[0] = underlying_value(obj.ctype.ai_info.CURRENT_GUN);
+			ai_info_flags[1] = obj.ctype.ai_info.CURRENT_STATE;
+			ai_info_flags[2] = obj.ctype.ai_info.GOAL_STATE;
+			ai_info_flags[3] = obj.ctype.ai_info.PATH_DIR;
+#if defined(DXX_BUILD_DESCENT_I)
+			ai_info_flags[4] = obj.ctype.ai_info.SUBMODE;
+#elif defined(DXX_BUILD_DESCENT_II)
+			ai_info_flags[4] = obj.ctype.ai_info.SUB_FLAGS;
+#endif
+			ai_info_flags[5] = underlying_value(obj.ctype.ai_info.GOALSIDE);
+			ai_info_flags[6] = obj.ctype.ai_info.CLOAKED;
+			ai_info_flags[7] = obj.ctype.ai_info.SKIP_AI_COUNT;
+			ai_info_flags[8] = obj.ctype.ai_info.REMOTE_OWNER;
+			ai_info_flags[9] = obj.ctype.ai_info.REMOTE_SLOT_NUM;
+			PHYSFS_write(f, &ai_info_flags[0], 1, 11);
 			PHYSFS_writeSLE16(f, obj.ctype.ai_info.hide_segment);
 			PHYSFS_writeSLE16(f, obj.ctype.ai_info.hide_index);
 			PHYSFS_writeSLE16(f, obj.ctype.ai_info.path_length);
@@ -696,7 +756,7 @@ static void write_object(const object &obj, short version, PHYSFS_File *f)
 			break;
 		}
 
-		case CT_EXPLOSION:
+		case object::control_type::explosion:
 
 			PHYSFSX_writeFix(f, obj.ctype.expl_info.spawn_time);
 			PHYSFSX_writeFix(f, obj.ctype.expl_info.delete_time);
@@ -704,22 +764,22 @@ static void write_object(const object &obj, short version, PHYSFS_File *f)
 
 			break;
 
-		case CT_WEAPON:
+		case object::control_type::weapon:
 
 			//do I really need to write these objects?
 
 			PHYSFS_writeSLE16(f, obj.ctype.laser_info.parent_type);
 			PHYSFS_writeSLE16(f, obj.ctype.laser_info.parent_num);
-			PHYSFS_writeSLE32(f, obj.ctype.laser_info.parent_signature.get());
+			PHYSFS_writeSLE32(f, static_cast<uint16_t>(obj.ctype.laser_info.parent_signature));
 
 			break;
 
-		case CT_LIGHT:
+		case object::control_type::light:
 
 			PHYSFSX_writeFix(f, obj.ctype.light_info.intensity);
 			break;
 
-		case CT_POWERUP:
+		case object::control_type::powerup:
 
 #if defined(DXX_BUILD_DESCENT_I)
 			PHYSFS_writeSLE32(f, obj.ctype.powerup_info.count);
@@ -729,20 +789,20 @@ static void write_object(const object &obj, short version, PHYSFS_File *f)
 #endif
 			break;
 
-		case CT_NONE:
-		case CT_FLYING:
-		case CT_DEBRIS:
+		case object::control_type::None:
+		case object::control_type::flying:
+		case object::control_type::debris:
 			break;
 
-		case CT_SLEW:		//the player is generally saved as slew
+		case object::control_type::slew:		//the player is generally saved as slew
 			break;
 
-		case CT_CNTRLCEN:
+		case object::control_type::cntrlcen:
 			break;			//control center object.
 
-		case CT_MORPH:
-		case CT_REPAIRCEN:
-		case CT_FLYTHROUGH:
+		case object::control_type::morph:
+		case object::control_type::repaircen:
+		case object::control_type::flythrough:
 		default:
 			Int3();
 	
@@ -755,7 +815,7 @@ static void write_object(const object &obj, short version, PHYSFS_File *f)
 
 		case RT_MORPH:
 		case RT_POLYOBJ: {
-			PHYSFS_writeSLE32(f, obj.rtype.pobj_info.model_num);
+			PHYSFS_writeSLE32(f, obj.rtype.pobj_info.model_num == polygon_model_index::None ? -1 : underlying_value(obj.rtype.pobj_info.model_num));
 
 			range_for (auto &i, obj.rtype.pobj_info.anim_angles)
 				PHYSFSX_writeAngleVec(f, i);
@@ -788,6 +848,7 @@ static void write_object(const object &obj, short version, PHYSFS_File *f)
 
 }
 }
+}
 #endif
 
 // --------------------------------------------------------------------
@@ -797,8 +858,9 @@ static void write_object(const object &obj, short version, PHYSFS_File *f)
 // Otherwise it loads the appropriate level mine.
 // returns 0=everything ok, 1=old version, -1=error
 namespace dsx {
+namespace {
 
-static void validate_segment_wall(const vcsegptridx_t seg, shared_side &side, const unsigned sidenum)
+static void validate_segment_wall(const vcsegptridx_t seg, shared_side &side, const sidenum_t sidenum)
 {
 	auto &rwn0 = side.wall_num;
 	const auto wn0 = rwn0;
@@ -809,20 +871,26 @@ static void validate_segment_wall(const vcsegptridx_t seg, shared_side &side, co
 	{
 		case WALL_DOOR:
 			{
-				const auto connected_seg = seg->children[sidenum];
+				const auto connected_seg = seg->shared_segment::children[sidenum];
 				if (connected_seg == segment_none)
 				{
 					rwn0 = wall_none;
-					LevelError("segment %u side %u wall %u has no child segment; removing orphan wall.", seg.get_unchecked_index(), sidenum, wn0);
+					LevelError("segment %hu side %u wall %hu has no child segment; removing orphan wall.", seg.get_unchecked_index(), underlying_value(sidenum), underlying_value(wn0));
 					return;
 				}
-				auto &vcseg = *vcsegptr(connected_seg);
-				const unsigned connected_side = find_connect_side(seg, vcseg);
-				const auto wn1 = vcseg.shared_segment::sides[connected_side].wall_num;
+				const shared_segment &vcseg = *vcsegptr(connected_seg);
+				const auto connected_side = find_connect_side(seg, vcseg);
+				if (connected_side == side_none)
+				{
+					rwn0 = wall_none;
+					LevelError("segment %hu side %u wall %u has child segment %hu side %u, but child segment does not link back; removing orphan wall.", seg.get_unchecked_index(), underlying_value(sidenum), underlying_value(wn0), connected_seg, underlying_value(connected_side));
+					return;
+				}
+				const auto wn1 = vcseg.sides[connected_side].wall_num;
 				if (wn1 == wall_none)
 				{
 					rwn0 = wall_none;
-					LevelError("segment %u side %u wall %u has child segment %u side %u, but no wall; removing orphan wall.", seg.get_unchecked_index(), sidenum, wn0, connected_seg, connected_side);
+					LevelError("segment %hu side %u wall %u has child segment %hu side %u, but no wall; removing orphan wall.", seg.get_unchecked_index(), underlying_value(sidenum), static_cast<unsigned>(wn0), connected_seg, underlying_value(connected_side));
 					return;
 				}
 			}
@@ -840,6 +908,7 @@ static int load_game_data(
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vmobjptr = Objects.vmptr;
+	auto &WallAnims = GameSharedState.WallAnims;
 	auto &RobotCenters = LevelSharedRobotcenterState.RobotCenters;
 	const auto &vcsegptridx = vmsegptridx;
 	short game_top_fileinfo_version;
@@ -875,8 +944,8 @@ static int load_game_data(
 	PHYSFSX_fseek(LoadFile, 24, SEEK_CUR);
 
 	trig_size = PHYSFSX_readInt(LoadFile);
-	Assert(trig_size == sizeof(ControlCenterTriggers));
-	(void)trig_size;
+	if (trig_size != sizeof(v1_control_center_triggers))
+		throw std::runtime_error("wrong size for v1_control_center_triggers");
 	PHYSFSX_fseek(LoadFile, 4, SEEK_CUR);
 
 	const unsigned Num_robot_centers = PHYSFSX_readInt(LoadFile);
@@ -899,26 +968,16 @@ static int load_game_data(
 	}
 #endif
 
-	if (game_top_fileinfo_version >= 31) //load mine filename
+	if (game_top_fileinfo_version >= 14) //load mine filename
+	{
 		// read newline-terminated string, not sure what version this changed.
-		PHYSFSX_fgets(Current_level_name,LoadFile);
-	else if (game_top_fileinfo_version >= 14) { //load mine filename
-		// read null-terminated string
-		//must do read one char at a time, since no PHYSFSX_fgets()
-		for (auto p = Current_level_name.next().begin(); (*p = PHYSFSX_fgetc(LoadFile));)
-		{
-			if (++p == Current_level_name.line().end())
-			{
-				p[-1] = 0;
-				while (PHYSFSX_fgetc(LoadFile))
-					;
-				break;
-			}
-		}
+		if (!PHYSFSX_fgets(Current_level_name, LoadFile))
+			*Current_level_name = 0;
 	}
 	else
 		Current_level_name.next()[0]=0;
 
+	savegame_pof_names_type Save_pof_names;
 	if (game_top_fileinfo_version >= 19) {	//load pof names
 		const unsigned N_save_pof_names = PHYSFSX_readShort(LoadFile);
 		if (N_save_pof_names < MAX_POLYGON_MODELS)
@@ -936,14 +995,14 @@ static int load_game_data(
 	Gamesave_num_players = 0;
 
 	if (object_offset > -1) {
-		if (PHYSFSX_fseek( LoadFile, object_offset, SEEK_SET ))
+		if (!PHYSFS_seek(LoadFile, object_offset))
 			Error( "Error seeking to object_offset in gamesave.c" );
 
 		range_for (auto &i, partial_range(Objects, gs_num_objects))
 		{
 			const auto &&o = vmobjptr(&i);
 			read_object(o, LoadFile, game_top_fileinfo_version);
-			verify_object(Vclip, o);
+			verify_object(LevelSharedRobotInfoState, Vclip, o, Save_pof_names);
 		}
 	}
 
@@ -959,34 +1018,39 @@ static int load_game_data(
 			v19_wall w;
 			v19_wall_read(LoadFile, w);
 			nw.segnum	        = w.segnum;
-			nw.sidenum	= w.sidenum;
+			nw.sidenum	= build_sidenum_from_untrusted(w.sidenum).value();
 			nw.linked_wall	= w.linked_wall;
 			nw.type		= w.type;
-			nw.flags		= w.flags & ~WALL_EXPLODING;
+			auto wf = static_cast<wall_flags>(w.flags);
+			wf &= ~wall_flag::exploding;
+			nw.flags = wf;
 			nw.hps		= w.hps;
-			nw.trigger	= w.trigger;
+			nw.trigger	= static_cast<trgnum_t>(w.trigger);
 #if defined(DXX_BUILD_DESCENT_I)
 			nw.clip_num	= convert_wclip(w.clip_num);
 #elif defined(DXX_BUILD_DESCENT_II)
 			nw.clip_num	= w.clip_num;
 #endif
-			nw.keys		= w.keys;
-			nw.state		= WALL_DOOR_CLOSED;
+			nw.keys		= static_cast<wall_key>(w.keys);
+			nw.state		= wall_state::closed;
 		} else {
 			v16_wall w;
 			v16_wall_read(LoadFile, w);
 			nw.segnum = segment_none;
-			nw.sidenum = nw.linked_wall = -1;
+			nw.sidenum = {};
+			nw.linked_wall = wall_none;
 			nw.type		= w.type;
-			nw.flags		= w.flags & ~WALL_EXPLODING;
+			auto wf = static_cast<wall_flags>(w.flags);
+			wf &= ~wall_flag::exploding;
+			nw.flags = wf;
 			nw.hps		= w.hps;
-			nw.trigger	= w.trigger;
+			nw.trigger	= static_cast<trgnum_t>(w.trigger);
 #if defined(DXX_BUILD_DESCENT_I)
 			nw.clip_num	= convert_wclip(w.clip_num);
 #elif defined(DXX_BUILD_DESCENT_II)
 			nw.clip_num	= w.clip_num;
 #endif
-			nw.keys		= w.keys;
+			nw.keys		= static_cast<wall_key>(w.keys);
 		}
 	}
 
@@ -1012,20 +1076,18 @@ static int load_game_data(
 				v30_trigger_read_as_v31(LoadFile, i);
 		}
 		else
-			trigger_read(&i, LoadFile);
+			trigger_read(LoadFile, i);
 #endif
 	}
 
 	//================ READ CONTROL CENTER TRIGGER INFO ===============
 
-	control_center_triggers_read(&ControlCenterTriggers, LoadFile);
+	control_center_triggers_read(ControlCenterTriggers, LoadFile);
 
 	//================ READ MATERIALOGRIFIZATIONATORS INFO ===============
 
-	range_for (auto &&e, enumerate(partial_range(RobotCenters, Num_robot_centers)))
+	for (auto &&[i, r] : enumerate(partial_range(RobotCenters, Num_robot_centers)))
 	{
-		const uint_fast32_t i = e.idx;
-		auto &r = e.value;
 #if defined(DXX_BUILD_DESCENT_I)
 		matcen_info_read(LoadFile, r, game_top_fileinfo_version);
 #elif defined(DXX_BUILD_DESCENT_II)
@@ -1036,8 +1098,8 @@ static int load_game_data(
 			matcen_info_read(LoadFile, r);
 #endif
 			//	Set links in RobotCenters to Station array
-		range_for (auto &seg, partial_const_range(Segments, Highest_segment_index + 1))
-			if (seg.special == SEGMENT_IS_ROBOTMAKER)
+		for (const shared_segment &seg : partial_const_range(Segments, Segments.get_count()))
+			if (seg.special == segment_special::robotmaker)
 				if (seg.matcen_num == i)
 					r.fuelcen_num = seg.station_idx;
 	}
@@ -1087,7 +1149,7 @@ static int load_game_data(
 			auto objsegnum = i.segnum;
 			if (objsegnum > Highest_segment_index)		//bogus object
 			{
-				Warning("Object %p is in non-existent segment %i, highest=%i", &i, objsegnum, Highest_segment_index);
+				Warning("Object %p is in non-existent segment %hu, highest=%hu", &i, objsegnum, Highest_segment_index);
 				i.type = OBJ_NONE;
 			}
 			else {
@@ -1100,22 +1162,21 @@ static int load_game_data(
 
 	// Make sure non-transparent doors are set correctly.
 	range_for (auto &&i, vmsegptridx)
-		range_for (const auto eside, enumerate(i->shared_segment::sides))	// d_zip
+		for (auto &&[side_idx, sside, uside] : enumerate(zip(i->shared_segment::sides, i->unique_segment::sides)))
 		{
-			auto &side = eside.value;
-			if (side.wall_num == wall_none)
+			if (sside.wall_num == wall_none)
 				continue;
-			auto &w = *vmwallptr(side.wall_num);
+			auto &w = *vmwallptr(sside.wall_num);
 			if (w.clip_num != -1)
 			{
-				if (WallAnims[w.clip_num].flags & WCF_TMAP1)
+				auto &wa = WallAnims[w.clip_num];
+				if (wa.flags & WCF_TMAP1)
 				{
-					auto &uside = i->unique_segment::sides[eside.idx];
-					uside.tmap_num = WallAnims[w.clip_num].frames[0];
-					uside.tmap_num2 = 0;
+					uside.tmap_num = build_texture1_value(wa.frames[0]);
+					uside.tmap_num2 = texture2_value();
 				}
 			}
-			validate_segment_wall(i, side, eside.idx);
+			validate_segment_wall(i, sside, side_idx);
 		}
 
 	auto &ActiveDoors = LevelUniqueWallSubsystemState.ActiveDoors;
@@ -1125,7 +1186,8 @@ static int load_game_data(
 	range_for (const auto &&p, vmwallptr)
 	{
 		auto &w = *p;
-		if (w.trigger >= Triggers.get_count()) {
+		if (underlying_value(w.trigger) >= Triggers.get_count())
+		{
 			w.trigger = trigger_none;	//kill trigger
 		}
 	}
@@ -1134,16 +1196,17 @@ static int load_game_data(
 	//go through all triggers, killing unused ones
 	{
 		const auto &&wr = make_range(vmwallptr);
-	for (uint_fast32_t i = 0;i < Triggers.get_count();) {
-		auto a = [i](const wall &w) { return w.trigger == i; };
+		for (auto iter = Triggers.vmptridx.begin(); iter != Triggers.vmptridx.end();)
+		{
+			const auto i = (*iter).get_unchecked_index();
 		//	Find which wall this trigger is connected to.
-		auto w = std::find_if(wr.begin(), wr.end(), a);
+			const auto &&w = ranges::find(wr, i, &wall::trigger);
 		if (w == wr.end())
 		{
-			remove_trigger_num(i);
+				remove_trigger_num(Triggers, Walls.vmptr, i);
 		}
 		else
-			i++;
+			++iter;
 	}
 	}
 #endif
@@ -1153,7 +1216,7 @@ static int load_game_data(
 	{
 #if defined(DXX_BUILD_DESCENT_II)
 		range_for (const auto &&w, vmwallptr)
-			w->controlling_trigger = -1;
+			w->controlling_trigger = trigger_none;
 #endif
 
 		auto &vctrgptridx = Triggers.vcptridx;
@@ -1167,11 +1230,11 @@ static int load_game_data(
 				const auto seg_num = tr.seg[l];
 				if (trigger_is_matcen(tr))
 				{
-					if (Segments[seg_num].special != SEGMENT_IS_ROBOTMAKER)
-						con_printf(CON_URGENT, "matcen %u triggers non-matcen segment %hu", t.get_unchecked_index(), seg_num);
+					if (Segments[seg_num].special != segment_special::robotmaker)
+						con_printf(CON_URGENT, "matcen %u triggers non-matcen segment %hu", underlying_value(t.get_unchecked_index()), seg_num);
 				}
 #if defined(DXX_BUILD_DESCENT_II)
-				else if (tr.type != TT_LIGHT_OFF && tr.type != TT_LIGHT_ON)
+				else if (tr.type != trigger_action::light_off && tr.type != trigger_action::light_on)
 				{	//light triggers don't require walls
 					const auto side_num = tr.side[l];
 					auto wall_num = vmsegptr(seg_num)->shared_segment::sides[side_num].wall_num;
@@ -1179,7 +1242,7 @@ static int load_game_data(
 						(*uwall)->controlling_trigger = t;
 					else
 					{
-						LevelError("trigger %u link %u type %u references segment %hu, side %u which is an invalid wall; ignoring.", static_cast<trgnum_t>(t), l, tr.type, seg_num, side_num);
+						LevelError("trigger %u link %u type %u references segment %hu, side %u which is an invalid wall; ignoring.", underlying_value(t.get_unchecked_index()), l, static_cast<unsigned>(tr.type), seg_num, underlying_value(side_num));
 					}
 				}
 #endif
@@ -1191,14 +1254,14 @@ static int load_game_data(
 	if (game_top_fileinfo_version < 17) {
 		range_for (const auto &&segp, vcsegptridx)
 		{
-			range_for (const int sidenum, xrange(6u))
+			for (const auto &&[sidenum, side] : enumerate(segp->shared_segment::sides))
 			{
-				const auto wallnum = segp->shared_segment::sides[sidenum].wall_num;
+				const auto wallnum = side.wall_num;
 				if (wallnum != wall_none)
 				{
 					auto &w = *vmwallptr(wallnum);
 					w.segnum = segp;
-					w.sidenum = sidenum;
+					w.sidenum = static_cast<sidenum_t>(sidenum);
 				}
 			}
 		}
@@ -1213,6 +1276,7 @@ static int load_game_data(
 		return 1;		//means old version
 	else
 		return 0;
+}
 }
 }
 
@@ -1248,12 +1312,10 @@ int load_level(
 #endif
 	const char * filename_passed)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vmobjptridx = Objects.vmptridx;
-#if DXX_USE_EDITOR
-	int use_compiled_level=1;
-#endif
-	char filename[PATH_MAX];
 	int sig, minedata_offset, gamedata_offset;
 	int mine_err, game_err;
 
@@ -1261,44 +1323,25 @@ int load_level(
 	Level_being_loaded = filename_passed;
 	#endif
 
-	strcpy(filename,filename_passed);
-
-#if DXX_USE_EDITOR
-	//if we have the editor, try the LVL first, no matter what was passed.
-	//if we don't have an LVL, try what was passed or RL2  
-	//if we don't have the editor, we just use what was passed
-
-	change_filename_extension(filename,filename_passed,".lvl");
-	use_compiled_level = 0;
-
-	if (!PHYSFSX_exists(filename,1))
-	{
-		const char *p = strrchr(filename_passed, '.');
-
-		if (d_stricmp(p, ".lvl"))
-			strcpy(filename, filename_passed);	// set to what was passed
-		else
-			change_filename_extension(filename, filename, "." DXX_LEVEL_FILE_EXTENSION);
-		use_compiled_level = 1;
-	}		
-#endif
-
-	auto LoadFile = PHYSFSX_openReadBuffered(filename);
+	std::array<char, PATH_MAX> filename_storage;
+	auto filename = filename_passed;
+	auto LoadFile = PHYSFSX_openReadBuffered(filename).first;
 	if (!LoadFile)
 	{
-		snprintf(filename, sizeof(filename), "%.*s%s", DXX_ptrdiff_cast_int(std::distance(Current_mission->path.cbegin(), Current_mission->filename)), Current_mission->path.c_str(), filename_passed);
-		LoadFile = PHYSFSX_openReadBuffered(filename);
-	}
-
-	if (!LoadFile)	{
+		filename = filename_storage.data(); 
+		snprintf(filename_storage.data(), filename_storage.size(), "%.*s%s", DXX_ptrdiff_cast_int(std::distance(Current_mission->path.cbegin(), Current_mission->filename)), Current_mission->path.c_str(), filename_passed);
+		auto &&[fp, physfserr] = PHYSFSX_openReadBuffered(filename);
+		if (!fp)
+		{
 #if DXX_USE_EDITOR
+			con_printf(CON_VERBOSE, "Failed to open file <%s>: %s", filename, PHYSFS_getErrorByCode(physfserr));
 			return 1;
 		#else
-			Error("Can't open file <%s>\n",filename);
+			Error("Failed to open file <%s>: %s", filename, PHYSFS_getErrorByCode(physfserr));
 		#endif
+		}
+		LoadFile = std::move(fp);
 	}
-
-	strcpy( Gamesave_current_filename, filename );
 
 	sig                      = PHYSFSX_readInt(LoadFile);
 	Gamesave_current_version = PHYSFSX_readInt(LoadFile);
@@ -1319,19 +1362,22 @@ int load_level(
 	}
 
 	if (Gamesave_current_version > 1)
-		PHYSFSX_fgets(Current_level_palette,LoadFile);
+	{
+		if (!PHYSFSX_fgets(Current_level_palette, LoadFile))
+			Current_level_palette[0] = 0;
+	}
 	if (Gamesave_current_version <= 1 || Current_level_palette[0]==0) // descent 1 level
 		strcpy(Current_level_palette.next().data(), DEFAULT_LEVEL_PALETTE);
 
 	if (Gamesave_current_version >= 3)
-		Base_control_center_explosion_time = PHYSFSX_readInt(LoadFile);
+		LevelSharedControlCenterState.Base_control_center_explosion_time = PHYSFSX_readInt(LoadFile);
 	else
-		Base_control_center_explosion_time = DEFAULT_CONTROL_CENTER_EXPLOSION_TIME;
+		LevelSharedControlCenterState.Base_control_center_explosion_time = DEFAULT_CONTROL_CENTER_EXPLOSION_TIME;
 
 	if (Gamesave_current_version >= 4)
-		Reactor_strength = PHYSFSX_readInt(LoadFile);
+		LevelSharedControlCenterState.Reactor_strength = PHYSFSX_readInt(LoadFile);
 	else
-		Reactor_strength = -1;  //use old defaults
+		LevelSharedControlCenterState.Reactor_strength = -1;  //use old defaults
 
 	if (Gamesave_current_version >= 7) {
 		Flickering_light_state.Num_flickering_lights = PHYSFSX_readInt(LoadFile);
@@ -1341,8 +1387,10 @@ int load_level(
 	else
 		Flickering_light_state.Num_flickering_lights = 0;
 
+	{
+		auto &Secret_return_orient = LevelSharedSegmentState.Secret_return_orient;
 	if (Gamesave_current_version < 6) {
-		Secret_return_segment = 0;
+		LevelSharedSegmentState.Secret_return_segment = segment_first;
 		Secret_return_orient.rvec.x = F1_0;
 		Secret_return_orient.rvec.y = 0;
 		Secret_return_orient.rvec.z = 0;
@@ -1353,7 +1401,10 @@ int load_level(
 		Secret_return_orient.uvec.y = 0;
 		Secret_return_orient.uvec.z = F1_0;
 	} else {
-		Secret_return_segment = PHYSFSX_readInt(LoadFile);
+		{
+			const auto s = segnum_t{static_cast<uint16_t>(PHYSFSX_readInt(LoadFile))};
+			LevelSharedSegmentState.Secret_return_segment = vmsegidx_t::check_nothrow_index(s) ? s : segment_none;
+		}
 		Secret_return_orient.rvec.x = PHYSFSX_readInt(LoadFile);
 		Secret_return_orient.rvec.y = PHYSFSX_readInt(LoadFile);
 		Secret_return_orient.rvec.z = PHYSFSX_readInt(LoadFile);
@@ -1364,43 +1415,34 @@ int load_level(
 		Secret_return_orient.uvec.y = PHYSFSX_readInt(LoadFile);
 		Secret_return_orient.uvec.z = PHYSFSX_readInt(LoadFile);
 	}
+	}
 #endif
 
-	PHYSFSX_fseek(LoadFile,minedata_offset,SEEK_SET);
-#if DXX_USE_EDITOR
-	if (!use_compiled_level) {
-		mine_err = load_mine_data(LoadFile);
-#if 0 // get from d1src if needed
-		// Compress all uv coordinates in mine, improves texmap precision. --MK, 02/19/96
-		compress_uv_coordinates_all();
-#endif
-	} else
-	#endif
+	PHYSFS_seek(LoadFile, minedata_offset);
 		//NOTE LINK TO ABOVE!!
-		mine_err = load_mine_data_compiled(LoadFile);
+		mine_err = load_mine_data_compiled(LoadFile, filename);
 
 	/* !!!HACK!!!
 	 * Descent 1 - Level 19: OBERON MINE has some ugly overlapping rooms (segment 484).
 	 * HACK to make this issue less visible by moving one vertex a little.
 	 */
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vmvertptr = Vertices.vmptr;
-	if (Current_mission && !d_stricmp("Descent: First Strike",Current_mission_longname) && !d_stricmp("level19.rdl",filename) && PHYSFS_fileLength(LoadFile) == 136706)
-		vmvertptr(1905u)->z = -385 * F1_0;
+	if (Current_mission && !d_stricmp("Descent: First Strike", Current_mission->mission_name) && !d_stricmp("level19.rdl", filename) && PHYSFS_fileLength(LoadFile) == 136706)
+		vmvertptr(vertnum_t{1905u})->z = -385 * F1_0;
 #if defined(DXX_BUILD_DESCENT_II)
 	/* !!!HACK!!!
 	 * Descent 2 - Level 12: MAGNACORE STATION has a segment (104) with illegal dimensions.
 	 * HACK to fix this by moving the Vertex and fixing the associated Normals.
 	 * NOTE: This only fixes the normals of segment 104, not the other ones connected to this Vertex but this is unsignificant.
 	 */
-	if (Current_mission && !d_stricmp("Descent 2: Counterstrike!",Current_mission_longname) && !d_stricmp("d2levc-4.rl2",filename))
+	if (Current_mission && !d_stricmp("Descent 2: Counterstrike!", Current_mission->mission_name) && !d_stricmp("d2levc-4.rl2", filename))
 	{
-		auto &s104 = *vmsegptr(vmsegidx_t(104));
-		auto &s104v0 = *vmvertptr(s104.verts[0]);
-		auto &s104s1 = s104.shared_segment::sides[1];
+		shared_segment &s104 = *vmsegptr(segnum_t{104});
+		auto &s104v0 = *vmvertptr(s104.verts[segment_relative_vertnum::_0]);
+		auto &s104s1 = s104.sides[sidenum_t::WTOP];
 		auto &s104s1n0 = s104s1.normals[0];
 		auto &s104s1n1 = s104s1.normals[1];
-		auto &s104s2 = s104.shared_segment::sides[2];
+		auto &s104s2 = s104.sides[sidenum_t::WRIGHT];
 		auto &s104s2n0 = s104s2.normals[0];
 		auto &s104s2n1 = s104s2.normals[1];
 		if (
@@ -1433,7 +1475,7 @@ int load_level(
 		return 2;
 	}
 
-	PHYSFSX_fseek(LoadFile,gamedata_offset,SEEK_SET);
+	PHYSFS_seek(LoadFile, gamedata_offset);
 	game_err = load_game_data(
 #if defined(DXX_BUILD_DESCENT_II)
 		LevelSharedDestructibleLightState,
@@ -1455,8 +1497,8 @@ int load_level(
 	//If an old version, ask the use if he wants to save as new version
 	if (((LEVEL_FILE_VERSION>1) && Gamesave_current_version < LEVEL_FILE_VERSION) || mine_err==1 || game_err==1) {
 		gr_palette_load(gr_palette);
-		if (nm_messagebox( NULL, 2, "Don't Save", "Save", "You just loaded a old version level.  Would\n"
-						"you like to save it as a current version level?")==1)
+		if (nm_messagebox_str(menu_title{nullptr}, nm_messagebox_tie("Don't Save", "Save"), menu_subtitle{"You just loaded a old version level.  Would\n"
+						"you like to save it as a current version level?"}) == 1)
 			save_level(filename);
 	}
 #elif defined(DXX_BUILD_DESCENT_II)
@@ -1485,10 +1527,10 @@ int load_level(
 	if (check_segment_connections())
 	{
 #ifndef NDEBUG
-		nm_messagebox( "ERROR", 1, "Ok", 
-				"Connectivity errors detected in\n"
+		nm_messagebox_str(menu_title{TXT_ERROR}, nm_messagebox_tie(TXT_OK),
+				menu_subtitle{"Connectivity errors detected in\n"
 				"mine.  See monochrome screen for\n"
-				"details, and contact Matt or Mike." );
+				"details, and contact Matt or Mike."});
 	#endif
 	}
 
@@ -1503,11 +1545,19 @@ int load_level(
 #if DXX_USE_EDITOR
 int get_level_name()
 {
-	array<newmenu_item, 2> m{{
-		nm_item_text("Please enter a name for this mine:"),
-		nm_item_input(Current_level_name.next()),
-	}};
-	return newmenu_do( NULL, "Enter mine name", m, unused_newmenu_subfunction, unused_newmenu_userdata ) >= 0;
+	using items_type = std::array<newmenu_item, 2>;
+	struct request_menu : items_type, passive_newmenu
+	{
+		request_menu(grs_canvas &canvas) :
+			items_type{{
+				newmenu_item::nm_item_text{"Please enter a name for this mine:"},
+				newmenu_item::nm_item_input(Current_level_name.next()),
+			}},
+			passive_newmenu(menu_title{nullptr}, menu_subtitle{"Enter mine name"}, menu_filename{nullptr}, tiny_mode_flag::normal, tab_processing_flag::ignore, adjusted_citem::create(*static_cast<items_type *>(this), 1), canvas, draw_box_flag::none)
+		{
+		}
+	};
+	return run_blocking_newmenu<request_menu>(*grd_curcanv);
 }
 #endif
 
@@ -1519,6 +1569,8 @@ int get_level_name()
 namespace dsx {
 int create_new_mine(void)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	vms_matrix	m1 = IDENTITY_MATRIX;
 	
 	// initialize_mine_arrays();
@@ -1547,25 +1599,23 @@ int create_new_mine(void)
 	
 	
 	LevelSharedVertexState.Num_vertices = 0;		// Number of vertices in global array.
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	Vertices.set_count(1);
 	LevelSharedSegmentState.Num_segments = 0;		// Number of segments in global array, will get increased in med_create_segment
 	Segments.set_count(1);
 	Cursegp = imsegptridx(segment_first);	// Say current segment is the only segment.
-	Curside = WBACK;		// The active side is the back side
+	Curside = sidenum_t::WBACK;		// The active side is the back side
 	Markedsegp = segment_none;		// Say there is no marked segment.
-	Markedside = WBACK;	//	Shouldn't matter since Markedsegp == 0, but just in case...
+	Markedside = sidenum_t::WBACK;	//	Shouldn't matter since Markedsegp == 0, but just in case...
 	for (int s=0;s<MAX_GROUPS+1;s++) {
 		GroupList[s].clear();
 		Groupsegp[s] = NULL;
-		Groupside[s] = 0;
 	}
+	Groupside = {};
 	
 	LevelSharedRobotcenterState.Num_robot_centers = 0;
-	auto &ActiveDoors = LevelUniqueWallSubsystemState.ActiveDoors;
-	ActiveDoors.set_count(0);
-	wall_init();
-	trigger_init();
+	wall_init(LevelUniqueWallSubsystemState);
+	auto &Triggers = LevelUniqueWallSubsystemState.Triggers;
+	Triggers.set_count(0);
 	
 	// Create New_segment, which is the segment we will be adding at each instance.
 	med_create_new_segment({DEFAULT_X_SIZE, DEFAULT_Y_SIZE, DEFAULT_Z_SIZE});		// New_segment = Segments[0];
@@ -1590,6 +1640,7 @@ int create_new_mine(void)
 int	Errors_in_mine;
 
 namespace dsx {
+namespace {
 // -----------------------------------------------------------------------------
 #if defined(DXX_BUILD_DESCENT_II)
 static unsigned compute_num_delta_light_records(fvcdlindexptr &vcdlindexptr)
@@ -1634,7 +1685,7 @@ static int save_game_data(
 
 #define WRITE_HEADER_ENTRY(t, n) do { PHYSFS_writeSLE32(SaveFile, -1); PHYSFS_writeSLE32(SaveFile, n); PHYSFS_writeSLE32(SaveFile, sizeof(t)); } while(0)
 
-	WRITE_HEADER_ENTRY(object, Highest_object_index + 1);
+	WRITE_HEADER_ENTRY(object, Objects.get_count());
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
 	WRITE_HEADER_ENTRY(wall, Walls.get_count());
 	auto &ActiveDoors = LevelUniqueWallSubsystemState.ActiveDoors;
@@ -1667,8 +1718,9 @@ static int save_game_data(
 	if (game_top_fileinfo_version >= 19)
 #endif
 	{
+		const auto N_polygon_models = LevelSharedPolygonModelState.N_polygon_models;
 		PHYSFS_writeSLE16(SaveFile, N_polygon_models);
-		range_for (auto &i, partial_const_range(Pof_names, N_polygon_models))
+		range_for (auto &i, partial_const_range(LevelSharedPolygonModelState.Pof_names, N_polygon_models))
 			PHYSFS_write(SaveFile, &i, sizeof(i), 1);
 	}
 
@@ -1709,7 +1761,7 @@ static int save_game_data(
 	//================ SAVE CONTROL CENTER TRIGGER INFO ===============
 
 	control_offset = PHYSFS_tell(SaveFile);
-	control_center_triggers_write(&ControlCenterTriggers, SaveFile);
+	control_center_triggers_write(ControlCenterTriggers, SaveFile);
 
 
 	//================ SAVE MATERIALIZATION CENTER TRIGGER INFO ===============
@@ -1771,10 +1823,12 @@ static int save_level_sub(
 #endif
 	fvmobjptridx &vmobjptridx, const char *const filename)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vmobjptr = Objects.vmptr;
-	char temp_filename[PATH_MAX];
 	int minedata_offset=0,gamedata_offset=0;
+	std::array<char, PATH_MAX> temp_filename;
 
 //	if ( !compiled_version )
 	{
@@ -1784,28 +1838,33 @@ static int save_level_sub(
 			if (is_real_level(filename)) {
 				gr_palette_load(gr_palette);
 	 
-				if (nm_messagebox( NULL, 2, "Cancel Save", "Save", "Warning: %i errors in this mine!\n", Errors_in_mine )!=1)	{
+				if (nm_messagebox(menu_title{nullptr}, 2, "Cancel Save", "Save", "Warning: %i errors in this mine!\n", Errors_in_mine )!=1)	{
 					return 1;
 				}
 			}
 		}
-//		change_filename_extension(temp_filename,filename,".LVL");
 	}
 //	else
 	{
+		auto &level_file_extension =
 #if defined(DXX_BUILD_DESCENT_II)
-		if (Gamesave_current_version > 3)
-			change_filename_extension(temp_filename, filename, "." D2X_LEVEL_FILE_EXTENSION);
-		else
+			(Gamesave_current_version > 3)
+			? D2X_LEVEL_FILE_EXTENSION
+			:
 #endif
-			change_filename_extension(temp_filename, filename, "." D1X_LEVEL_FILE_EXTENSION);
+			D1X_LEVEL_FILE_EXTENSION;
+		if (!change_filename_extension(temp_filename, filename, level_file_extension))
+		{
+			con_printf(CON_URGENT, "Failed to generate filename for level data from \"%s\"", filename);
+			return 1;
+		}
 	}
 
-	auto SaveFile = PHYSFSX_openWriteBuffered(temp_filename);
+	auto &&[SaveFile, physfserr] = PHYSFSX_openWriteBuffered(temp_filename.data());
 	if (!SaveFile)
 	{
 		gr_palette_load(gr_palette);
-		nm_messagebox( NULL, 1, "Ok", "ERROR: Cannot write to '%s'.", temp_filename);
+		nm_messagebox(menu_title{nullptr}, 1, TXT_OK, "ERROR: Cannot write to '%s'.\n%s", temp_filename.data(), PHYSFS_getErrorByCode(physfserr));
 		return 1;
 	}
 
@@ -1823,7 +1882,6 @@ static int save_level_sub(
 		{
 			if (plr->segnum > Highest_segment_index)
 				plr->segnum = segment_first;
-			auto &Vertices = LevelSharedVertexState.get_vertices();
 			auto &vcvertptr = Vertices.vcptr;
 			compute_segment_center(vcvertptr, plr->pos, vcsegptr(plr->segnum));
 		}
@@ -1863,9 +1921,9 @@ static int save_level_sub(
 		PHYSFSX_printf(SaveFile, "%s\n", static_cast<const char *>(Current_level_palette));
 
 	if (Gamesave_current_version >= 3)
-		PHYSFS_writeSLE32(SaveFile, Base_control_center_explosion_time);
+		PHYSFS_writeSLE32(SaveFile, LevelSharedControlCenterState.Base_control_center_explosion_time);
 	if (Gamesave_current_version >= 4)
-		PHYSFS_writeSLE32(SaveFile, Reactor_strength);
+		PHYSFS_writeSLE32(SaveFile, LevelSharedControlCenterState.Reactor_strength);
 
 	if (Gamesave_current_version >= 7)
 	{
@@ -1877,7 +1935,8 @@ static int save_level_sub(
 
 	if (Gamesave_current_version >= 6)
 	{
-		PHYSFS_writeSLE32(SaveFile, Secret_return_segment);
+		PHYSFS_writeSLE32(SaveFile, LevelSharedSegmentState.Secret_return_segment);
+		auto &Secret_return_orient = LevelSharedSegmentState.Secret_return_orient;
 		PHYSFSX_writeVector(SaveFile, Secret_return_orient.rvec);
 		PHYSFSX_writeVector(SaveFile, Secret_return_orient.fvec);
 		PHYSFSX_writeVector(SaveFile, Secret_return_orient.uvec);
@@ -1885,11 +1944,6 @@ static int save_level_sub(
 #endif
 
 	minedata_offset = PHYSFS_tell(SaveFile);
-#if 0	// only save compiled mine data
-	if ( !compiled_version )	
-		save_mine_data(SaveFile);
-	else
-#endif
 		save_mine_data_compiled(SaveFile);
 	gamedata_offset = PHYSFS_tell(SaveFile);
 	save_game_data(
@@ -1921,6 +1975,7 @@ static int save_level_sub(
 
 	return 0;
 
+}
 }
 
 int save_level(

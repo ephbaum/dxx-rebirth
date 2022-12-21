@@ -28,18 +28,12 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "inferno.h"
 #include "game.h"
 #include "vecmat.h"
-#include "key.h"
 #include "joy.h"
 #include "object.h"
-#include "dxxerror.h"
-#include "physics.h"
 #include "kconfig.h"
 #include "slew.h"
 #include "segment.h"
-
-#if DXX_USE_EDITOR
-#include "editor/editor.h"
-#endif
+#include "d_levelstate.h"
 
 
 //variables for slew system
@@ -52,8 +46,8 @@ void slew_init(const vmobjptr_t obj)
 {
 	slew_obj = obj;
 
-	slew_obj->control_type = CT_SLEW;
-	slew_obj->movement_type = MT_NONE;
+	slew_obj->control_source = object::control_type::slew;
+	slew_obj->movement_source = object::movement_type::None;
 
 	slew_stop();		//make sure not moving
 }
@@ -61,7 +55,8 @@ void slew_init(const vmobjptr_t obj)
 
 int slew_stop()
 {
-	if (!slew_obj || slew_obj->control_type!=CT_SLEW) return 0;
+	if (!slew_obj || slew_obj->control_source != object::control_type::slew)
+		return 0;
 
 	vm_vec_zero(slew_obj->mtype.phys_info.velocity);
 	return 1;
@@ -69,7 +64,8 @@ int slew_stop()
 
 void slew_reset_orient()
 {
-	if (!slew_obj || slew_obj->control_type!=CT_SLEW) return;
+	if (!slew_obj || slew_obj->control_source != object::control_type::slew)
+		return;
 
 	slew_obj->orient.rvec.x = slew_obj->orient.uvec.y = slew_obj->orient.fvec.z = f1_0;
 
@@ -78,7 +74,11 @@ void slew_reset_orient()
 
 }
 
-static int do_slew_movement(const vmobjptridx_t obj, int check_keys )
+namespace dsx {
+
+namespace {
+
+static int do_slew_movement(const vmobjptridx_t obj, int check_keys, const control_info &Controls)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vmobjptr = Objects.vmptr;
@@ -90,7 +90,8 @@ static int do_slew_movement(const vmobjptridx_t obj, int check_keys )
 	vms_vector svel;				//scaled velocity (per this frame)
 	vms_angvec rotang;
 
-	if (!slew_obj || slew_obj->control_type!=CT_SLEW) return 0;
+	if (!slew_obj || slew_obj->control_source != object::control_type::slew)
+		return 0;
 
 	if (check_keys) {
 #if 0	//def EDITOR	// might be useful for people with playing keys set to modifiers or such, 
@@ -137,7 +138,6 @@ static int do_slew_movement(const vmobjptridx_t obj, int check_keys )
 	vm_vec_scale(svel,FrameTime);		//movement in this frame
 	const auto movement = vm_vec_rotate(svel,new_pm);
 
-//	obj->last_pos = obj->pos;
 	vm_vec_add2(obj->pos,movement);
 
 	moved |= (movement.x || movement.y || movement.z);
@@ -148,11 +148,14 @@ static int do_slew_movement(const vmobjptridx_t obj, int check_keys )
 	return moved;
 }
 
+}
+
 //do slew for this frame
 int slew_frame(int check_keys)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vmobjptridx = Objects.vmptridx;
-	return do_slew_movement(vmobjptridx(slew_obj), !check_keys);
+	return do_slew_movement(vmobjptridx(slew_obj), !check_keys, Controls);
 }
 
+}

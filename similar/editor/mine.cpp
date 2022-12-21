@@ -28,7 +28,6 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
-#include "key.h"
 #include "gr.h"
 #include "bm.h"			// for MAX_TEXTURES
 #include "inferno.h"
@@ -38,31 +37,29 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "wall.h"
 #include "dxxerror.h"
 #include "textures.h"
-#include "object.h"
 #include "physfsx.h"
 #include "gamemine.h"
 #include "gamesave.h"
-#include "gameseg.h"
-#include "ui.h"			// Because texpage.h need UI_DIALOG type
-#include "texpage.h"		// For texpage_goto_first
-#include "medwall.h"
 #include "switch.h"
 #include "fuelcen.h"
 
 #include "compiler-range_for.h"
+#include "d_enumerate.h"
 #include "d_range.h"
-#include "partial_range.h"
+#include "d_underlying_value.h"
 
 #define REMOVE_EXT(s)  (*(strchr( (s), '.' ))='\0')
-
-static int save_mine_data(PHYSFS_File * SaveFile);
 
 int	New_file_format_save = 1;
 
 #if defined(DXX_BUILD_DESCENT_II)
+namespace dsx {
+
+namespace {
+
 // Converts descent 2 texture numbers back to descent 1 texture numbers.
 // Only works properly when the full Descent 1 texture set (descent.pig) is available.
-static short convert_to_d1_tmap_num(short tmap_num)
+static texture_index convert_to_d1_tmap_num(const texture_index tmap_num)
 {
 	switch (tmap_num)
 	{
@@ -307,20 +304,19 @@ static short convert_to_d1_tmap_num(short tmap_num)
 				if (tmap_num < 635) return tmap_num - 141;
 				if (tmap_num < 731) return tmap_num - 147;
 			}
-			{ // handle rare case where orientation != 0
-				short tmap_num_part = tmap_num &  TMAP_NUM_MASK;
-				short orient = tmap_num & ~TMAP_NUM_MASK;
-				if (orient != 0)
-					return orient | convert_to_d1_tmap_num(tmap_num_part);
-				else
-				{
-					Warning("can't convert unknown texture #%d to descent 1.\n", tmap_num_part);
-					return tmap_num;
-				}
-			}
+			Warning("can't convert unknown texture #%hu to descent 1.\n", tmap_num);
+			return tmap_num;
 	}
 }
+
+}
+
+}
 #endif
+
+namespace {
+
+static int save_mine_data(PHYSFS_File * SaveFile);
 
 // -----------------------------------------------------------------------------
 // Save mine will:
@@ -329,14 +325,14 @@ static short convert_to_d1_tmap_num(short tmap_num)
 // 2. Go through all the fields and fill in the offset, size, and sizeof
 //    values in the headers.
 
-int med_save_mine(const char * filename)
+static int med_save_mine(const char * filename)
 {
 	char ErrorMessage[256];
 
-	auto SaveFile = PHYSFSX_openWriteBuffered(filename);
+	auto &&[SaveFile, physfserr] = PHYSFSX_openWriteBuffered(filename);
 	if (!SaveFile)
 	{
-		snprintf(ErrorMessage, sizeof(ErrorMessage), "ERROR: Unable to open %s\n", filename);
+		snprintf(ErrorMessage, sizeof(ErrorMessage), "ERROR: Unable to open %.200s: %s\n", filename, PHYSFS_getErrorByCode(physfserr));
 		ui_messagebox( -2, -2, 1, ErrorMessage, "Ok" );
 		return 1;
 	}
@@ -351,13 +347,14 @@ int med_save_mine(const char * filename)
 // saves to an already-open file
 static int save_mine_data(PHYSFS_File * SaveFile)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	int  header_offset, editor_offset, vertex_offset, segment_offset, texture_offset, walls_offset, triggers_offset; //, links_offset;
 	int  newseg_verts_offset;
 	int  newsegment_offset;
 	med_compress_mine();
 	warn_if_concave_segments();
 	
-	array<d_fname, MAX_TEXTURES> current_tmap_list;
+	std::array<d_fname, MAX_TEXTURES> current_tmap_list;
 	auto &TmapInfo = LevelUniqueTmapInfoState.TmapInfo;
 	for (int i=0;i<NumTextures;i++)
 		current_tmap_list[i] = TmapInfo[i].filename;
@@ -424,16 +421,16 @@ static int save_mine_data(PHYSFS_File * SaveFile)
 	mine_editor.newsegment_size     =   sizeof(segment);
 
 	// Next 3 vars added 10/07 by JAS
-	mine_editor.Curside             =   Curside;
+	mine_editor.Curside             =   underlying_value(Curside);
 	if (Markedsegp)
 		mine_editor.Markedsegp      =   Markedsegp;
 	else									  
 		mine_editor.Markedsegp       =   -1;
-	mine_editor.Markedside          =   Markedside;
+	mine_editor.Markedside          =   underlying_value(Markedside);
 	range_for (const int i, xrange(10u))
 		mine_editor.Groupsegp[i]	  =	vmsegptridx(Groupsegp[i]);
 	range_for (const int i, xrange(10u))
-		mine_editor.Groupside[i]     =	Groupside[i];
+		mine_editor.Groupside[i] = underlying_value(Groupside[i]);
 
 	if (editor_offset != PHYSFS_tell(SaveFile))
 		Error( "OFFSETS WRONG IN MINE.C!" );
@@ -470,7 +467,7 @@ static int save_mine_data(PHYSFS_File * SaveFile)
 
 	if (newseg_verts_offset != PHYSFS_tell(SaveFile))
 		Error( "OFFSETS WRONG IN MINE.C!" );
-	PHYSFS_write( SaveFile, &Vertices[New_segment.verts[0]], sizeof(vms_vector), 8 );
+	PHYSFS_write( SaveFile, &Vertices[New_segment.verts.front()], sizeof(vms_vector), 8 );
 
 	//==================== CLOSE THE FILE =============================
 
@@ -522,38 +519,45 @@ static void dump_fix_as_ushort( fix value, int nbits, PHYSFS_File *SaveFile )
 	PHYSFS_writeULE16(SaveFile, short_value);
 }
 
-static void write_children(const shared_segment &seg, const unsigned bit_mask, PHYSFS_File *const SaveFile)
+static void write_children(const shared_segment &seg, const sidemask_t bit_mask, PHYSFS_File *const SaveFile)
 {
-	auto &children = seg.children;
-	for (int bit = 0; bit < MAX_SIDES_PER_SEGMENT; bit++)
+	for (const auto &&[bit, child] : enumerate(seg.children))
 	{
-		if (bit_mask & (1 << bit))
-			PHYSFS_writeSLE16(SaveFile, children[bit]);
+		if (bit_mask & build_sidemask(bit))
+			PHYSFS_writeSLE16(SaveFile, child);
 	}
 }
 
 static void write_verts(const shared_segment &seg, PHYSFS_File *const SaveFile)
 {
 	range_for (auto &i, seg.verts)
-		PHYSFS_writeSLE16(SaveFile, i);
+		PHYSFS_writeSLE16(SaveFile, static_cast<uint16_t>(i));
 }
 
-static void write_special(const shared_segment &seg, const unsigned bit_mask, PHYSFS_File *const SaveFile)
+static void write_special(const shared_segment &seg, const sidemask_t bit_mask, PHYSFS_File *const SaveFile)
 {
-	if (bit_mask & (1 << MAX_SIDES_PER_SEGMENT))
+	if (bit_mask & build_sidemask(MAX_SIDES_PER_SEGMENT))
 	{
-		PHYSFSX_writeU8(SaveFile, seg.special);
-		PHYSFSX_writeU8(SaveFile, seg.matcen_num);
-		PHYSFS_writeULE16(SaveFile, seg.station_idx);
+		PHYSFSX_writeU8(SaveFile, underlying_value(seg.special));
+		PHYSFSX_writeU8(SaveFile, underlying_value(seg.matcen_num));
+		PHYSFS_writeULE16(SaveFile, underlying_value(seg.station_idx));
 	}
 }
+
+}
+
+int med_save_mine(const mine_filename_type &filename)
+{
+	return med_save_mine(filename.data());
+}
+
 // -----------------------------------------------------------------------------
 // saves compiled mine data to an already-open file...
 namespace dsx {
 int save_mine_data_compiled(PHYSFS_File *SaveFile)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	ubyte 	version = COMPILED_MINE_VERSION;
-	ubyte		bit_mask = 0;
 
 	med_compress_mine();
 	warn_if_concave_segments();
@@ -589,22 +593,24 @@ int save_mine_data_compiled(PHYSFS_File *SaveFile)
 		PHYSFSX_writeVector(SaveFile, i);
 	
 	const auto Num_segments = LevelSharedSegmentState.Num_segments;
-	for (segnum_t segnum = 0; segnum < Num_segments; segnum++)
+	auto &&segment_range = partial_const_range(Segments, Num_segments);
+	for (const cscusegment seg : segment_range)
 	{
-		const auto &&seg = vcsegptr(segnum);
-		for (short sidenum = 0; sidenum < MAX_SIDES_PER_SEGMENT; sidenum++)
 		{
- 			if (seg->children[sidenum] != segment_none)
-				bit_mask |= (1 << sidenum);
+		sidemask_t bit_mask{};
+		for (const auto &&[sidenum, child] : enumerate(seg.s.children))
+		{
+			if (child != segment_none)
+				bit_mask |= build_sidemask(sidenum);
 		}
 
-		if (seg->special != 0 || seg->matcen_num != 0 || seg->station_idx != station_none)
-			bit_mask |= (1 << MAX_SIDES_PER_SEGMENT);
+		if (seg.s.special != segment_special::nothing || seg.s.matcen_num != materialization_center_number::None || seg.s.station_idx != station_number::None)
+			bit_mask |= build_sidemask(MAX_SIDES_PER_SEGMENT);
 
 		if (New_file_format_save)
-			PHYSFSX_writeU8(SaveFile, bit_mask);
+			PHYSFSX_writeU8(SaveFile, underlying_value(bit_mask));
 		else
-			bit_mask = 0x7F;
+			bit_mask = sidemask_t{0x7f};
 
 		if (Gamesave_current_version == 5)	// d2 SHAREWARE level
 		{
@@ -621,59 +627,56 @@ int save_mine_data_compiled(PHYSFS_File *SaveFile)
 		}
 
 		if (Gamesave_current_version <= 5) // descent 1 thru d2 SHAREWARE level
-			dump_fix_as_ushort(seg->static_light, 4, SaveFile);
-	
-		// Write the walls as a 6 byte array
-		bit_mask = 0;
-		for (short sidenum = 0; sidenum < MAX_SIDES_PER_SEGMENT; sidenum++)
-		{
-			uint wallnum;
+			dump_fix_as_ushort(seg.u.static_light, 4, SaveFile);
+		}
 
-			if (seg->shared_segment::sides[sidenum].wall_num != wall_none)
-			{
-				bit_mask |= (1 << sidenum);
-				wallnum = seg->shared_segment::sides[sidenum].wall_num;
-				Assert( wallnum < 255 );		// Get John or Mike.. can only store up to 255 walls!!! 
-				(void)wallnum;
-			}
+		// Write the walls as a 6 byte array
+		{
+		sidemask_t bit_mask{};
+		for (const auto &&[sidenum, side] : enumerate(seg.s.sides))
+		{
+			if (side.wall_num != wall_none)
+				bit_mask |= build_sidemask(sidenum);
 		}
 		if (New_file_format_save)
-			PHYSFSX_writeU8(SaveFile, bit_mask);
+			PHYSFSX_writeU8(SaveFile, underlying_value(bit_mask));
 		else
-			bit_mask = 0x3F;
+			bit_mask = sidemask_t{0x3f};
 
-		for (short sidenum = 0; sidenum < MAX_SIDES_PER_SEGMENT; sidenum++)
+		for (const auto &&[sidenum, side] : enumerate(seg.s.sides))
 		{
-			if (bit_mask & (1 << sidenum))
-				PHYSFSX_writeU8(SaveFile, seg->shared_segment::sides[sidenum].wall_num);
+			if (bit_mask & build_sidemask(sidenum))
+				PHYSFSX_writeU8(SaveFile, underlying_value(side.wall_num));
+		}
 		}
 
-		for (short sidenum = 0; sidenum < MAX_SIDES_PER_SEGMENT; sidenum++)
+		for (const auto sidenum : MAX_SIDES_PER_SEGMENT)
 		{
-			if ((seg->children[sidenum] == segment_none) || (seg->shared_segment::sides[sidenum].wall_num != wall_none))
+			if (seg.s.children[sidenum] == segment_none || seg.s.sides[sidenum].wall_num != wall_none)
 			{
-				ushort	tmap_num, tmap_num2;
-
-				tmap_num = seg->unique_segment::sides[sidenum].tmap_num;
-				tmap_num2 = seg->unique_segment::sides[sidenum].tmap_num2;
+				auto tmap_num = seg.u.sides[sidenum].tmap_num;
+				auto tmap_num2 = seg.u.sides[sidenum].tmap_num2;
 
 #if defined(DXX_BUILD_DESCENT_II)
 				if (Gamesave_current_version <= 3)	// convert texture numbers back to d1
 				{
-					tmap_num = convert_to_d1_tmap_num(tmap_num);
-					if (tmap_num2)
-						tmap_num2 = convert_to_d1_tmap_num(tmap_num2);
+					tmap_num = build_texture1_value(convert_to_d1_tmap_num(get_texture_index(tmap_num)));
+					if (tmap_num2 != texture2_value::None)
+					{
+						tmap_num2 = build_texture2_value(convert_to_d1_tmap_num(get_texture_index(tmap_num2)), get_texture_rotation_high(tmap_num2));
+					}
 				}
 #endif
 
-				if (tmap_num2 != 0 && New_file_format_save)
-					tmap_num |= 0x8000;
+				uint16_t write_tmap_num = static_cast<uint16_t>(tmap_num);
+				if (tmap_num2 != texture2_value::None && New_file_format_save)
+					write_tmap_num |= 0x8000;
 
-				PHYSFS_writeSLE16(SaveFile, tmap_num);
-				if (tmap_num2 != 0 || !New_file_format_save)
-					PHYSFS_writeSLE16(SaveFile, tmap_num2);
+				PHYSFS_writeSLE16(SaveFile, write_tmap_num);
+				if (tmap_num2 != texture2_value::None || !New_file_format_save)
+					PHYSFS_writeSLE16(SaveFile, static_cast<uint16_t>(tmap_num2));
 
-				range_for (auto &i, seg->unique_segment::sides[sidenum].uvls)
+				range_for (auto &i, seg.u.sides[sidenum].uvls)
 				{
 					dump_fix_as_short(i.u, 5, SaveFile);
 					dump_fix_as_short(i.v, 5, SaveFile);
@@ -686,8 +689,8 @@ int save_mine_data_compiled(PHYSFS_File *SaveFile)
 
 #if defined(DXX_BUILD_DESCENT_II)
 	if (Gamesave_current_version > 5)
-		for (segnum_t i = 0; i < Num_segments; i++)
-			segment2_write(vcsegptr(i), SaveFile);
+		for (auto &s : segment_range)
+			segment2_write(s, SaveFile);
 #endif
 
 	return 0;

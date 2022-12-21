@@ -27,8 +27,9 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #include "vclip.h"
 #include "dxxsconf.h"
-#include "compiler-array.h"
 #include "pack.h"
+#include "bm.h"
+#include <array>
 
 #if defined(DXX_BUILD_DESCENT_I) || defined(DXX_BUILD_DESCENT_II)
 namespace dsx {
@@ -50,7 +51,8 @@ constexpr std::integral_constant<uint16_t, UINT16_MAX> eclip_none{};
 #define ECLIP_NUM_FUELCEN     2
 #define ECLIP_NUM_BOSS        53
 #ifdef DXX_BUILD_DESCENT_II
-#define ECLIP_NUM_FORCE_FIELD 78
+#define ECLIP_NUM_FORCE_FIELD 78 // diagonal force field texture
+#define ECLIP_NUM_FORCE_FIELD2 93 // straight force field texture
 #endif
 
 struct eclip : public prohibit_void_ptr<eclip>
@@ -59,7 +61,7 @@ struct eclip : public prohibit_void_ptr<eclip>
 	fix     time_left;      //for sequencing
 	uint32_t frame_count;    //for sequencing
 	short   changing_wall_texture;      //Which element of Textures array to replace.
-	short   changing_object_texture;    //Which element of ObjBitmapPtrs array to replace.
+	object_bitmap_index changing_object_texture;    //Which element of ObjBitmapPtrs array to replace.
 	int     flags;          //see above
 	int     crit_clip;      //use this clip instead of above one when mine critical
 	unsigned dest_bm_num;    //use this bitmap when monitor destroyed
@@ -68,7 +70,7 @@ struct eclip : public prohibit_void_ptr<eclip>
 	fix     dest_size;      //3d size of explosion
 	int     sound_num;      //what sound this makes
 	segnum_t     segnum;
-	uint8_t sidenum; //what seg & side, for one-shot clips
+	sidenum_t sidenum; //what seg & side, for one-shot clips
 };
 
 extern unsigned Num_effects;
@@ -102,7 +104,7 @@ void eclip_write(PHYSFS_File *fp, const eclip &ec);
 #ifdef dsx
 namespace dsx {
 
-using d_eclip_array = array<eclip, MAX_EFFECTS>;
+using d_eclip_array = std::array<eclip, MAX_EFFECTS>;
 
 struct d_level_unique_effects_clip_state
 {

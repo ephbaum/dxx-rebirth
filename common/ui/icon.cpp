@@ -32,61 +32,60 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 namespace dcx {
 
+namespace {
+
 #define Middle(x) ((2*(x)+1)/4)
 
 static void ui_draw_box_in1(grs_canvas &canvas, const unsigned x1, const unsigned y1, const unsigned x2, const unsigned y2)
 {
-	const uint8_t color = CWHITE;
+	const auto color = CWHITE;
 	gr_urect(canvas, x1 + 1, y1 + 1, x2 - 1, y2 - 1, color);
 	ui_draw_shad(canvas, x1, y1, x2, y2, CGREY, CBRIGHT);
 }
 
-
-void ui_draw_icon( UI_GADGET_ICON * icon )
+void ui_draw_icon(UI_GADGET_ICON &icon)
 {
-	int height, width;
 	int x, y;
 	
 #if 0  //ndef OGL
 	if ((icon->status==1) || (icon->position != icon->oldposition))
 #endif
 	{
-		icon->status = 0;
-
-		gr_set_current_canvas( icon->canvas );
+		gr_set_current_canvas(icon.canvas);
 		auto &canvas = *grd_curcanv;
-		gr_get_string_size(*canvas.cv_font, icon->text.get(), &width, &height, nullptr);
+		const auto &&[width, height] = gr_get_string_size(*canvas.cv_font, icon.text.get());
 	
-		x = ((icon->width-1)/2)-((width-1)/2);
-		y = ((icon->height-1)/2)-((height-1)/2);
+		x = ((icon.width - 1) / 2) - ((width - 1) / 2);
+		y = ((icon.height - 1) / 2) - ((height - 1) / 2);
 
-		if (icon->position==1 )
+		if (icon.position==1)
 		{
 			// Draw pressed
-			ui_draw_box_in(canvas, 0, 0, icon->width, icon->height);
+			ui_draw_box_in(canvas, 0, 0, icon.width, icon.height);
 			x += 2; y += 2;
 		}
-		else if (icon->flag)
+		else if (icon.flag)
 		{
 			// Draw part out
-			ui_draw_box_in1(canvas, 0, 0, icon->width, icon->height);
+			ui_draw_box_in1(canvas, 0, 0, icon.width, icon.height);
 			x += 1; y += 1;	
 		}
 		else
 		{
 			// Draw released!
-			ui_draw_box_out(canvas, 0, 0, icon->width, icon->height);
+			ui_draw_box_out(canvas, 0, 0, icon.width, icon.height);
 		}
 	
 		gr_set_fontcolor(canvas, CBLACK, -1);
-		gr_ustring(canvas, *canvas.cv_font, x, y, icon->text.get());
+		gr_ustring(canvas, *canvas.cv_font, x, y, icon.text.get());
 	}
 }
 
+}
 
-std::unique_ptr<UI_GADGET_ICON> ui_add_gadget_icon(UI_DIALOG * dlg, const char * text, short x, short y, short w, short h, int k,int (*f)())
+std::unique_ptr<UI_GADGET_ICON> ui_add_gadget_icon(UI_DIALOG &dlg, const char *const text, short x, short y, short w, short h, int k,int (*const f)())
 {
-	std::unique_ptr<UI_GADGET_ICON> icon{ui_gadget_add<UI_GADGET_ICON>(dlg, x, y, x+w-1, y+h-1)};
+	auto icon = ui_gadget_add<UI_GADGET_ICON>(dlg, x, y, x + w - 1, y + h - 1);
 
 	icon->width = w;
 	icon->height = h;
@@ -110,68 +109,58 @@ std::unique_ptr<UI_GADGET_ICON> ui_add_gadget_icon(UI_DIALOG * dlg, const char *
 	return icon;
 }
 
-window_event_result ui_icon_do( UI_DIALOG *dlg, UI_GADGET_ICON * icon,const d_event &event )
+window_event_result UI_GADGET_ICON::event_handler(UI_DIALOG &dlg, const d_event &event)
 {
-	icon->oldposition = icon->position;
-	icon->pressed = 0;
+	oldposition = position;
+	pressed = 0;
 
 	window_event_result rval = window_event_result::ignored;
 	if (event.type == EVENT_MOUSE_BUTTON_DOWN || event.type == EVENT_MOUSE_BUTTON_UP)
 	{
-		int OnMe;
-		
-		OnMe = ui_mouse_on_gadget( icon );
+		const auto OnMe = ui_mouse_on_gadget(*this);
 
 		if (B1_JUST_PRESSED && OnMe)
 		{
-			icon->position = 1;
+			position = 1;
 			rval = window_event_result::handled;
 		}
 		else if (B1_JUST_RELEASED)
 		{
-			if ((icon->position == 1) && OnMe)
-				icon->pressed = 1;
+			if ((position == 1) && OnMe)
+				pressed = 1;
 				
-			icon->position = 0;
+			position = 0;
 		}
 	}
 
 
 	if (event.type == EVENT_KEY_COMMAND)
 	{
-		int key;
-		
-		key = event_key_get(event);
-		
-		if (key == icon->trap_key)
+		const auto key = event_key_get(event);
+		if (key == trap_key)
 		{
-			icon->position = 1;
+			position = 1;
 			rval = window_event_result::handled;
 		}
 	}
 	else if (event.type == EVENT_KEY_RELEASE)
 	{
-		int key;
-		
-		key = event_key_get(event);
-		
-		icon->position = 0;
-		
-		if (key == icon->trap_key)
-			icon->pressed = 1;
+		const auto key = event_key_get(event);
+		position = 0;
+		if (key == trap_key)
+			pressed = 1;
 	}
 		
-	if (icon->pressed == 1)
+	if (pressed == 1)
 	{
-		icon->status = 1;
-		icon->flag = static_cast<int8_t>(icon->user_function());
-		rval = ui_gadget_send_event(dlg, EVENT_UI_GADGET_PRESSED, icon);
+		flag = static_cast<int8_t>(user_function());
+		rval = ui_gadget_send_event(dlg, EVENT_UI_GADGET_PRESSED, *this);
 		if (rval == window_event_result::ignored)
 			rval = window_event_result::handled;
 	}
 
 	if (event.type == EVENT_WINDOW_DRAW)
-		ui_draw_icon( icon );
+		ui_draw_icon(*this);
 
 	return rval;
 }

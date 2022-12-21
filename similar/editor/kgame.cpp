@@ -30,16 +30,18 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "inferno.h"
 #include "editor.h"
 #include "ui.h"
-#include "game.h"
 #include "gamesave.h"
 #include "object.h"
 #include "gameseq.h"
 #include "gameseg.h"
 #include "kdefs.h"
+#include "d_levelstate.h"
 
-static char game_filename[PATH_MAX] = "*." DXX_LEVEL_FILE_EXTENSION;
+namespace {
 
-static void checkforgamext( char * f )
+static std::array<char, PATH_MAX> game_filename{"*." DXX_LEVEL_FILE_EXTENSION};
+
+static void checkforgamext(std::array<char, PATH_MAX> &f)
 {
 	int i;
 
@@ -75,6 +77,8 @@ segnum_t Perm_player_segnum=segment_none;		//-1 means position not set
 vms_vector Perm_player_position;
 vms_matrix Perm_player_orient;
 
+}
+
 //set the player's "permanant" position from the current position
 int SetPlayerPosition()
 {
@@ -91,7 +95,9 @@ int SetPlayerPosition()
 //	returns 0 if unsuccessful
 int SaveGameData()
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vmobjptr = Objects.vmptr;
 	auto &vmobjptridx = Objects.vmptridx;
 	if (gamestate == editor_gamestate::unsaved) {
@@ -110,10 +116,9 @@ int SaveGameData()
 		if (Perm_player_segnum > Highest_segment_index)
 			Perm_player_segnum = segment_none;
 
-		auto &Vertices = LevelSharedVertexState.get_vertices();
 		auto &vcvertptr = Vertices.vcptr;
 		if (Perm_player_segnum!=segment_none) {
-			if (get_seg_masks(vcvertptr, Perm_player_position, vcsegptr(Perm_player_segnum), 0).centermask == 0)
+			if (get_seg_masks(vcvertptr, Perm_player_position, vcsegptr(Perm_player_segnum), 0).centermask == sidemask_t{})
 			{
 				ConsoleObject->pos = Perm_player_position;
 				ConsoleObject->orient = Perm_player_orient;
@@ -126,11 +131,11 @@ int SaveGameData()
 #if defined(DXX_BUILD_DESCENT_II)
 			LevelSharedSegmentState.DestructibleLights,
 #endif
-			game_filename);
+			game_filename.data());
 		if (Perm_player_segnum!=segment_none) {
 
 			if (save_segnum > Highest_segment_index)
-				save_segnum = 0;
+				save_segnum = {};
 
 			ConsoleObject->pos = save_pos;
 			const auto &&save_segp = vmsegptridx(save_segnum);
@@ -166,7 +171,7 @@ if (SafetyCheck())  {
 #if defined(DXX_BUILD_DESCENT_II)
 				LevelSharedSegmentState.DestructibleLights,
 #endif
-				game_filename))
+				game_filename.data()))
 			return 0;
 		Current_level_num = 1;			// assume level 1
 		gamestate = editor_gamestate::none;
@@ -183,6 +188,6 @@ if (SafetyCheck())  {
 //of last saved mine as default
 void ResetFilename()
 {
-	strcpy(game_filename,"*.LVL");
+	strcpy(game_filename.data(), "*.LVL");
 }
 

@@ -27,20 +27,25 @@ def TOOL_SUBST(env):
             contents = f.read()
             f.close()
         except:
-            raise SCons.Errors.UserError, "Can't read source file %s"%sourcefile
+            raise SCons.Errors.UserError("Can't read source file %s" % (sourcefile,))
         for (k,v) in dict.items():
+            try:
+                contents = contents.decode("UTF-8")
+            except (UnicodeDecodeError, AttributeError):
+                pass
             contents = re.sub(k, v, contents)
         try:
-            f = open(targetfile, 'wb')
+            f = open(targetfile, 'wt')
             f.write(contents)
             f.close()
-        except:
-            raise SCons.Errors.UserError, "Can't write target file %s"%targetfile
+        except Exception as e:
+            print("Text:", str(e))
+            raise SCons.Errors.UserError("Can't write target file %s" % (targetfile,))
         return 0 # success
 
     def subst_in_file(target, source, env):
-        if not env.has_key('SUBST_DICT'):
-            raise SCons.Errors.UserError, "SubstInFile requires SUBST_DICT to be set."
+        if 'SUBST_DICT' not in env:
+            raise SCons.Errors.UserError("SubstInFile requires SUBST_DICT to be set.")
         d = dict(env['SUBST_DICT']) # copy it
         for (k,v) in d.items():
             if callable(v):
@@ -48,7 +53,7 @@ def TOOL_SUBST(env):
             elif SCons.Util.is_String(v):
                 d[k]=env.subst(v)
             else:
-                raise SCons.Errors.UserError, "SubstInFile: key %s: %s must be a string or callable"%(k, repr(v))
+                raise SCons.Errors.UserError("SubstInFile: key %s: %r must be a string or callable" % (k, v))
         for (t,s) in zip(target, source):
             return do_subst_in_file(str(t), str(s), d)
 
@@ -98,7 +103,7 @@ def TOOL_BUNDLE(env):
     if 'BUNDLE' in env['TOOLS']: return
     if sys.platform == 'darwin':
         #if tools_verbose:
-        print " running tool: TOOL_BUNDLE"
+        print(" running tool: TOOL_BUNDLE")
         env.Append(TOOLS = 'BUNDLE')
         # This is like the regular linker, but uses different vars.
         # XXX: NOTE: this may be out of date now, scons 0.96.91 has some bundle linker stuff built in.
@@ -120,7 +125,6 @@ def TOOL_BUNDLE(env):
         env['BUNDLEFLAGS'] = ' -bundle'
         env['BUNDLECOM'] = '$BUNDLE $BUNDLEFLAGS -o ${TARGET} $SOURCES $_LIBDIRFLAGS $_LIBFLAGS $FRAMEWORKS'
         # This requires some other tools:
-        TOOL_WRITE_VAL(env)
         TOOL_SUBST(env)
         # Common type codes are BNDL for generic bundle and APPL for application.
         def MakeBundle(env, bundledir, app,
@@ -143,10 +147,10 @@ def TOOL_BUNDLE(env):
             if not ('.' in bundledir):
                 bundledir += '.$BUNDLEDIRSUFFIX'
             bundledir = env.subst(bundledir) # substitute again
-            suffix=bundledir[string.rfind(bundledir,'.'):]
+            suffix=bundledir[bundledir.rfind('.'):]
             if (suffix=='.app' and typecode != 'APPL' or
                 suffix!='.app' and typecode == 'APPL'):
-                raise Error, "MakeBundle: inconsistent dir suffix %s and type code %s: app bundles should end with .app and type code APPL."%(suffix, typecode)
+                raise Error("MakeBundle: inconsistent dir suffix %s and type code %s: app bundles should end with .app and type code APPL." % (suffix, typecode))
             if subst_dict is None:
                 subst_dict={'%SHORTVERSION%': '$VERSION_NUM',
                             '%LONGVERSION%': '$VERSION_NAME',
@@ -156,31 +160,21 @@ def TOOL_BUNDLE(env):
                             '%CREATOR%': creator,
                             '%TYPE%': typecode,
                             '%BUNDLE_KEY%': key}
-            env.Install(bundledir+'/Contents/MacOS', app)
-            f=env.SubstInFile(bundledir+'/Contents/Info.plist', info_plist,
+            bundledir = env.Dir(bundledir)
+            appfile = env.Install(bundledir.Dir('Contents/MacOS'), app)
+            f = env.SubstInFile(bundledir.File('Contents/Info.plist'), info_plist,
                             SUBST_DICT=subst_dict)
-            env.Depends(f,SCons.Node.Python.Value(key+creator+typecode+env['VERSION_NUM']+env['VERSION_NAME']))
-            env.WriteVal(target=bundledir+'/Contents/PkgInfo',
-                         source=SCons.Node.Python.Value(typecode+creator))
+            env.Depends(f, env.Value(key + creator + typecode + env['VERSION_NUM'] + env['VERSION_NAME']))
+            env.Textfile(target=bundledir.File('Contents/PkgInfo'),
+                         source=env.Value(typecode+creator))
             resources.append(icon_file)
+            resource_directory = bundledir.Dir('Contents/Resources')
             for r in resources:
                 if SCons.Util.is_List(r):
-                    env.InstallAs(bundledir+'/Contents/Resources/'+r[1],
-                                  r[0])
+                    env.InstallAs(resource_directory.File(r[1]), r[0])
                 else:
-                    env.Install(bundledir+'/Contents/Resources', r)
-            return [ SCons.Node.FS.default_fs.Dir(bundledir) ]
+                    env.Install(resource_directory, r)
+            return bundledir, appfile
         # This is not a regular Builder; it's a wrapper function.
         # So just make it available as a method of Environment.
         SConsEnvironment.MakeBundle = MakeBundle
-def TOOL_WRITE_VAL(env):
-    #if tools_verbose:
-    print " running tool: TOOL_WRITE_VAL"
-    env.Append(TOOLS = 'WRITE_VAL')
-    def write_val(target, source, env):
-        """Write the contents of the first source into the target.
-        source is usually a Value() node, but could be a file."""
-        f = open(str(target[0]), 'wb')
-        f.write(source[0].get_contents())
-        f.close()
-    env['BUILDERS']['WriteVal'] = env.Builder(action=write_val)

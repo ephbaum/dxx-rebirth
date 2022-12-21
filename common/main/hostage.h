@@ -27,7 +27,7 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #ifdef __cplusplus
 #include "fwd-object.h"
-#include "compiler-array.h"
+#include <array>
 
 #define HOSTAGE_SIZE        i2f(5)  // 3d size of a hostage
 
@@ -44,7 +44,7 @@ int hostage_is_valid( int hostage_num );
 namespace dcx {
 
 extern unsigned N_hostage_types;
-extern array<int, MAX_HOSTAGE_TYPES> Hostage_vclip_num;    // for each type of hostage
+extern std::array<int, MAX_HOSTAGE_TYPES> Hostage_vclip_num;    // for each type of hostage
 
 }
 

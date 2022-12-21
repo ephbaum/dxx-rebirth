@@ -27,19 +27,31 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #include "maths.h"
 
-#ifdef __cplusplus
+namespace dcx {
 
-enum class kmatrix_result
+enum class kmatrix_result : uint8_t
 {
 	abort,
 	proceed,
 };
 
-kmatrix_result kmatrix_view(int network); // shows matrix screen. Retruns 0 if aborted (quitting game) and 1 if proceeding to next level if applicable.
+enum class kmatrix_network : uint8_t
+{
+	offline,
+	/* This has the same numeric value as GM_NETWORK, but currently,
+	 * that is not required for correct operation.
+	 */
+	multiplayer = 4,
+};
+
+}
+
 #ifdef dsx
+#include "kconfig.h"
+
 namespace dsx {
+
+kmatrix_result kmatrix_view(kmatrix_network network, control_info &Controls); // shows matrix screen. Retruns 0 if aborted (quitting game) and 1 if proceeding to next level if applicable.
 kmatrix_result multi_endlevel_score();
 }
-#endif
-
 #endif

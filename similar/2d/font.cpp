@@ -36,10 +36,8 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #include "u_mem.h"
 #include "gr.h"
-#include "grdef.h"
 #include "dxxerror.h"
 #include "common/2d/bitmap.h"
-#include "makesig.h"
 #include "physfsx.h"
 #include "gamefont.h"
 #include "byteutil.h"
@@ -49,33 +47,32 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "ogl_init.h"
 #endif
 
-#include "compiler-array.h"
 #include "compiler-range_for.h"
-#include "compiler-make_unique.h"
 #include "partial_range.h"
+#include "d_range.h"
+#include <array>
+#include <memory>
+
+namespace dcx {
+
+namespace {
 
 static font_x_scale_float FONTSCALE_X()
 {
-	return FNTScaleX.operator float();
+	return font_x_scale_float(FNTScaleX.operator float());
 }
 
 static auto FONTSCALE_Y(const int &y)
 {
-	return font_scaled_float<'y'>(FNTScaleY * y);
+	return font_y_scaled_float(FNTScaleY * y);
 }
 
 #define MAX_OPEN_FONTS	50
 
-namespace {
-
 constexpr std::integral_constant<uint8_t, 255> kerndata_terminator{};
 
-}
-
-namespace dcx {
-
 //list of open fonts, for use (for now) for palette remapping
-static array<grs_font *, MAX_OPEN_FONTS> open_font;
+static std::array<grs_font *, MAX_OPEN_FONTS> open_font;
 
 #define BITS_TO_BYTES(x)    (((x)+7)>>3)
 
@@ -94,8 +91,6 @@ static const uint8_t *find_kern_entry(const grs_font &font, const uint8_t first,
 }
 
 //takes the character AFTER being offset into font
-
-namespace {
 
 class font_character_extent
 {
@@ -130,8 +125,6 @@ struct get_char_width_result<float>
 	{
 	}
 };
-
-}
 
 //takes the character BEFORE being offset into current font
 template <typename T>
@@ -186,22 +179,28 @@ static int get_centered_x(const grs_canvas &canvas, const grs_font &cv_font, con
 //function must already have orig_color var set (or they could be passed as args...)
 //perhaps some sort of recursive orig_color type thing would be better, but that would be way too much trouble for little gain
 constexpr std::integral_constant<int, 1> gr_message_color_level{};
-#define CHECK_EMBEDDED_COLORS() if ((*text_ptr >= 0x01) && (*text_ptr <= 0x02)) { \
+
+struct per_character_row_state
+{
+	uint8_t draw_full_width_as_fg_color = 0;
+};
+
+#define CHECK_EMBEDDED_COLORS() if (const char control_code = *text_ptr; control_code >= 0x01 && control_code <= 0x02) { \
 		text_ptr++; \
 		if (*text_ptr){ \
-			if (gr_message_color_level >= *(text_ptr-1)) \
-				canvas.cv_font_fg_color = static_cast<uint8_t>(*text_ptr); \
+			if (gr_message_color_level >= control_code) \
+				canvas.cv_font_fg_color = *text_ptr; \
 			text_ptr++; \
 		} \
 	} \
-	else if (*text_ptr == 0x03) \
+	else if (control_code == 0x03) \
 	{ \
-		underline = 1; \
+		state.draw_full_width_as_fg_color = 1; \
 		text_ptr++; \
 	} \
-	else if ((*text_ptr >= 0x04) && (*text_ptr <= 0x06)){ \
-		if (gr_message_color_level >= *text_ptr - 3) \
-			canvas.cv_font_fg_color= static_cast<uint8_t>(orig_color); \
+	else if (control_code >= 0x04 && control_code <= 0x06) { \
+		if (gr_message_color_level >= control_code - 3) \
+			canvas.cv_font_fg_color= orig_color; \
 		text_ptr++; \
 	}
 
@@ -219,11 +218,9 @@ static int gr_internal_string0_template(grs_canvas &canvas, const grs_font &cv_f
 	//to allow easy reseting to default string color with colored strings -MPM
 	const auto orig_color = canvas.cv_font_fg_color;
 	VideoOffset1 = y * canvas.cv_bitmap.bm_rowsize + x;
-	auto next_row = s;
-	while (next_row != NULL )
+	for (auto next_row = s; next_row;)
 	{
-		const auto text_ptr1 = next_row;
-		next_row = NULL;
+		const auto text_ptr1 = std::exchange(next_row, nullptr);
 
 		if (x==0x8000) {			//centered
 			int xx = get_centered_x(canvas, cv_font, text_ptr1);
@@ -256,9 +253,11 @@ static int gr_internal_string0_template(grs_canvas &canvas, const grs_font &cv_f
 					continue;
 				}
 
-				auto underline = unlikely(c0 == CC_UNDERLINE)
-					? ++text_ptr, r == cv_font.ft_baseline + 2 || r == cv_font.ft_baseline + 3
-					: 0;
+				per_character_row_state state{
+					(unlikely(c0 == CC_UNDERLINE)
+						? ++text_ptr, r == cv_font.ft_baseline + 2 || r == cv_font.ft_baseline + 3
+						: false),
+				};
 
 				const uint8_t c = *text_ptr;
 				const auto &result = get_char_width<int>(cv_font, c, text_ptr[1]);
@@ -267,8 +266,9 @@ static int gr_internal_string0_template(grs_canvas &canvas, const grs_font &cv_f
 
 				const unsigned letter = c - cv_font.ft_minchar;
 
-				if (masked_draws_background)
+				if constexpr (masked_draws_background)
 				{
+					(void)orig_color;
 					if (!INFONT(letter)) {	//not in font, draw as space
 						VideoOffset += spacing;
 						text_ptr++;
@@ -291,7 +291,7 @@ static int gr_internal_string0_template(grs_canvas &canvas, const grs_font &cv_f
 				{
 					auto data = &canvas.cv_bitmap.get_bitmap_data()[VideoOffset];
 					const auto cv_font_fg_color = canvas.cv_font_fg_color;
-				if (underline)
+					if (state.draw_full_width_as_fg_color)
 				{
 					std::fill_n(data, width, cv_font_fg_color);
 				}
@@ -317,7 +317,7 @@ static int gr_internal_string0_template(grs_canvas &canvas, const grs_font &cv_f
 
 						const auto bit_enabled = (bits & 0x80);
 						bits <<= 1;
-						if (!masked_draws_background)
+						if constexpr (!masked_draws_background)
 						{
 							if (!bit_enabled)
 								continue;
@@ -349,7 +349,7 @@ static int gr_internal_string0m(grs_canvas &canvas, const grs_font &cv_font, con
 }
 
 #if !DXX_USE_OGL
-static int gr_internal_color_string(grs_canvas &canvas, const grs_font &cv_font, const int x, const int y, const char *const s)
+static void gr_internal_color_string(grs_canvas &canvas, const grs_font &cv_font, const int x, const int y, const char *const s)
 {
 //a bitmap for the character
 	grs_bitmap char_bm = {};
@@ -404,7 +404,11 @@ static int gr_internal_color_string(grs_canvas &canvas, const grs_font &cv_font,
 				? cv_font.ft_chars[letter]
 				: &cv_font.ft_data[letter * BITS_TO_BYTES(width) * cv_font.ft_h];
 
-			gr_init_bitmap(char_bm, bm_mode::linear, 0, 0, width, cv_font.ft_h, width, fp);
+			/* Cast away const-ness on the font pointer.  The function
+			 * must take the parameter as non-const because some callers
+			 * provide an uninitialized pointer and fill it later.
+			 */
+			gr_init_bitmap(char_bm, bm_mode::linear, 0, 0, width, cv_font.ft_h, width, const_cast<color_palette_index *>(fp));
 			gr_bitmapm(canvas, xx, yy, char_bm);
 
 			xx += spacing;
@@ -413,7 +417,6 @@ static int gr_internal_color_string(grs_canvas &canvas, const grs_font &cv_font,
 		}
 
 	}
-	return 0;
 }
 
 #else //OGL
@@ -435,11 +438,13 @@ static int get_font_total_width(const grs_font &font)
 	}
 }
 
-static void ogl_font_choose_size(grs_font * font,int gap,int *rw,int *rh){
+static std::pair<int, int> ogl_font_choose_size(grs_font * font, const int gap)
+{
 	int	nchars = font->ft_maxchar-font->ft_minchar+1;
 	int r,x,y,nc=0,smallest=999999,smallr=-1,tries;
 	int smallprop=10000;
 	int w;
+	int rw = INT_MIN, rh = INT_MIN;
 	for (int h=32;h<=256;h*=2){
 //		h=pow2ize(font->ft_h*rows+gap*(rows-1));
 		if (font->ft_h>h)continue;
@@ -494,28 +499,27 @@ static void ogl_font_choose_size(grs_font * font,int gap,int *rw,int *rh){
 		if (w*h<smallest){
 			smallr=1;
 			smallest=w*h;
-			*rw=w;
-			*rh=h;
+			rw = w;
+			rh = h;
 		}
 	}
 	if (smallr<=0)
 		Error("Could not fit font?\n");
+	return {rw, rh};
 }
 
 static void ogl_init_font(grs_font * font)
 {
 	int oglflags = OGL_FLAG_ALPHA;
-	int	nchars = font->ft_maxchar-font->ft_minchar+1;
-	int w,h,tw,th,curx=0,cury=0;
+	const unsigned nchars = font->ft_maxchar - font->ft_minchar + 1;
+	int curx=0,cury=0;
 	int gap=1; // x/y offset between the chars so we can filter
 
-	th = tw = 0xffff;
-
-	ogl_font_choose_size(font,gap,&tw,&th);
+	const auto &&[tw, th] = ogl_font_choose_size(font, gap);
 	{
 		RAIIdmem<uint8_t[]> data;
 		const unsigned length = tw * th;
-		MALLOC(data, uint8_t, length);
+		MALLOC(data, uint8_t[], length);
 		std::fill_n(data.get(), length, TRANSPARENCY_COLOR); // map the whole data with transparency so we won't have borders if using gap
 		gr_init_main_bitmap(font->ft_parent_bitmap, bm_mode::linear, 0, 0, tw, th, tw, std::move(data));
 	}
@@ -525,15 +529,14 @@ static void ogl_init_font(grs_font * font)
 		oglflags |= OGL_FLAG_NOCOLOR;
 	ogl_init_texture(*(font->ft_parent_bitmap.gltexture = ogl_get_free_texture()), tw, th, oglflags); // have to init the gltexture here so the subbitmaps will find it.
 
-	font->ft_bitmaps = make_unique<grs_bitmap[]>(nchars);
-	h=font->ft_h;
+	font->ft_bitmaps = std::make_unique<grs_bitmap[]>(nchars);
+	const unsigned h = font->ft_h;
 
-	for(int i=0;i<nchars;i++)
+	for (const auto i : xrange(nchars))
 	{
-		if (font->ft_flags & FT_PROPORTIONAL)
-			w=font->ft_widths[i];
-		else
-			w=font->ft_w;
+		const unsigned w = (font->ft_flags & FT_PROPORTIONAL)
+			? font->ft_widths[i]
+			: font->ft_w;
 
 		if (w<1 || w>256)
 			continue;
@@ -552,17 +555,16 @@ static void ogl_init_font(grs_font * font)
 			const auto fp = (font->ft_flags & FT_PROPORTIONAL)
 				? font->ft_chars[i]
 				: font->ft_data + i * w*h;
-			for (int y=0;y<h;y++)
+			for (const auto y : xrange(h))
 			{
-				for (int x=0;x<w;x++)
-				{
+				for (const auto x : xrange(w))
 					font->ft_parent_bitmap.get_bitmap_data()[curx+x+(cury+y)*tw] = fp[x+y*w];
 					// Let's call this a HACK:
 					// If we filter the fonts, the sliders will be messed up as the border pixels will have an
 					// alpha value while filtering. So the slider bitmaps will not look "connected".
 					// To prevent this, duplicate the first/last pixel-row with a 1-pixel offset.
-					if (gap && i >= 99 && i <= 102)
-					{
+				if (gap && i >= 99 && i <= 102)
+				{
 						// See which bitmaps need left/right shifts:
 						// 99  = SLIDER_LEFT - shift RIGHT
 						// 100 = SLIDER_RIGHT - shift LEFT
@@ -570,35 +572,44 @@ static void ogl_init_font(grs_font * font)
 						// 102 = SLIDER_MARKER - shift RIGHT
 
 						// shift left border
-						if (x==0 && i != 99 && i != 102)
-							font->ft_parent_bitmap.get_bitmap_data()[(curx+x+(cury+y)*tw)-1] = fp[x+y*w];
-
-						// shift right border
-						if (x==w-1 && i != 100)
-							font->ft_parent_bitmap.get_bitmap_data()[(curx+x+(cury+y)*tw)+1] = fp[x+y*w];
+					std::size_t oi, ii;
+					if (i != 99 && i != 102)
+					{
+						oi = (curx + (cury + y) * tw) - 1;
+						ii = y * w;
 					}
+						// shift right border
+					else if (i != 100)
+					{
+						oi = (curx + (w - 1) + (cury + y) * tw) + 1;
+						ii = (w - 1) + y * w;
+					}
+					else
+						continue;
+					font->ft_parent_bitmap.get_bitmap_data()[oi] = fp[ii];
 				}
 			}
 		}
 		else
 		{
-			int BitMask,bits=0,white=gr_find_closest_color(63,63,63);
+			auto white = gr_find_closest_color(63, 63, 63);
 			auto fp = (font->ft_flags & FT_PROPORTIONAL)
 				? font->ft_chars[i]
 				: font->ft_data + i * BITS_TO_BYTES(w)*h;
-			for (int y=0;y<h;y++){
-				BitMask=0;
-				for (int x=0; x< w; x++ )
+			for (const auto y : xrange(h))
+			{
+				uint8_t BitMask = 0;
+				uint8_t bits = 0;
+				for (const auto x : xrange(w))
 				{
 					if (BitMask==0) {
 						bits = *fp++;
 						BitMask = 0x80;
 					}
 
-					if (bits & BitMask)
-						font->ft_parent_bitmap.get_bitmap_data()[curx+x+(cury+y)*tw] = white;
-					else
-						font->ft_parent_bitmap.get_bitmap_data()[curx+x+(cury+y)*tw] = 255;
+					font->ft_parent_bitmap.get_bitmap_data()[curx+x+(cury+y)*tw] = (bits & BitMask)
+						? white
+						: 255;
 					BitMask >>= 1;
 				}
 			}
@@ -609,17 +620,9 @@ static void ogl_init_font(grs_font * font)
 	ogl_loadbmtexture_f(font->ft_parent_bitmap, CGameCfg.TexFilt, 0, 0);
 }
 
-static int ogl_internal_string(grs_canvas &canvas, const grs_font &cv_font, const int x, const int y, const char *const s)
+static void ogl_internal_string(grs_canvas &canvas, const grs_font &cv_font, const int entry_x, int yy, const char *const s)
 {
-	const char * text_ptr, * next_row, * text_ptr1;
-	int letter;
-	int xx,yy;
-	int orig_color = canvas.cv_font_fg_color;//to allow easy reseting to default string color with colored strings -MPM
-	int underline;
-
-	next_row = s;
-
-	yy = y;
+	auto orig_color = canvas.cv_font_fg_color;//to allow easy reseting to default string color with colored strings -MPM
 
 	if (grd_curscreen->sc_canvas.cv_bitmap.get_type() != bm_mode::ogl)
 		Error("carp.\n");
@@ -628,84 +631,86 @@ static int ogl_internal_string(grs_canvas &canvas, const grs_font &cv_font, cons
 	const auto &&fontscale_x = FONTSCALE_X();
 	const auto &&FONTSCALE_Y_ft_h = FONTSCALE_Y(cv_font.ft_h);
 	ogl_colors colors;
-	while (next_row != NULL)
+	for (auto next_row = s; next_row;)
 	{
-		text_ptr1 = next_row;
-		next_row = NULL;
+		auto text_ptr = std::exchange(next_row, nullptr);
+		auto line_x = entry_x == 0x8000
+			? get_centered_x(canvas, cv_font, text_ptr)
+			: entry_x;
 
-		text_ptr = text_ptr1;
-
-		xx = x;
-
-		if (xx==0x8000)			//centered
-			xx = get_centered_x(canvas, cv_font, text_ptr);
-
-		while (*text_ptr)
+		for (; const auto c0 = *text_ptr;)
 		{
-
-			if (*text_ptr == '\n' )
+			if (c0 == '\n')
 			{
 				next_row = &text_ptr[1];
 				yy += FONTSCALE_Y_ft_h + fspacy1;
 				break;
 			}
 
-			letter = static_cast<uint8_t>(*text_ptr) - cv_font.ft_minchar;
+			const auto letter = c0 - cv_font.ft_minchar;
 
-			const auto &result = get_char_width<int>(cv_font, text_ptr[0], text_ptr[1]);
+			const auto &result = get_char_width<int>(cv_font, c0, text_ptr[1]);
 			const auto &spacing = result.spacing;
 
-			underline = 0;
-			if (!INFONT(letter) || static_cast<uint8_t>(*text_ptr) <= 0x06) //not in font, draw as space
+			per_character_row_state state;
+			if (!INFONT(letter) || c0 <= 0x06) //not in font, draw as space
 			{
 				CHECK_EMBEDDED_COLORS() else{
-					xx += spacing;
+					line_x += spacing;
 					text_ptr++;
 				}
-				
-				if (underline)
+				if (state.draw_full_width_as_fg_color)
 				{
-					const uint8_t color = canvas.cv_font_fg_color;
-					gr_rect(canvas, xx, yy + cv_font.ft_baseline + 2, xx + cv_font.ft_w, yy + cv_font.ft_baseline + 3, color);
+					const auto color = canvas.cv_font_fg_color;
+					gr_rect(canvas, line_x, yy + cv_font.ft_baseline + 2, line_x + cv_font.ft_w, yy + cv_font.ft_baseline + 3, color);
 				}
 
 				continue;
 			}
-			
 			const auto ft_w = (cv_font.ft_flags & FT_PROPORTIONAL)
 				? cv_font.ft_widths[letter]
 				: cv_font.ft_w;
 
-			ogl_ubitmapm_cs(canvas, xx, yy, fontscale_x(ft_w), FONTSCALE_Y_ft_h, cv_font.ft_bitmaps[letter], (cv_font.ft_flags & FT_COLOR) ? colors.white : (canvas.cv_bitmap.get_type() == bm_mode::ogl) ? colors.init(canvas.cv_font_fg_color) : throw std::runtime_error("non-color string to non-ogl dest"), F1_0);
+			ogl_ubitmapm_cs(canvas, line_x, yy, fontscale_x(ft_w), FONTSCALE_Y_ft_h, cv_font.ft_bitmaps[letter], (cv_font.ft_flags & FT_COLOR) ? colors.white : (canvas.cv_bitmap.get_type() == bm_mode::ogl) ? colors.init(canvas.cv_font_fg_color) : throw std::runtime_error("non-color string to non-ogl dest"));
 
-			xx += spacing;
-
+			line_x += spacing;
 			text_ptr++;
 		}
 	}
-	return 0;
 }
 
 #define gr_internal_color_string ogl_internal_string
 #endif //OGL
 
+}
+
 void gr_string(grs_canvas &canvas, const grs_font &cv_font, const int x, const int y, const char *const s)
 {
-	int w, h;
-	gr_get_string_size(cv_font, s, &w, &h, nullptr);
+	const auto &&[w, h] = gr_get_string_size(cv_font, s);
 	gr_string(canvas, cv_font, x, y, s, w, h);
 }
+
+namespace {
 
 static void gr_ustring_mono(grs_canvas &canvas, const grs_font &cv_font, const int x, const int y, const char *const s)
 {
 	switch (canvas.cv_bitmap.get_type())
 	{
 		case bm_mode::linear:
-			if (canvas.cv_font_bg_color == -1)
+			if (canvas.cv_font_bg_color == TRANSPARENCY_COLOR)
 				gr_internal_string0m(canvas, cv_font, x, y, s);
 			else
 				gr_internal_string0(canvas, cv_font, x, y, s);
+			break;
+		case bm_mode::ilbm:
+		case bm_mode::rgb15:
+#if DXX_USE_OGL
+		case bm_mode::ogl:
+#endif
+			break;
 	}
+}
+
 }
 
 void gr_string(grs_canvas &canvas, const grs_font &cv_font, const int x, const int y, const char *const s, const int w, const int h)
@@ -746,7 +751,7 @@ void gr_string(grs_canvas &canvas, const grs_font &cv_font, const int x, const i
 		return;
 	}
 
-	if (canvas.cv_font_bg_color == -1)
+	if (canvas.cv_font_bg_color == TRANSPARENCY_COLOR)
 	{
 		gr_internal_string_clipped_m(canvas, cv_font, x, y, s);
 		return;
@@ -764,26 +769,27 @@ void gr_ustring(grs_canvas &canvas, const grs_font &cv_font, const int x, const 
 	}
 #endif
 	
-	if (canvas.cv_font->ft_flags & FT_COLOR) {
+	if (cv_font.ft_flags & FT_COLOR)
 		gr_internal_color_string(canvas, cv_font, x, y, s);
-	}
 	else
 		gr_ustring_mono(canvas, cv_font, x, y, s);
 }
 
-void gr_get_string_size(const grs_font &cv_font, const char *s, int *const string_width, int *const string_height, int *const average_width)
+unsigned gr_get_string_height(const grs_font &cv_font, const unsigned lines)
 {
-	gr_get_string_size(cv_font, s, string_width, string_height, average_width, UINT_MAX);
+	const auto fontscale_y = FONTSCALE_Y(cv_font.ft_h);
+	return static_cast<unsigned>(fontscale_y + (lines * (fontscale_y + FSPACY(1))));
 }
 
-void gr_get_string_size(const grs_font &cv_font, const char *s, int *const string_width, int *const string_height, int *const average_width, const unsigned max_chars_per_line)
+gr_string_size gr_get_string_size(const grs_font &cv_font, const char *s)
+{
+	return gr_get_string_size(cv_font, s, UINT_MAX);
+}
+
+gr_string_size gr_get_string_size(const grs_font &cv_font, const char *s, const unsigned max_chars_per_line)
 {
 	float longest_width=0.0,string_width_f=0.0;
 	unsigned lines = 0;
-	if (average_width)
-		*average_width = cv_font.ft_w;
-	if (!string_width && !string_height)
-		return;
 	if (s)
 	{
 		unsigned remaining_chars_this_line = max_chars_per_line;
@@ -812,13 +818,7 @@ void gr_get_string_size(const grs_font &cv_font, const char *s, int *const strin
 				break;
 		}
 	}
-	if (string_width)
-		*string_width = std::max(longest_width, string_width_f);
-	if (string_height)
-	{
-		const auto fontscale_y = FONTSCALE_Y(cv_font.ft_h);
-		*string_height = static_cast<int>(fontscale_y + (lines * (fontscale_y + FSPACY(1))));
-	}
+	return {static_cast<unsigned long>(std::max(longest_width, string_width_f)), gr_get_string_height(cv_font, lines)};
 }
 
 std::pair<const char *, unsigned> gr_get_string_wrap(const grs_font &cv_font, const char *s, unsigned limit)
@@ -880,6 +880,8 @@ void gr_remap_color_fonts()
 	}
 }
 
+namespace {
+
 /*
  * reads a grs_font structure from a PHYSFS_File
  */
@@ -900,17 +902,17 @@ static void grs_font_read(grs_font *gf, PHYSFS_File *fp)
 
 static std::unique_ptr<grs_font> gr_internal_init_font(const char *fontname)
 {
-	const uint8_t *ptr;
-	uint8_t *ft_data;
+	color_palette_index *ptr;
+	color_palette_index *ft_data;
 	struct {
-		array<char, 4> magic;
+		std::array<char, 4> magic;
 		unsigned datasize;	//size up to (but not including) palette
 	} file_header;
 
-	auto fontfile = PHYSFSX_openReadBuffered(fontname);
+	auto &&[fontfile, physfserr] = PHYSFSX_openReadBuffered(fontname);
 
 	if (!fontfile) {
-		con_printf(CON_VERBOSE, "Can't open font file %s", fontname);
+		con_printf(CON_VERBOSE, "Failed to open font file \"%s\": %s", fontname, PHYSFS_getErrorByCode(physfserr));
 		return {};
 	}
 
@@ -926,7 +928,7 @@ static std::unique_ptr<grs_font> gr_internal_init_font(const char *fontname)
 	file_header.datasize -= GRS_FONT_SIZE; // subtract the size of the header.
 	const auto &datasize = file_header.datasize;
 
-	auto font = make_unique<grs_font>();
+	auto font = std::make_unique<grs_font>();
 	grs_font_read(font.get(), fontfile);
 
 	const unsigned nchars = font->ft_maxchar - font->ft_minchar + 1;
@@ -934,7 +936,7 @@ static std::unique_ptr<grs_font> gr_internal_init_font(const char *fontname)
 		? sizeof(uint8_t *) * nchars
 		: 0;
 
-	auto ft_allocdata = make_unique<uint8_t[]>(datasize + ft_chars_storage);
+	auto ft_allocdata = std::make_unique<color_palette_index[]>(datasize + ft_chars_storage);
 	const auto font_data = &ft_allocdata[ft_chars_storage];
 	if (PHYSFS_read(fontfile, font_data, 1, datasize) != datasize)
 	{
@@ -965,7 +967,7 @@ static std::unique_ptr<grs_font> gr_internal_init_font(const char *fontname)
 		const unsigned ft_h = font->ft_h;
 		std::generate_n(ft_chars, nchars, [is_color, ft_h, &w, &ptr]{
 			const unsigned s = INTEL_SHORT(*w);
-			if (words_bigendian)
+			if constexpr (words_bigendian)
 				*w = static_cast<uint16_t>(s);
 			++w;
 			const auto r = ptr;
@@ -977,7 +979,7 @@ static std::unique_ptr<grs_font> gr_internal_init_font(const char *fontname)
 		font->ft_data   = ft_data = font_data;
 		font->ft_widths = NULL;
 
-		ptr = font->ft_data + (nchars * font->ft_w * font->ft_h);
+		ptr = ft_data + (nchars * font->ft_w * font->ft_h);
 	}
 
 	if (font->ft_flags & FT_KERNED)
@@ -1007,13 +1009,14 @@ static std::unique_ptr<grs_font> gr_internal_init_font(const char *fontname)
 
 	if (font->ft_flags & FT_COLOR) {		//remap palette
 		palette_array_t palette;
-		array<uint8_t, 256> colormap;
+		std::array<color_palette_index, 256> colormap;
 		/* `freq` exists so that decode_data can write to it, but it is
 		 * otherwise unused.  `decode_data` is not guaranteed to write
-		 * to every element, so `freq` must not be read without first
-		 * adding an initialization step.
+		 * to every element, but the bitset constructor will initialize
+		 * the storage, so reading unwritten fields will always return
+		 * false.
 		 */
-		array<bool, 256> freq;
+		std::bitset<256> freq;
 
 		PHYSFS_read(fontfile,&palette[0],sizeof(palette[0]),palette.size());		//read the palette
 
@@ -1021,7 +1024,7 @@ static std::unique_ptr<grs_font> gr_internal_init_font(const char *fontname)
 
 		colormap[TRANSPARENCY_COLOR] = TRANSPARENCY_COLOR;              // changed from colormap[255] = 255 to this for macintosh
 
-		decode_data(ft_data, ptr - font->ft_data, colormap, freq );
+		decode_data(std::span{ft_data, ptr}, colormap, freq);
 	}
 	fontfile.reset();
 	//set curcanv vars
@@ -1030,6 +1033,8 @@ static std::unique_ptr<grs_font> gr_internal_init_font(const char *fontname)
 	font->ft_allocdata = move(ft_allocdata);
 	strncpy(&ft_filename[0], fontname, ft_filename.size());
 	return font;
+}
+
 }
 
 grs_font_ptr gr_init_font(grs_canvas &canvas, const char *fontname)
@@ -1069,34 +1074,27 @@ void gr_remap_font(grs_font *font, const char *fontname)
 #endif
 }
 
-void gr_set_curfont(grs_canvas &canvas, const grs_font *n)
+void gr_set_curfont(grs_canvas &canvas, const grs_font &n)
 {
-	canvas.cv_font = n;
+	canvas.cv_font = &n;
 }
 
-void gr_set_fontcolor(grs_canvas &canvas, const int fg_color, const int bg_color)
-{
-	canvas.cv_font_fg_color = fg_color;
-	canvas.cv_font_bg_color = bg_color;
-}
+namespace {
 
 template <bool masked_draws_background>
 static int gr_internal_string_clipped_template(grs_canvas &canvas, const grs_font &cv_font, int x, int y, const char *const s)
 {
-	const char * text_ptr, * next_row, * text_ptr1;
 	int letter;
 	int x1 = x, last_x;
-
-	next_row = s;
 
 	const auto &&INFONT = font_character_extent(cv_font);
 	const auto ft_flags = cv_font.ft_flags;
 	const auto proportional = ft_flags & FT_PROPORTIONAL;
 	const auto cv_font_bg_color = canvas.cv_font_bg_color;
 
-	while (next_row != NULL )
+	for (auto next_row = s; next_row;)
 	{
-		text_ptr1 = next_row;
+		const auto text_ptr1 = next_row;
 		next_row = NULL;
 
 		x = x1;
@@ -1105,8 +1103,9 @@ static int gr_internal_string_clipped_template(grs_canvas &canvas, const grs_fon
 
 		last_x = x;
 
-		for (int r=0; r < cv_font.ft_h; r++) {
-			text_ptr = text_ptr1;
+		for (const auto r : xrange(cv_font.ft_h))
+		{
+			auto text_ptr = text_ptr1;
 			x = last_x;
 
 			for (; const uint8_t c0 = *text_ptr; ++text_ptr)
@@ -1129,9 +1128,11 @@ static int gr_internal_string_clipped_template(grs_canvas &canvas, const grs_fon
 					continue;
 				}
 
-				const auto underline = unlikely(c0 == CC_UNDERLINE)
-					? ++text_ptr, r == cv_font.ft_baseline + 2 || r == cv_font.ft_baseline + 3
-					: 0;
+				per_character_row_state state{
+					(unlikely(c0 == CC_UNDERLINE)
+						? ++text_ptr, r == cv_font.ft_baseline + 2 || r == cv_font.ft_baseline + 3
+						: false),
+				};
 				const uint8_t c = *text_ptr;
 				const auto &result = get_char_width<int>(cv_font, c, text_ptr[1]);
 				const auto &width = result.width;
@@ -1147,7 +1148,7 @@ static int gr_internal_string_clipped_template(grs_canvas &canvas, const grs_fon
 				auto color = cv_font_fg_color;
 				if (width)
 				{
-				if (underline)	{
+					if (state.draw_full_width_as_fg_color)	{
 					for (uint_fast32_t i = width; i--;)
 					{
 						gr_pixel(canvas.cv_bitmap, x++, y, color);
@@ -1173,7 +1174,7 @@ static int gr_internal_string_clipped_template(grs_canvas &canvas, const grs_fon
 						}
 						const auto bit_enabled = (bits & 0x80);
 						bits <<= 1;
-						if (masked_draws_background)
+						if constexpr (masked_draws_background)
 							color = bit_enabled ? cv_font_fg_color : cv_font_bg_color;
 						else
 						{
@@ -1200,6 +1201,8 @@ static int gr_internal_string_clipped_m(grs_canvas &canvas, const grs_font &cv_f
 static int gr_internal_string_clipped(grs_canvas &canvas, const grs_font &cv_font, const int x, const int y, const char *const s)
 {
 	return gr_internal_string_clipped_template<false>(canvas, cv_font, x, y, s);
+}
+
 }
 
 }

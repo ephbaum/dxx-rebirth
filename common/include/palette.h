@@ -30,29 +30,29 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "pstypes.h"
 
 #ifdef __cplusplus
+#include <cstddef>
 #include <cstdint>
 #include "dxxsconf.h"
 #include "dsx-ns.h"
-#include "compiler-array.h"
+#include <array>
 
 struct rgb_t {
 	ubyte r,g,b;
+	[[nodiscard]]
+	constexpr bool operator==(const rgb_t &) const = default;
 };
 
 typedef uint8_t color_t;
 
-static inline bool operator==(const rgb_t &a, const rgb_t &b) { return a.r == b.r && a.g == b.g && a.b == b.b; }
-
 namespace dcx {
 
-struct palette_array_t : public array<rgb_t, 256> {};
+struct palette_array_t : public std::array<rgb_t, 256> {};
 
 #ifdef DXX_BUILD_DESCENT_II
 #define DEFAULT_LEVEL_PALETTE "groupa.256" //don't confuse with D2_DEFAULT_PALETTE
 #endif
 
 void copy_bound_palette(palette_array_t &d, const palette_array_t &s);
-void copy_diminish_palette(palette_array_t &palette, const ubyte *p);
 void diminish_palette(palette_array_t &palette);
 extern void gr_palette_set_gamma( int gamma );
 extern int gr_palette_get_gamma();
@@ -61,9 +61,32 @@ color_t gr_find_closest_color_current( int r, int g, int b );
 #if !DXX_USE_OGL
 void gr_palette_read(palette_array_t &palette);
 #endif
-extern void init_computed_colors(void);
+void reset_computed_colors();
 extern ubyte gr_palette_gamma;
 extern palette_array_t gr_current_pal;
+extern palette_array_t gr_palette;
+
+using color_palette_index = uint8_t;
+
+static inline const rgb_t &CPAL2T(const color_palette_index c)
+{
+	return gr_current_pal[static_cast<std::size_t>(c)];
+}
+
+static inline const rgb_t &PAL2T(const color_palette_index c)
+{
+	return gr_palette[static_cast<std::size_t>(c)];
+}
+
+#define CPAL2Tr(c) (CPAL2T(c).r / 63.0)
+#define CPAL2Tg(c) (CPAL2T(c).g / 63.0)
+#define CPAL2Tb(c) (CPAL2T(c).b / 63.0)
+#define PAL2Tr(c) (PAL2T(c).r / 63.0)
+#define PAL2Tg(c) (PAL2T(c).g / 63.0)
+#define PAL2Tb(c) (PAL2T(c).b / 63.0)
+//inline GLfloat PAL2Tr(int c);
+//inline GLfloat PAL2Tg(int c);
+//inline GLfloat PAL2Tb(int c);
 }
 
 #endif

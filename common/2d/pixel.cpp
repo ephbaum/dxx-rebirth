@@ -25,14 +25,13 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #include "u_mem.h"
 #include "gr.h"
-#include "grdef.h"
 #if DXX_USE_OGL
 #include "ogl_init.h"
 #endif
 
 namespace dcx {
 
-void gr_upixel(grs_bitmap &cv_bitmap, const unsigned x, const unsigned y, const uint8_t color)
+void gr_upixel(grs_bitmap &cv_bitmap, const unsigned x, const unsigned y, const color_palette_index color)
 {
 	switch (cv_bitmap.get_type())
 	{
@@ -44,20 +43,25 @@ void gr_upixel(grs_bitmap &cv_bitmap, const unsigned x, const unsigned y, const 
 	case bm_mode::linear:
 		cv_bitmap.get_bitmap_data()[cv_bitmap.bm_rowsize * y + x] = color;
 		return;
+		case bm_mode::ilbm:
+		case bm_mode::rgb15:
+			break;
 	}
 }
 
-void gr_pixel(grs_bitmap &cv_bitmap, const unsigned x, const unsigned y, const uint8_t color)
+void gr_pixel(grs_bitmap &cv_bitmap, const unsigned x, const unsigned y, const color_palette_index color)
 {
 	if (unlikely(x >= cv_bitmap.bm_w || y >= cv_bitmap.bm_h))
 		return;
 	gr_upixel(cv_bitmap, x, y, color);
 }
 
+namespace {
+
 #if !DXX_USE_OGL
 #define gr_bm_upixel(C,B,X,Y,C2) gr_bm_upixel(B,X,Y,C2)
 #endif
-static inline void gr_bm_upixel(grs_canvas &canvas, grs_bitmap &bm, const uint_fast32_t x, const uint_fast32_t y, const uint8_t color)
+static inline void gr_bm_upixel(grs_canvas &canvas, grs_bitmap &bm, const uint_fast32_t x, const uint_fast32_t y, const color_palette_index color)
 {
 	switch (bm.get_type())
 	{
@@ -69,10 +73,15 @@ static inline void gr_bm_upixel(grs_canvas &canvas, grs_bitmap &bm, const uint_f
 	case bm_mode::linear:
 		bm.get_bitmap_data()[bm.bm_rowsize*y+x] = color;
 		return;
+		case bm_mode::rgb15:
+		case bm_mode::ilbm:
+			break;
 	}
 }
 
-void gr_bm_pixel(grs_canvas &canvas, grs_bitmap &bm, const uint_fast32_t x, const uint_fast32_t y, const uint8_t color)
+}
+
+void gr_bm_pixel(grs_canvas &canvas, grs_bitmap &bm, const uint_fast32_t x, const uint_fast32_t y, const color_palette_index color)
 {
 	if (unlikely(x >= bm.bm_w || y >= bm.bm_h))
 		return;

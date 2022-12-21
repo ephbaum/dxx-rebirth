@@ -25,6 +25,8 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #include <algorithm>
 #include <numeric>
+#include <random>
+#include <optional>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -49,23 +51,22 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "weapon.h"
 #include "fireball.h"
 #include "collide.h"
-#include "newmenu.h"
-#include "gameseq.h"
 #include "physics.h"
-#include "scores.h"
 #include "laser.h"
 #include "wall.h"
 #include "multi.h"
-#include "endlevel.h"
 #include "timer.h"
-#include "fuelcen.h"
 #include "playsave.h"
-#include "cntrlcen.h"
 #include "gameseg.h"
 #include "automap.h"
 #include "byteutil.h"
 
 #include "compiler-range_for.h"
+#include "d_array.h"
+#include "d_enumerate.h"
+#include "d_levelstate.h"
+#include "d_range.h"
+#include "d_zip.h"
 #include "partial_range.h"
 #include "segiter.h"
 
@@ -73,15 +74,242 @@ using std::min;
 
 #define EXPLOSION_SCALE (F1_0*5/2)		//explosion is the obj size times this 
 
-//--unused-- ubyte	Frame_processed[MAX_OBJECTS];
-
 namespace dcx {
+
+namespace {
+
+/* C arrays are normally indexed starting from 0.  For some use cases,
+ * values in [0, Bias) for some Bias are not useful.  Callers must
+ * either waste Bias unused elements at the head of the array, or
+ * subtract Bias from all indexes when accessing the array.  This class
+ * automates the latter approach.  Its actual size is N, and all index
+ * operations are offset by subtracting Bias.  As with std::array,
+ * callers are responsible for passing only valid index values.
+ */
+template <std::size_t Bias, typename T, std::size_t N>
+struct biased_index_array : std::array<T, N>
+{
+	using base_type = std::array<T, N>;
+	using typename base_type::reference;
+	using typename base_type::const_reference;
+	using typename base_type::size_type;
+	/* Not implemented, so delete it to avoid using the base class
+	 * implementation, which would not adjust by Bias.  This could be
+	 * implemented if needed.
+	 */
+	constexpr reference at(size_type position) = delete;
+	constexpr reference at(size_type position) const = delete;
+	constexpr reference operator[](size_type pos)
+	{
+		return this->base_type::operator[](pos - Bias);
+	}
+	constexpr const_reference operator[](size_type pos) const
+	{
+		return this->base_type::operator[](pos - Bias);
+	}
+	[[nodiscard]]
+	static constexpr bool valid_index(size_type pos)
+	{
+		return pos >= Bias && pos - Bias < N;
+	}
+};
+
+struct connected_segment_raw_distances
+{
+	using segment_distance_count_type = uint8_t;
+	/* Minimum depth must be at least 2, since very low values are used
+	 * for special purposes.
+	 */
+	static constexpr std::integral_constant<segment_distance_count_type, 4> minimum_supported_max_depth{};
+	static constexpr std::integral_constant<segment_distance_count_type, 30> maximum_supported_max_depth{};
+	static constexpr std::integral_constant<segment_distance_count_type, 1 + maximum_supported_max_depth - minimum_supported_max_depth> supported_max_depth_range{};
+	/* The value_type must be sufficient to hold the largest number of
+	 * segments that could be at a distance of
+	 * `maximum_supported_max_depth`.
+	 */
+	using depth_count_array = biased_index_array<minimum_supported_max_depth, uint16_t, supported_max_depth_range>;
+	enum class biased_distance : uint8_t
+	{
+		indeterminate,
+		depth_0,
+	};
+	static segment_distance_count_type get_distance_from_biased_distance(const biased_distance d)
+	{
+		return static_cast<segment_distance_count_type>(d) - static_cast<unsigned>(biased_distance::depth_0);
+	}
+	static biased_distance get_biased_distance_from_distance(const segment_distance_count_type d)
+	{
+		return static_cast<biased_distance>(d + static_cast<unsigned>(biased_distance::depth_0));
+	}
+	/* To reduce the stack footprint when recursively visiting segments,
+	 * all the arguments that remain constant during the search are
+	 * stored in an instance of `builder`, and `visit_segment` is a
+	 * member method on `builder`.
+	 */
+	struct builder
+	{
+		fvcsegptr &vcsegptr;
+		fvcwallptr &vcwallptr;
+		const segment_distance_count_type max_depth;
+		depth_count_array &count_segments_at_depth;
+		enumerated_array<biased_distance, MAX_SEGMENTS, segnum_t> &depth_by_segment;
+		/* Segments that are farther away than max_depth do not have a
+		 * specific distance computed, and are only known to be too far
+		 * away.
+		 */
+		void visit_segment(vcsegidx_t current_segment_idx, segment_distance_count_type current_depth) const;
+	};
+	/* Initialize all depths to 0.  These will be updated as the
+	 * constructor traverses the level.  Counts are only maintained for
+	 * supported depths.  If a segment is closer than
+	 * `minimum_supported_max_depth` or farther than
+	 * `maximum_supported_max_depth`, then it is not counted.
+	 */
+	depth_count_array count_segments_at_depth{};
+	/* Initialize all segments to be at the indeterminate distance.
+	 *
+	 * Traversal of the level data will replace the placeholder distance
+	 * with a real value.  Traversal requires that every element either
+	 * be the value `indeterminate` or have a valid depth from earlier
+	 * in the traversal.
+	 */
+	static_assert(static_cast<unsigned>(biased_distance::indeterminate) == 0, "`indeterminate` must be 0 so that zero-initialization assigns the value `indeterminate` to every element in the array");
+	enumerated_array<biased_distance, MAX_SEGMENTS, segnum_t> depth_by_segment{};
+	/* Prefer that the maximum depth be passed as a
+	 * std::integral_constant so that it can be checked at compile time.
+	 * Allow use of non-integral_constant expressions if the caller uses
+	 * the explicit constructor.
+	 */
+	explicit connected_segment_raw_distances(fvcsegptr &vcsegptr, fvcwallptr &vcwallptr, segment_distance_count_type max_depth, vcsegidx_t current_segment_idx);
+	template <segment_distance_count_type max_depth>
+		connected_segment_raw_distances(fvcsegptr &vcsegptr, fvcwallptr &vcwallptr, std::integral_constant<segment_distance_count_type, max_depth>, vcsegidx_t current_segment_idx) : connected_segment_raw_distances(vcsegptr, vcwallptr, max_depth, current_segment_idx)
+		{
+			static_assert(max_depth <= maximum_supported_max_depth);
+		}
+	/* Scan depth_by_segment to find the Nth segment of the desired
+	 * depth, where N is drawn from `uniform_int_distribution(0,
+	 * count_of_segments_at_depth - 1)(mrd)`.  If there are no segments
+	 * at this depth, return an empty std::optional.
+	 */
+	std::optional<segnum_t> scan_segment_depths(unsigned desired_depth, std::minstd_rand &mrd) const;
+};
+
+}
 
 unsigned Num_exploding_walls;
 
 void init_exploding_walls()
 {
 	Num_exploding_walls = 0;
+}
+
+connected_segment_raw_distances::connected_segment_raw_distances(fvcsegptr &vcsegptr, fvcwallptr &vcwallptr, segment_distance_count_type max_depth, vcsegidx_t current_segment_idx)
+{
+	builder{vcsegptr, vcwallptr, max_depth, count_segments_at_depth, depth_by_segment}.visit_segment(current_segment_idx, 0u);
+}
+
+std::optional<segnum_t> connected_segment_raw_distances::scan_segment_depths(const unsigned desired_depth, std::minstd_rand &mrd) const
+{
+	const auto count_segments_at_desired_depth = count_segments_at_depth[desired_depth];
+	if (!count_segments_at_desired_depth)
+		/* No segments exist at this depth.  Move to next depth.
+		*/
+		return std::nullopt;
+	/* Pick a random segment within the segments at the selected
+	 * depth.
+	 */
+	std::uniform_int_distribution uid(0u, count_segments_at_desired_depth - 1u);
+	/* Walk over all segments.  Ignore any segment at the wrong depth.
+	 * Ignore the first `skip_count` segments at the right depth.
+	 */
+	const auto initial_skip_count = uid(mrd);
+	unsigned skip_count = initial_skip_count;
+	const auto desired_biased_depth = get_biased_distance_from_distance(desired_depth);
+	for (const auto &&[sn, biased_depth] : enumerate(depth_by_segment))
+	{
+		if (biased_depth != desired_biased_depth)
+			continue;
+		if (!skip_count)
+			/* Found a segment at the correct depth and the required
+			 * number of segments have been skipped.  Pick this segment.
+			 */
+			return sn;
+		-- skip_count;
+	}
+	/* This should not happen.  `skip_count` is computed such that it is
+	 * below the number of segments at a depth of `desired_depth`, so
+	 * control should always `return` from the loop.
+	 */
+	con_printf(CON_URGENT, DXX_STRINGIZE_FL(__FILE__, __LINE__, "error: count=%u, skip_count=%u, and no segment found at depth %u"), count_segments_at_desired_depth, initial_skip_count, desired_depth);
+	return std::nullopt;
+}
+
+void connected_segment_raw_distances::builder::visit_segment(const vcsegidx_t current_segment_idx, const segment_distance_count_type current_depth) const
+{
+	auto &biased_depth = depth_by_segment[current_segment_idx];
+	if (biased_depth != biased_distance::indeterminate)
+	{
+		const auto d = get_distance_from_biased_distance(biased_depth);
+		if (d <= current_depth)
+			/* This segment was already found through some other
+			 * route.  Leave that result in place.
+			 */
+			return;
+		/* If this segment was previously found at a greater depth, and
+		 * the current step found a shorter path to that segment, then
+		 * reduce the count of segments at the greater depth, since the
+		 * recorded depth of this segment will be changed.
+		 */
+		if (count_segments_at_depth.valid_index(d))
+			-- count_segments_at_depth[d];
+	}
+	biased_depth = get_biased_distance_from_distance(current_depth);
+	if (current_depth >= max_depth)
+		return;
+	const shared_segment &seg = vcsegptr(current_segment_idx);
+	if (seg.special == segment_special::controlcen)
+	{
+		/* Every caller wants to exclude the control-center segment from
+		 * the set of choices.  If the segment is encountered here,
+		 * assign it a depth value that prevents it being selected, and
+		 * stop.  Stopping here prevents exploring segments beyond the
+		 * control-center.  If there is a path around the
+		 * control-center, that path can be used to reach those segments
+		 * instead.  This will lead to a slightly higher than accurate
+		 * distance value for those segments, but the original Descent
+		 * implementation had a random walk that could wander about and
+		 * assign high values to any segment it reached.  By refusing to
+		 * traverse through the control center, this implementation
+		 * avoids selecting areas that are only reachable by flying
+		 * through the control center.
+		 */
+		biased_depth = get_biased_distance_from_distance(0);
+		return;
+	}
+	/* Segments closer than minimum_supported_max_depth or farther than
+	 * maximum_supported_max_depth will not be analyzed later, so no
+	 * count is maintained for them.
+	 *
+	 * This increment is deferred until after the control-center check,
+	 * so that it does not need to be undone when the control-center is
+	 * found.
+	 */
+	if (count_segments_at_depth.valid_index(current_depth))
+		++ count_segments_at_depth[current_depth];
+	for (const auto &&[child_segnum, side] : zip(seg.children, seg.sides))
+	{
+		if (!IS_CHILD(child_segnum))
+			continue;
+		if (const auto wall_num = side.wall_num; wall_num != wall_none)
+		{
+			auto &w = *vcwallptr(wall_num);
+			if (w.type == WALL_CLOSED)
+				continue;
+			if (w.type == WALL_DOOR && (w.flags & wall_flag::door_locked))
+				continue;
+		}
+		visit_segment(child_segnum, current_depth + 1);
+	}
 }
 
 }
@@ -93,8 +321,14 @@ fix	Flash_effect=0;
 constexpr int	PK1=1, PK2=8;
 #endif
 
+namespace {
+
 static bool can_collide(const object *const weapon_object, const object_base &iter_object, const object *const parent_object)
 {
+	/* `weapon_object` may not be a weapon in some cases, though the
+	 * caller originally expected it would be.  For this function, the
+	 * distinction is currently irrelevant.
+	 */
 #if defined(DXX_BUILD_DESCENT_I)
 	(void)weapon_object;
 #elif defined(DXX_BUILD_DESCENT_II)
@@ -109,7 +343,7 @@ static bool can_collide(const object *const weapon_object, const object_base &it
 	{
 #if defined(DXX_BUILD_DESCENT_II)
 		case OBJ_WEAPON:
-			return is_proximity_bomb_or_smart_mine_or_placed_mine(get_weapon_id(iter_object));
+			return is_proximity_bomb_or_player_smart_mine_or_placed_mine(get_weapon_id(iter_object));
 #endif
 		case OBJ_CNTRLCEN:
 		case OBJ_PLAYER:
@@ -125,107 +359,127 @@ static bool can_collide(const object *const weapon_object, const object_base &it
 	}
 }
 
-static imobjptridx_t object_create_explosion_sub(const d_vclip_array &Vclip, fvmobjptridx &vmobjptridx, const imobjptridx_t objp, const vmsegptridx_t segnum, const vms_vector &position, fix size, int vclip_type, fix maxdamage, fix maxdistance, fix maxforce, const icobjptridx_t parent )
-{
-	auto &Robot_info = LevelSharedRobotInfoState.Robot_info;
-	auto obj = obj_create( OBJ_FIREBALL,vclip_type,segnum,position,&vmd_identity_matrix,size,
-					CT_EXPLOSION,MT_NONE,RT_FIREBALL);
+}
 
-	if (obj == object_none)
+imobjptridx_t object_create_explosion_without_damage(const d_vclip_array &Vclip, const vmsegptridx_t segnum, const vms_vector &position, const fix size, const int vclip_type)
+{
+	const auto &&obj_fireball = obj_create(LevelUniqueObjectState, LevelSharedSegmentState, LevelUniqueSegmentState, OBJ_FIREBALL, vclip_type, segnum, position, &vmd_identity_matrix, size,
+					object::control_type::explosion, object::movement_type::None, RT_FIREBALL);
+
+	if (obj_fireball == object_none)
 	{
 		return object_none;
 	}
 
 	//now set explosion-specific data
 
-	obj->lifeleft = Vclip[vclip_type ].play_time;
-	obj->ctype.expl_info.spawn_time = -1;
-	obj->ctype.expl_info.delete_objnum = object_none;
-	obj->ctype.expl_info.delete_time = -1;
+	obj_fireball->lifeleft = Vclip[vclip_type ].play_time;
+	obj_fireball->ctype.expl_info.spawn_time = -1;
+	obj_fireball->ctype.expl_info.delete_objnum = object_none;
+	obj_fireball->ctype.expl_info.delete_time = -1;
+	return obj_fireball;
+}
 
+namespace {
+
+static imobjptridx_t object_create_explosion_with_damage(const d_robot_info_array &Robot_info, const d_vclip_array &Vclip, fvmobjptridx &vmobjptridx, const imobjptridx_t obj_explosion_origin, const vmsegptridx_t segnum, const vms_vector &position, const fix size, const int vclip_type, const fix maxdamage, const fix maxdistance, const fix maxforce, const icobjptridx_t parent)
+{
+	/* `obj_explosion_origin` may not be a weapon in some cases, though
+	 * this function originally expected it would be.
+	 */
+	const auto &&obj_fireball = object_create_explosion_without_damage(Vclip, segnum, position, size, vclip_type);
+	if (obj_fireball == object_none)
+		return object_none;
+#if defined(DXX_BUILD_DESCENT_II)
+	auto &Objects = LevelUniqueObjectState.Objects;
+#endif
 	if (maxdamage > 0) {
 		fix force;
 		vms_vector pos_hit, vforce;
 		fix damage;
-		// -- now legal for badass explosions on a wall. Assert(objp != NULL);
+		// -- now legal for badass explosions on a wall. Assert(obj_explosion_origin != NULL);
 
-		range_for (const auto &&obj0p, vmobjptridx)
+		range_for (const auto &&obj_iter, vmobjptridx)
 		{
 			//	Weapons used to be affected by badass explosions, but this introduces serious problems.
 			//	When a smart bomb blows up, if one of its children goes right towards a nearby wall, it will
 			//	blow up, blowing up all the children.  So I remove it.  MK, 09/11/94
-			if (can_collide(objp, obj0p, parent))
+			if (can_collide(obj_explosion_origin, obj_iter, parent))
 			{
-				const auto dist = vm_vec_dist_quick( obj0p->pos, obj->pos );
+				const auto dist = vm_vec_dist_quick(obj_iter->pos, obj_fireball->pos);
 				// Make damage be from 'maxdamage' to 0.0, where 0.0 is 'maxdistance' away;
 				if ( dist < maxdistance ) {
-					if (object_to_object_visibility(obj, obj0p, FQ_TRANSWALL)) {
-
+					if (object_to_object_visibility(obj_fireball, obj_iter, FQ_TRANSWALL))
+					{
 						damage = maxdamage - fixmuldiv( dist, maxdamage, maxdistance );
 						force = maxforce - fixmuldiv( dist, maxforce, maxdistance );
 
 						// Find the force vector on the object
-						vm_vec_normalized_dir_quick( vforce, obj0p->pos, obj->pos );
+						vm_vec_normalized_dir_quick(vforce, obj_iter->pos, obj_fireball->pos);
 						vm_vec_scale(vforce, force );
 	
 						// Find where the point of impact is... ( pos_hit )
-						vm_vec_scale(vm_vec_sub(pos_hit, obj->pos, obj0p->pos), fixdiv(obj0p->size, obj0p->size + dist));
-	
-						switch ( obj0p->type )	{
+						vm_vec_scale(vm_vec_sub(pos_hit, obj_fireball->pos, obj_iter->pos), fixdiv(obj_iter->size, obj_iter->size + dist));
+						switch (obj_iter->type)
+						{
 #if defined(DXX_BUILD_DESCENT_II)
 							case OBJ_WEAPON:
-								phys_apply_force(obj0p,vforce);
+								phys_apply_force(obj_iter, vforce);
 
-								if (is_proximity_bomb_or_smart_mine(get_weapon_id(obj0p)))
+								if (is_proximity_bomb_or_player_smart_mine(get_weapon_id(obj_iter)))
 								{		//prox bombs have chance of blowing up
 									if (fixmul(dist,force) > i2f(8000)) {
-										obj0p->flags |= OF_SHOULD_BE_DEAD;
-										explode_badass_weapon(obj0p, obj0p->pos);
+										obj_iter->flags |= OF_SHOULD_BE_DEAD;
+										explode_badass_weapon(Robot_info, obj_iter, obj_iter->pos);
 									}
 								}
 								break;
 #endif
 							case OBJ_ROBOT:
 								{
-								phys_apply_force(obj0p,vforce);
+								phys_apply_force(obj_iter, vforce);
 #if defined(DXX_BUILD_DESCENT_II)
 								//	If not a boss, stun for 2 seconds at 32 force, 1 second at 16 force
-								if (objp != object_none && objp->type == OBJ_WEAPON && !Robot_info[get_robot_id(obj0p)].boss_flag && Weapon_info[get_weapon_id(objp)].flash)
+								fix flash;
+								if (obj_explosion_origin != object_none && obj_explosion_origin->type == OBJ_WEAPON && !Robot_info[get_robot_id(obj_iter)].boss_flag && (flash = Weapon_info[get_weapon_id(obj_explosion_origin)].flash))
 								{
-									ai_static	*aip = &obj0p->ctype.ai_info;
-									int			force_val = f2i(fixdiv(vm_vec_mag_quick(vforce) * Weapon_info[get_weapon_id(objp)].flash, FrameTime)/128) + 2;
+									ai_static *const aip = &obj_iter->ctype.ai_info;
 
-									if (obj->ctype.ai_info.SKIP_AI_COUNT * FrameTime < F1_0) {
+									if (obj_fireball->ctype.ai_info.SKIP_AI_COUNT * FrameTime < F1_0)
+									{
+										const int force_val = f2i(fixdiv(vm_vec_mag_quick(vforce) * flash, FrameTime) / 128) + 2;
 										aip->SKIP_AI_COUNT += force_val;
-										obj0p->mtype.phys_info.rotthrust.x = ((d_rand() - 16384) * force_val)/16;
-										obj0p->mtype.phys_info.rotthrust.y = ((d_rand() - 16384) * force_val)/16;
-										obj0p->mtype.phys_info.rotthrust.z = ((d_rand() - 16384) * force_val)/16;
-										obj0p->mtype.phys_info.flags |= PF_USES_THRUST;
+										obj_iter->mtype.phys_info.rotthrust.x = ((d_rand() - 16384) * force_val) / 16;
+										obj_iter->mtype.phys_info.rotthrust.y = ((d_rand() - 16384) * force_val) / 16;
+										obj_iter->mtype.phys_info.rotthrust.z = ((d_rand() - 16384) * force_val) / 16;
+										obj_iter->mtype.phys_info.flags |= PF_USES_THRUST;
 									} else
 										aip->SKIP_AI_COUNT--;
 								}
 #endif
 
+								const auto Difficulty_level = underlying_value(GameUniqueState.Difficulty_level);
 								//	When a robot gets whacked by a badass force, he looks towards it because robots tend to get blasted from behind.
 								{
 									vms_vector neg_vforce;
 									neg_vforce.x = vforce.x * -2 * (7 - Difficulty_level)/8;
 									neg_vforce.y = vforce.y * -2 * (7 - Difficulty_level)/8;
 									neg_vforce.z = vforce.z * -2 * (7 - Difficulty_level)/8;
-									phys_apply_rot(obj0p,neg_vforce);
+									phys_apply_rot(obj_iter, neg_vforce);
 								}
-								if ( obj0p->shields >= 0 ) {
+								if (obj_iter->shields >= 0)
+								{
 #if defined(DXX_BUILD_DESCENT_II)
-									const auto &robot_info = Robot_info[get_robot_id(obj0p)];
+									const auto &robot_info = Robot_info[get_robot_id(obj_iter)];
 									if (robot_info.boss_flag >= BOSS_D2 && Boss_invulnerable_matter[robot_info.boss_flag - BOSS_D2])
 											damage /= 4;
 #endif
-									if (apply_damage_to_robot(obj0p, damage, parent))
-										if ((objp != object_none) && (parent == get_local_player().objnum))
-											add_points_to_score(ConsoleObject->ctype.player_info, Robot_info[get_robot_id(obj0p)].score_value);
+									if (apply_damage_to_robot(Robot_info, obj_iter, damage, parent))
+										if (obj_explosion_origin != object_none && parent == get_local_player().objnum)
+											add_points_to_score(ConsoleObject->ctype.player_info, Robot_info[get_robot_id(obj_iter)].score_value, Game_mode);
 								}
 #if defined(DXX_BUILD_DESCENT_II)
-								if (objp != object_none && Robot_info[get_robot_id(obj0p)].companion && !Weapon_info[get_weapon_id(objp)].flash)
+								if (obj_explosion_origin != object_none && Robot_info[get_robot_id(obj_iter)].companion && !(obj_explosion_origin->type == OBJ_WEAPON && Weapon_info[get_weapon_id(obj_explosion_origin)].flash))
 								{
 									static const char ouch_str[] = "ouch! " "ouch! " "ouch! " "ouch! ";
 									int	count;
@@ -241,22 +495,20 @@ static imobjptridx_t object_create_explosion_sub(const d_vclip_array &Vclip, fvm
 								break;
 								}
 							case OBJ_CNTRLCEN:
-								if (parent != object_none && obj0p->shields >= 0)
-								{
-									apply_damage_to_controlcen(obj0p, damage, parent );
-								}
+								if (parent != object_none && obj_iter->shields >= 0)
+									apply_damage_to_controlcen(Robot_info, obj_iter, damage, parent);
 								break;
 							case OBJ_PLAYER:	{
 								icobjptridx_t killer = object_none;
 #if defined(DXX_BUILD_DESCENT_II)
 								//	Hack! Warning! Test code!
-								if (objp != object_none && Weapon_info[get_weapon_id(objp)].flash && get_player_id(obj0p) == Player_num)
+								fix flash;
+								if (obj_explosion_origin != object_none && obj_explosion_origin->type == OBJ_WEAPON && (flash = Weapon_info[get_weapon_id(obj_explosion_origin)].flash) && get_player_id(obj_iter) == Player_num)
 								{
-									int	fe;
+									int fe = min(F1_0 * 4, force * flash / 32);	//	For four seconds or less
 
-									fe = min(F1_0 * 4, force*Weapon_info[get_weapon_id(objp)].flash / 32);	//	For four seconds or less
-
-									if (objp->ctype.laser_info.parent_signature == ConsoleObject->signature) {
+									if (laser_parent_is_player(Objects.vcptr, obj_explosion_origin->ctype.laser_info, *ConsoleObject))
+									{
 										fe /= 2;
 										force /= 2;
 									}
@@ -266,8 +518,9 @@ static imobjptridx_t object_create_explosion_sub(const d_vclip_array &Vclip, fvm
 									}
 								}
 #endif
-								if ((objp != object_none) && (Game_mode & GM_MULTI) && (objp->type == OBJ_PLAYER)) {
-									killer = objp;
+								if (obj_explosion_origin != object_none && (Game_mode & GM_MULTI) && obj_explosion_origin->type == OBJ_PLAYER)
+								{
+									killer = obj_explosion_origin;
 								}
 								auto vforce2 = vforce;
 								if (parent != object_none ) {
@@ -279,15 +532,15 @@ static imobjptridx_t object_create_explosion_sub(const d_vclip_array &Vclip, fvm
 								}
 								vforce2.x /= 2;	vforce2.y /= 2;	vforce2.z /= 2;
 
-								phys_apply_force(obj0p,vforce);
-								phys_apply_rot(obj0p,vforce2);
-								if (obj0p->shields >= 0)
+								phys_apply_force(obj_iter, vforce);
+								phys_apply_rot(obj_iter, vforce2);
+								if (obj_iter->shields >= 0)
 								{
 #if defined(DXX_BUILD_DESCENT_II)
-								if (Difficulty_level == 0)
+									if (GameUniqueState.Difficulty_level == Difficulty_level_type::_0)
 									damage /= 4;
 #endif
-									apply_damage_to_player(obj0p, killer, damage, 1 );
+									apply_damage_to_player(obj_iter, killer, damage, apply_damage_player::check_for_friendly);
 								}
 							}
 								break;
@@ -302,30 +555,16 @@ static imobjptridx_t object_create_explosion_sub(const d_vclip_array &Vclip, fvm
 			}
 		}	// end for
 	}	// end if (maxdamage...
-
-	return obj;
+	return obj_fireball;
+}
 
 }
 
-void object_create_muzzle_flash(const vmsegptridx_t segnum, const vms_vector &position, fix size, int vclip_type )
+imobjptridx_t object_create_badass_explosion(const d_robot_info_array &Robot_info, const imobjptridx_t objp, const vmsegptridx_t segnum, const vms_vector &position, fix size, int vclip_type, fix maxdamage, fix maxdistance, fix maxforce, const icobjptridx_t parent )
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vmobjptridx = Objects.vmptridx;
-	object_create_explosion_sub(Vclip, vmobjptridx, object_none, segnum, position, size, vclip_type, 0, 0, 0, object_none );
-}
-
-imobjptridx_t object_create_explosion(const vmsegptridx_t segnum, const vms_vector &position, fix size, int vclip_type )
-{
-	auto &Objects = LevelUniqueObjectState.Objects;
-	auto &vmobjptridx = Objects.vmptridx;
-	return object_create_explosion_sub(Vclip, vmobjptridx, object_none, segnum, position, size, vclip_type, 0, 0, 0, object_none );
-}
-
-imobjptridx_t object_create_badass_explosion(const imobjptridx_t objp, const vmsegptridx_t segnum, const vms_vector &position, fix size, int vclip_type, fix maxdamage, fix maxdistance, fix maxforce, const icobjptridx_t parent )
-{
-	auto &Objects = LevelUniqueObjectState.Objects;
-	auto &vmobjptridx = Objects.vmptridx;
-	const imobjptridx_t rval = object_create_explosion_sub(Vclip, vmobjptridx, objp, segnum, position, size, vclip_type, maxdamage, maxdistance, maxforce, parent);
+	const imobjptridx_t rval = object_create_explosion_with_damage(Robot_info, Vclip, vmobjptridx, objp, segnum, position, size, vclip_type, maxdamage, maxdistance, maxforce, parent);
 
 	if ((objp != object_none) && (objp->type == OBJ_WEAPON))
 		create_weapon_smart_children(objp);
@@ -334,7 +573,7 @@ imobjptridx_t object_create_badass_explosion(const imobjptridx_t objp, const vms
 
 //blows up a badass weapon, creating the badass explosion
 //return the explosion object
-void explode_badass_weapon(const vmobjptridx_t obj,const vms_vector &pos)
+void explode_badass_weapon(const d_robot_info_array &Robot_info, const vmobjptridx_t obj,const vms_vector &pos)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &imobjptridx = Objects.imptridx;
@@ -348,7 +587,8 @@ void explode_badass_weapon(const vmobjptridx_t obj,const vms_vector &pos)
 #endif
 	digi_link_sound_to_object(SOUND_BADASS_EXPLOSION, obj, 0, F1_0, sound_stack::allow_stacking);
 
-	object_create_badass_explosion(obj, vmsegptridx(obj->segnum), pos,
+	const auto Difficulty_level = GameUniqueState.Difficulty_level;
+	object_create_badass_explosion(Robot_info, obj, vmsegptridx(obj->segnum), pos,
 	                                      wi->impact_size,
 	                                      wi->robot_hit_vclip,
 	                                      wi->strength[Difficulty_level],
@@ -357,39 +597,39 @@ void explode_badass_weapon(const vmobjptridx_t obj,const vms_vector &pos)
 
 }
 
-static void explode_badass_object(fvmsegptridx &vmsegptridx, const vmobjptridx_t objp, fix damage, fix distance, fix force)
+namespace {
+
+static void explode_badass_object(const d_robot_info_array &Robot_info, fvmsegptridx &vmsegptridx, const vmobjptridx_t objp, fix damage, fix distance, fix force)
 {
-	const auto &&rval = object_create_badass_explosion(objp, vmsegptridx(objp->segnum), objp->pos, objp->size,
-					get_explosion_vclip(objp, explosion_vclip_stage::s0),
+	const auto &&rval = object_create_badass_explosion(Robot_info, objp, vmsegptridx(objp->segnum), objp->pos, objp->size,
+					get_explosion_vclip(Robot_info, objp, explosion_vclip_stage::s0),
 					damage, distance, force,
 					objp);
 	if (rval != object_none)
 		digi_link_sound_to_object(SOUND_BADASS_EXPLOSION, rval, 0, F1_0, sound_stack::allow_stacking);
 }
 
-//blows up the player with a badass explosion
-//return the explosion object
-void explode_badass_player(const vmobjptridx_t objp)
-{
-	explode_badass_object(vmsegptridx, objp, F1_0*50, F1_0*40, F1_0*150);
 }
 
+//blows up the player with a badass explosion
+//return the explosion object
+void explode_badass_player(const d_robot_info_array &Robot_info, const vmobjptridx_t objp)
+{
+	explode_badass_object(Robot_info, vmsegptridx, objp, F1_0*50, F1_0*40, F1_0*150);
+}
 
 #define DEBRIS_LIFE (f1_0 * (PERSISTENT_DEBRIS?60:2))		//lifespan in seconds
 
+namespace {
+
 static void object_create_debris(fvmsegptridx &vmsegptridx, const object_base &parent, int subobj_num)
 {
-	auto &Objects = LevelUniqueObjectState.Objects;
 	Assert(parent.type == OBJ_ROBOT || parent.type == OBJ_PLAYER);
 
 	auto &Polygon_models = LevelSharedPolygonModelState.Polygon_models;
-	const auto &&obj = obj_create(OBJ_DEBRIS, 0, vmsegptridx(parent.segnum), parent.pos, &parent.orient, Polygon_models[parent.rtype.pobj_info.model_num].submodel_rads[subobj_num],
-				CT_DEBRIS,MT_PHYSICS,RT_POLYOBJ);
+	const auto &&obj = obj_create(LevelUniqueObjectState, LevelSharedSegmentState, LevelUniqueSegmentState, OBJ_DEBRIS, 0, vmsegptridx(parent.segnum), parent.pos, &parent.orient, Polygon_models[parent.rtype.pobj_info.model_num].submodel_rads[subobj_num],
+				object::control_type::debris, object::movement_type::physics, RT_POLYOBJ);
 
-	if ((obj == object_none ) && (Highest_object_index >= MAX_OBJECTS-1)) {
-//		Int3(); // this happens often and is normal :-)
-		return;
-	}
 	if ( obj == object_none )
 		return;				// Not enough debris slots!
 
@@ -427,6 +667,8 @@ static void object_create_debris(fvmsegptridx &vmsegptridx, const object_base &p
 	}
 }
 
+}
+
 void draw_fireball(const d_vclip_array &Vclip, grs_canvas &canvas, const vcobjptridx_t obj)
 {
 	const auto lifeleft = obj->lifeleft;
@@ -434,140 +676,25 @@ void draw_fireball(const d_vclip_array &Vclip, grs_canvas &canvas, const vcobjpt
 		draw_vclip_object(canvas, obj, lifeleft, Vclip[get_fireball_id(obj)]);
 }
 
-// --------------------------------------------------------------------------------------------------------------------
-//	Return true if there is a door here and it is openable
-//	It is assumed that the player has all keys.
-static int door_is_openable_by_player(fvcwallptr &vcwallptr, const shared_segment &segp, const unsigned sidenum)
+namespace {
+
+static unsigned disallowed_cc_dist(fvcsegptr &vcsegptr, fvcvertptr &vcvertptr, const vcsegptridx_t &segp, const vms_vector &player_pos, const vcsegptridx_t player_seg, const unsigned cur_drop_depth)
 {
-	const auto wall_num = segp.sides[sidenum].wall_num;
-
-	if (wall_num == wall_none)
-		return 0;						//	no wall here.
-
-	auto &w = *vcwallptr(wall_num);
-	const auto wall_type = w.type;
-	//	Can't open locked doors.
-	if ((wall_type == WALL_DOOR && (w.flags & WALL_DOOR_LOCKED)) || wall_type == WALL_CLOSED)
-		return 0;
-
-	return 1;
-}
-
-// --------------------------------------------------------------------------------------------------------------------
-//	Return a segment %i segments away from initial segment.
-//	Returns -1 if can't find a segment that distance away.
-imsegidx_t pick_connected_segment(const vcsegidx_t start_seg, int max_depth)
-{
-	using std::swap;
-	int		i;
-	int		cur_depth;
-	int		head, tail;
-	constexpr unsigned QUEUE_SIZE = 64;
-	array<segnum_t, QUEUE_SIZE * 2> seg_queue{};
-	array<uint8_t, MAX_SEGMENTS> depth{};
-	array<uint8_t, MAX_SIDES_PER_SEGMENT> side_rand;
-
-	visited_segment_bitarray_t visited;
-
-	head = 0;
-	tail = 0;
-	seg_queue[head++] = start_seg;
-
-	cur_depth = 0;
-
-	std::iota(side_rand.begin(), side_rand.end(), 0);
-
-	//	Now, randomize a bit to start, so we don't always get started in the same direction.
-	for (i=0; i<4; i++) {
-		int	ind1;
-
-		ind1 = (d_rand() * MAX_SIDES_PER_SEGMENT) >> 15;
-		swap(side_rand[ind1], side_rand[i]);
-	}
-
-	auto &Walls = LevelUniqueWallSubsystemState.Walls;
-	auto &vcwallptr = Walls.vcptr;
-	while (tail != head) {
-		int		sidenum, count;
-		int		ind1, ind2;
-
-		if (cur_depth >= max_depth) {
-			return seg_queue[tail];
-		}
-
-		const auto &&segp = vcsegptr(seg_queue[tail++]);
-		tail &= QUEUE_SIZE-1;
-
-		//	to make random, switch a pair of entries in side_rand.
-		ind1 = (d_rand() * MAX_SIDES_PER_SEGMENT) >> 15;
-		ind2 = (d_rand() * MAX_SIDES_PER_SEGMENT) >> 15;
-		swap(side_rand[ind1], side_rand[ind2]);
-		count = 0;
-		for (sidenum=ind1; count<MAX_SIDES_PER_SEGMENT; count++) {
-			int	snrand;
-
-			if (sidenum == MAX_SIDES_PER_SEGMENT)
-				sidenum = 0;
-
-			snrand = side_rand[sidenum];
-			auto wall_num = segp->shared_segment::sides[snrand].wall_num;
-			sidenum++;
-
-			if ((wall_num == wall_none || door_is_openable_by_player(vcwallptr, segp, snrand)) && IS_CHILD(segp->children[snrand]))
-			{
-				if (!visited[segp->children[snrand]]) {
-					seg_queue[head++] = segp->children[snrand];
-					visited[segp->children[snrand]] = true;
-					depth[segp->children[snrand]] = cur_depth+1;
-					head &= QUEUE_SIZE-1;
-					if (head > tail) {
-						if (head == tail + QUEUE_SIZE-1)
-							Int3();	//	queue overflow.  Make it bigger!
-					} else
-						if (head+QUEUE_SIZE == tail + QUEUE_SIZE-1)
-							Int3();	//	queue overflow.  Make it bigger!
-				}
-			}
-		}
-
-		if (seg_queue[tail] > Highest_segment_index)
-		{
-			// -- Int3();	//	Something bad has happened.  Queue is trashed.  --MK, 12/13/94
-			return segment_none;
-		}
-		cur_depth = depth[seg_queue[tail]];
-	}
-	return segment_none;
-}
-
-#if defined(DXX_BUILD_DESCENT_I)
-#define BASE_NET_DROP_DEPTH 10
-#elif defined(DXX_BUILD_DESCENT_II)
-#define BASE_NET_DROP_DEPTH 8
-#endif
-
-static imsegidx_t pick_connected_drop_segment(const segment_array &Segments, fvcvertptr &vcvertptr, const vcsegidx_t start_seg, const unsigned cur_drop_depth, const vms_vector &player_pos, const vcsegptridx_t &player_seg)
-{
-	const auto segnum = pick_connected_segment(start_seg, cur_drop_depth);
-	if (segnum == segment_none)
-		return segnum;
-	const auto &&segp = Segments.vcptridx(segnum);
-	if (segp->special == SEGMENT_IS_CONTROLCEN)
-		return segment_none;
+	const shared_segment &sseg = segp;
 	//don't drop in any children of control centers
-	range_for (const auto ch, segp->children)
+	for (const auto ch : sseg.children)
 	{
 		if (!IS_CHILD(ch))
 			continue;
-		auto &childsegp = *Segments.vcptr(ch);
-		if (childsegp.special == SEGMENT_IS_CONTROLCEN)
-			return segment_none;
+		const shared_segment &childsegp = *vcsegptr(ch);
+		if (childsegp.special == segment_special::controlcen)
+			return 1;
 	}
 	//bail if not far enough from original position
-	const auto &&tempv = compute_segment_center(vcvertptr, segp);
-	if (find_connected_distance(player_pos, player_seg, tempv, segp, -1, WID_FLY_FLAG) < static_cast<fix>(i2f(20) * cur_drop_depth))
-		return segment_none;
-	return segnum;
+	const auto &&tempv = compute_segment_center(vcvertptr, sseg);
+	if (find_connected_distance(player_pos, player_seg, tempv, segp, -1, WALL_IS_DOORWAY_FLAG::fly) < static_cast<fix>(i2f(20) * cur_drop_depth))
+		return 1;
+	return 0;
 }
 
 //	------------------------------------------------------------------------------------------------------
@@ -575,69 +702,144 @@ static imsegidx_t pick_connected_drop_segment(const segment_array &Segments, fvc
 //	For all active net players, try to create a N segment path from the player.  If possible, return that
 //	segment.  If not possible, try another player.  After a few tries, use a random segment.
 //	Don't drop if control center in segment.
-static vmsegptridx_t choose_drop_segment(fvcsegptridx &vcsegptridx, fvmsegptridx &vmsegptridx, const playernum_t drop_pnum)
+static vmsegptridx_t choose_drop_segment(fvmsegptridx &vmsegptridx, fvcvertptr &vcvertptr, fvcwallptr &vcwallptr, const playernum_t drop_pnum)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vcobjptr = Objects.vcptr;
 	auto &vmobjptr = Objects.vmptr;
-	playernum_t	pnum = 0;
-	int	cur_drop_depth;
-	int	count;
 	auto &drop_player = *vcplayerptr(drop_pnum);
 	auto &drop_playerobj = *vmobjptr(drop_player.objnum);
 
-	d_srand(static_cast<fix>(timer_query()));
-
-	cur_drop_depth = BASE_NET_DROP_DEPTH + ((d_rand() * BASE_NET_DROP_DEPTH*2) >> 15);
-
-	auto &player_pos = drop_playerobj.pos;
-	const auto &&player_seg = vcsegptridx(drop_playerobj.segnum);
-
-	segnum_t	segnum = segment_none;
-	auto &Vertices = LevelSharedVertexState.get_vertices();
-	auto &vcvertptr = Vertices.vcptr;
-	for (; (segnum == segment_none) && (cur_drop_depth > BASE_NET_DROP_DEPTH/2); --cur_drop_depth)
-	{
-		pnum = (d_rand() * N_players) >> 15;
-		count = 0;
-#if defined(DXX_BUILD_DESCENT_I)
-		while (count < N_players && (vcplayerptr(pnum)->connected == CONNECT_DISCONNECTED || pnum == drop_pnum))
-#elif defined(DXX_BUILD_DESCENT_II)
-		while (count < N_players && (vcplayerptr(pnum)->connected == CONNECT_DISCONNECTED || pnum == drop_pnum || ((Game_mode & (GM_TEAM|GM_CAPTURE)) && (get_team(pnum)==get_team(drop_pnum)))))
+	auto mrd = std::minstd_rand(timer_query());
+	per_player_array<playernum_t> candidate_drop_players;
+	const auto end_drop_players = [&candidate_drop_players, drop_pnum]() {
+		const auto b = candidate_drop_players.begin();
+		auto r = b;
+#if defined(DXX_BUILD_DESCENT_II)
+		/* Build a list of active players, excluding the initiator and
+		 * anyone from the same team as the initiator.
+		 */
+		const auto team_of_drop_player = get_team(drop_pnum);
+		for (auto &&[pnum, plr] : enumerate(Players))
+		{
+			/* Skip the initiator, so that items will try to jump from
+			 * player to player as the item is spent and respawned.
+			 */
+			if (pnum == drop_pnum)
+				continue;
+			if (plr.connected == player_connection_status::disconnected)
+				continue;
+			if ((Game_mode & GM_TEAM) && get_team(pnum) == team_of_drop_player)
+				continue;
+			*r++ = pnum;
+		}
+		if (b != r)
+			/* If at least one such player found, stop and use that
+			 * list.
+			 */
+			return r;
 #endif
+		/* Otherwise, try again, but allow teammates of the initiator.
+		 * Exclude the drop initiator.
+		 */
+		for (auto &&[pnum, plr] : enumerate(Players))
 		{
-			pnum = (pnum+1)%N_players;
-			count++;
+			if (pnum == drop_pnum)
+				continue;
+			if (plr.connected == player_connection_status::disconnected)
+				continue;
+			*r++ = pnum;
 		}
+		if (b != r)
+			/* If a teammate was found, use that.  This encourages the
+			 * game to move the items among players.
+			 */
+			return r;
+		/* If no player found through other rules, use the player
+		 * who triggered the drop event.
+		 */
+		*r++ = drop_pnum;
+		return r;
+	}();
+	/* candidate_drop_players now contains the player IDs of all players
+	 * that can be used for a drop.  Shuffle them for randomness to vary
+	 * who will be checked first for each new item.
+	 */
+	std::shuffle(candidate_drop_players.begin(), end_drop_players, mrd);
+	static constexpr std::integral_constant<connected_segment_raw_distances::segment_distance_count_type, 8> net_drop_max_depth_lower{};
+	static constexpr std::integral_constant<connected_segment_raw_distances::segment_distance_count_type, 24> net_drop_max_depth_upper{};
+	static constexpr std::integral_constant<connected_segment_raw_distances::segment_distance_count_type, 4> net_drop_min_depth{};
+	static_assert(connected_segment_raw_distances::depth_count_array::valid_index(net_drop_max_depth_lower));
+	static_assert(connected_segment_raw_distances::depth_count_array::valid_index(net_drop_max_depth_upper));
+	static_assert(connected_segment_raw_distances::depth_count_array::valid_index(net_drop_min_depth + 1u));
 
-		if (count == N_players) {
-			//if can't valid non-player person, use the player
-			pnum = drop_pnum;
-		}
+	const auto &&drop_player_seg = vmsegptridx(drop_playerobj.segnum);
 
-		segnum = pick_connected_drop_segment(Segments, vcvertptr, vcobjptr(vcplayerptr(pnum)->objnum)->segnum, cur_drop_depth, player_pos, player_seg);
-	}
-
-	if (segnum == segment_none) {
-		cur_drop_depth = BASE_NET_DROP_DEPTH;
-		while (cur_drop_depth > 0 && segnum == segment_none) // before dropping in random segment, try to find ANY segment which is connected to the player responsible for the drop so object will not spawn in inaccessible areas
+	/* Defer constructing instances until needed.  In most games, a
+	 * segment should be found before all MAX_PLAYERS instances are
+	 * constructed.
+	 */
+	per_player_array<std::unique_ptr<connected_segment_raw_distances>> distance_by_player;
+	std::optional<vmsegptridx_t> fallback_drop;
+	for (const unsigned candidate_depth : xrange(std::uniform_int_distribution(net_drop_max_depth_lower + 0u, net_drop_max_depth_upper + 0u)(mrd), net_drop_min_depth, xrange_descending()))
+	{
+		for (const auto pnum : ranges::subrange(candidate_drop_players.begin(), end_drop_players))
 		{
-			segnum = pick_connected_segment(vcobjptr(vcplayerptr(drop_pnum)->objnum)->segnum, --cur_drop_depth);
-			if (segnum != segment_none && vcsegptr(segnum)->special == SEGMENT_IS_CONTROLCEN)
-				segnum = segment_none;
+			auto &plr = *vcplayerptr(pnum);
+			auto &plrobj = *vcobjptr(plr.objnum);
+			auto &rdp = distance_by_player[pnum];
+			if (!rdp)
+				/* connected_segment_raw_distances computes data for all
+				 * distances below candidate_depth too.  Since the
+				 * xrange counts down, this initialization is
+				 * sufficient to cover all data required by all passes
+				 * of the loop.
+				 */
+				rdp = std::make_unique<connected_segment_raw_distances>(vcsegptr, vcwallptr, candidate_depth, plrobj.segnum);
+			auto &rd = *rdp;
+			const auto sn = rd.scan_segment_depths(candidate_depth, mrd);
+			if (!sn)
+				continue;
+			const auto segnum = *sn;
+			const auto &&segp = vmsegptridx(segnum);
+			if (disallowed_cc_dist(vcsegptr, vcvertptr, segp, drop_playerobj.pos, drop_player_seg, candidate_depth))
+			{
+				if (!fallback_drop.has_value())
+					fallback_drop = segp;
+				continue;
+			}
+			return segp;
 		}
-		if (segnum == segment_none) // basically it should be impossible segnum == -1 now... but oh well...
-			return vmsegptridx(static_cast<segnum_t>((d_rand() * Highest_segment_index) >> 15));
 	}
-	return vmsegptridx(segnum);
+	if (fallback_drop.has_value())
+		/* If no player found a segment acceptable to the first pass
+		 * rules, but a player found a reachable segment, use that
+		 * segment.  This differs slightly from retail, which would
+		 * compute the fallback from the initiator, rather than a random
+		 * successful player.  However, since saving the fallback is
+		 * cheap, this is done instead of performing yet another search.
+		 */
+		return *fallback_drop;
+	/* This can be reached if there are no segments found at any of the
+	 * acceptable depths.  If the origin segment is in a small room with
+	 * no passable exits, this can happen.
+	 *
+	 * Give up and pick a completely random segment.  This is compatible
+	 * with retail.
+	 */
+	std::uniform_int_distribution<typename std::underlying_type<segnum_t>::type> uid(0u, Highest_segment_index);
+	return vmsegptridx(vmsegidx_t(segnum_t{uid(mrd)}));
+}
+
 }
 
 //	------------------------------------------------------------------------------------------------------
 //	(Re)spawns powerup if in a network game.
 void maybe_drop_net_powerup(powerup_type_t powerup_type, bool adjust_cap, bool random_player)
 {
-	auto &Objects = LevelUniqueObjectState.Objects;
-	auto &vmobjptr = Objects.vmptr;
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &LevelUniqueControlCenterState = LevelUniqueObjectState.ControlCenterState;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
         playernum_t pnum = Player_num;
 	if ((Game_mode & GM_MULTI) && !(Game_mode & GM_MULTI_COOP)) {
 		if ((Game_mode & GM_NETWORK) && adjust_cap)
@@ -647,7 +849,7 @@ void maybe_drop_net_powerup(powerup_type_t powerup_type, bool adjust_cap, bool r
 				return;
 		}
 
-		if (Control_center_destroyed || (Network_status == NETSTAT_ENDLEVEL))
+		if (LevelUniqueControlCenterState.Control_center_destroyed || Network_status == network_state::endlevel)
 			return;
 
                 if (random_player)
@@ -661,7 +863,7 @@ void maybe_drop_net_powerup(powerup_type_t powerup_type, bool adjust_cap, bool r
                                         break;
                                 }
                                 failsafe_count++;
-                        } while (vcplayerptr(pnum)->connected != CONNECT_PLAYING);
+                        } while (vcplayerptr(pnum)->connected != player_connection_status::playing);
                 }
 
 //--old-- 		segnum = (d_rand() * Highest_segment_index) >> 15;
@@ -672,31 +874,27 @@ void maybe_drop_net_powerup(powerup_type_t powerup_type, bool adjust_cap, bool r
 //--old-- 			segnum /= 2;
 
 		Net_create_loc = 0;
-		const auto &&objnum = call_object_create_egg(vmobjptr(vcplayerptr(pnum)->objnum), 1, powerup_type);
 
+		auto &vcvertptr = Vertices.vcptr;
+		const auto &&segnum = choose_drop_segment(LevelUniqueSegmentState.get_segments().vmptridx, vcvertptr, LevelUniqueWallSubsystemState.Walls.vcptr, pnum);
+		const auto &&new_pos = pick_random_point_in_seg(vcvertptr, segnum, std::minstd_rand(d_rand()));
+		const auto &&objnum = drop_powerup(LevelUniqueObjectState, LevelSharedSegmentState, LevelUniqueSegmentState, Vclip, powerup_type, {}, new_pos, segnum, true);
 		if (objnum == object_none)
 			return;
-
-		const auto &&segnum = choose_drop_segment(LevelSharedSegmentState.get_segments().vcptridx, LevelUniqueSegmentState.get_segments().vmptridx, pnum);
-		auto &Vertices = LevelSharedVertexState.get_vertices();
-		auto &vcvertptr = Vertices.vcptr;
-		const auto &&new_pos = pick_random_point_in_seg(vcvertptr, segnum);
 		multi_send_create_powerup(powerup_type, segnum, objnum, new_pos);
-		objnum->pos = new_pos;
-		vm_vec_zero(objnum->mtype.phys_info.velocity);
-		obj_relink(vmobjptr, vmsegptr, objnum, segnum);
-
-		object_create_explosion(segnum, new_pos, i2f(5), VCLIP_POWERUP_DISAPPEARANCE );
+		object_create_explosion_without_damage(Vclip, segnum, new_pos, i2f(5), VCLIP_POWERUP_DISAPPEARANCE);
 	}
 }
+
+namespace {
 
 //	------------------------------------------------------------------------------------------------------
 //	Return true if current segment contains some object.
 static const object *segment_contains_powerup(fvcobjptridx &vcobjptridx, fvcsegptr &vcsegptr, const unique_segment &segnum, const powerup_type_t obj_id)
 {
-	range_for (const auto objp, objects_in(segnum, vcobjptridx, vcsegptr))
+	range_for (const object &objp, objects_in(segnum, vcobjptridx, vcsegptr))
 	{
-		auto &o = *objp;
+		auto &o = objp;
 		if (o.type == OBJ_POWERUP && get_powerup_id(o) == obj_id)
 			return &o;
 	}
@@ -706,12 +904,12 @@ static const object *segment_contains_powerup(fvcobjptridx &vcobjptridx, fvcsegp
 //	------------------------------------------------------------------------------------------------------
 static const object *powerup_nearby_aux(fvcobjptridx &vcobjptridx, fvcsegptr &vcsegptr, const vcsegidx_t segnum, const powerup_type_t object_id, uint_fast32_t depth)
 {
-	auto &&segp = vcsegptr(segnum);
+	const cscusegment &&segp = vcsegptr(segnum);
 	if (auto r = segment_contains_powerup(vcobjptridx, vcsegptr, segp, object_id))
 		return r;
 	if (! -- depth)
 		return nullptr;
-	range_for (const auto seg2, segp->children)
+	for (const auto seg2 : segp.s.children)
 	{
 		if (seg2 != segment_none)
 			if (auto r = powerup_nearby_aux(vcobjptridx, vcsegptr, seg2, object_id, depth))
@@ -727,13 +925,20 @@ static const object *weapon_nearby(fvcobjptridx &vcobjptridx, fvcsegptr &vcsegpt
 	return powerup_nearby_aux(vcobjptridx, vcsegptr, objp.segnum, weapon_id, 2);
 }
 
+}
+
 //	------------------------------------------------------------------------------------------------------
 void maybe_replace_powerup_with_energy(object_base &del_obj)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vcobjptridx = Objects.vcptridx;
 	auto &vmobjptr = Objects.vmptr;
-	int	weapon_index=-1;
+	/* This function has no special handling to remap laser weapons, so
+	 * borrow LASER_INDEX as a flag value to indicate that the powerup
+	 * ID was not recognized.
+	 */
+	constexpr primary_weapon_index_t unset_weapon_index = primary_weapon_index_t::LASER_INDEX;
+	primary_weapon_index_t weapon_index = unset_weapon_index;
 
 	if (del_obj.contains_type != OBJ_POWERUP)
 		return;
@@ -778,7 +983,8 @@ void maybe_replace_powerup_with_energy(object_base &del_obj)
 	if ((weapon_index_uses_vulcan_ammo(weapon_index) || del_obj.contains_id == POW_VULCAN_AMMO) &&
 		player_info.vulcan_ammo >= VULCAN_AMMO_MAX)
 		del_obj.contains_count = 0;
-	else if (weapon_index != -1) {
+	else if (weapon_index != unset_weapon_index)
+	{
 		if (player_has_primary_weapon(player_info, weapon_index).has_weapon() || weapon_nearby(vcobjptridx, vcsegptr, del_obj, static_cast<powerup_type_t>(del_obj.contains_id)) != nullptr)
 		{
 			if (d_rand() > 16384) {
@@ -835,17 +1041,9 @@ void maybe_replace_powerup_with_energy(object_base &del_obj)
 	}
 }
 
-#if defined(DXX_BUILD_DESCENT_I)
-static
-#endif
-imobjptridx_t drop_powerup(const d_vclip_array &Vclip, int id, const unsigned num, const vms_vector &init_vel, const vms_vector &pos, const vmsegptridx_t segnum, const bool player)
+imobjptridx_t drop_powerup(d_level_unique_object_state &LevelUniqueObjectState, const d_level_shared_segment_state &LevelSharedSegmentState, d_level_unique_segment_state &LevelUniqueSegmentState, const d_vclip_array &Vclip, int id, const vms_vector &init_vel, const vms_vector &pos, vmsegptridx_t segnum, bool player)
 {
-	imobjptridx_t	objnum = object_none;
-	unsigned count;
-
-			for (count=0; count<num; count++) {
 				int	rand_scale;
-				auto new_velocity = init_vel;
 				const auto old_mag = vm_vec_mag_quick(init_vel);
 
 				//	We want powerups to move more in network mode.
@@ -857,106 +1055,121 @@ imobjptridx_t drop_powerup(const d_vclip_array &Vclip, int id, const unsigned nu
 				} else
 					rand_scale = 2;
 
-				new_velocity.x += fixmul(old_mag+F1_0*32, d_rand()*rand_scale - 16384*rand_scale);
-				new_velocity.y += fixmul(old_mag+F1_0*32, d_rand()*rand_scale - 16384*rand_scale);
-				new_velocity.z += fixmul(old_mag+F1_0*32, d_rand()*rand_scale - 16384*rand_scale);
-
-				// Give keys zero velocity so they can be tracked better in multi
-
-				if ((Game_mode & GM_MULTI) && (id >= POW_KEY_BLUE) && (id <= POW_KEY_GOLD))
-					vm_vec_zero(new_velocity);
-
-				auto new_pos = pos;
-//				new_pos.x += (d_rand()-16384)*8;
-//				new_pos.y += (d_rand()-16384)*8;
-//				new_pos.z += (d_rand()-16384)*8;
-
 				if (Game_mode & GM_MULTI)
 				{	
 					if (Net_create_loc >= MAX_NET_CREATE_OBJECTS)
 					{
+						con_printf(CON_URGENT, DXX_STRINGIZE_FL("%s", __LINE__, "unable to record network object; Net_create_loc=%u"), __FILE__, Net_create_loc);
 						return object_none;
 					}
 #if defined(DXX_BUILD_DESCENT_II)
-					if ((Game_mode & GM_NETWORK) && Network_status == NETSTAT_ENDLEVEL)
+					if ((Game_mode & GM_NETWORK) && Network_status == network_state::endlevel)
 					 return object_none;
 #endif
 				}
-				auto		obj = obj_create( OBJ_POWERUP, id, segnum, new_pos, &vmd_identity_matrix, Powerup_info[id].size, CT_POWERUP, MT_PHYSICS, RT_POWERUP);
-				objnum = obj;
+				const auto &&objp = obj_create(LevelUniqueObjectState, LevelSharedSegmentState, LevelUniqueSegmentState, OBJ_POWERUP, id, segnum, pos, &vmd_identity_matrix, Powerup_info[id].size, object::control_type::powerup, object::movement_type::physics, RT_POWERUP);
 
-				if (objnum == object_none)
-				{
-					Int3();
-					return object_none;
-				}
+				if (objp == object_none)
+					return objp;
+				auto &obj = *objp;
 #if defined(DXX_BUILD_DESCENT_II)
 				if (player)
-					obj->flags |= OF_PLAYER_DROPPED;
+					obj.flags |= OF_PLAYER_DROPPED;
 #endif
 
 				if (Game_mode & GM_MULTI)
 				{
-					Net_create_objnums[Net_create_loc++] = objnum;
+					Net_create_objnums[Net_create_loc++] = objp;
 				}
-				obj->mtype.phys_info.velocity = new_velocity;
 
-				obj->mtype.phys_info.drag = 512;	//1024;
-				obj->mtype.phys_info.mass = F1_0;
+				// Give keys zero velocity so they can be tracked better in multi
+				auto &object_velocity = obj.mtype.phys_info.velocity;
+				if ((Game_mode & GM_MULTI) && (id >= POW_KEY_BLUE) && (id <= POW_KEY_GOLD))
+					object_velocity = {};
+				else
+				{
+					object_velocity = init_vel;
+					const auto random_velocity_adjustment = [old_mag, rand_scale]() {
+						return fixmul(old_mag + F1_0 * 32, d_rand() * rand_scale - 16384 * rand_scale);
+					};
+					object_velocity.x += random_velocity_adjustment();
+					object_velocity.y += random_velocity_adjustment();
+					object_velocity.z += random_velocity_adjustment();
+				}
 
-				obj->mtype.phys_info.flags = PF_BOUNCE;
+				obj.mtype.phys_info.drag = 512;	//1024;
+				obj.mtype.phys_info.mass = F1_0;
 
-				obj->rtype.vclip_info.vclip_num = Powerup_info[get_powerup_id(obj)].vclip_num;
-				obj->rtype.vclip_info.frametime = Vclip[obj->rtype.vclip_info.vclip_num].frame_time;
-				obj->rtype.vclip_info.framenum = 0;
+				obj.mtype.phys_info.flags = PF_BOUNCE;
 
-				switch (get_powerup_id(obj)) {
+				obj.rtype.vclip_info.vclip_num = Powerup_info[id].vclip_num;
+				obj.rtype.vclip_info.frametime = Vclip[obj.rtype.vclip_info.vclip_num].frame_time;
+				obj.rtype.vclip_info.framenum = 0;
+
+				switch (id)
+				{
 					case POW_MISSILE_1:
 					case POW_MISSILE_4:
 					case POW_SHIELD_BOOST:
 					case POW_ENERGY:
-						obj->lifeleft = (d_rand() + F1_0*3) * 64;		//	Lives for 3 to 3.5 binary minutes (a binary minute is 64 seconds)
+						obj.lifeleft = (d_rand() + F1_0*3) * 64;		//	Lives for 3 to 3.5 binary minutes (a binary minute is 64 seconds)
 						if (Game_mode & GM_MULTI)
-							obj->lifeleft /= 2;
+							obj.lifeleft /= 2;
 						break;
 #if defined(DXX_BUILD_DESCENT_II)
 					case POW_OMEGA_WEAPON:
 						if (!player)
-							obj->ctype.powerup_info.count = MAX_OMEGA_CHARGE;
+							obj.ctype.powerup_info.count = MAX_OMEGA_CHARGE;
 						break;
 					case POW_GAUSS_WEAPON:
 #endif
 					case POW_VULCAN_WEAPON:
 						if (!player)
-							obj->ctype.powerup_info.count = VULCAN_WEAPON_AMMO_AMOUNT;
+							obj.ctype.powerup_info.count = VULCAN_WEAPON_AMMO_AMOUNT;
 						break;
 					default:
-//						if (Game_mode & GM_MULTI)
-//							obj->lifeleft = (d_rand() + F1_0*3) * 64;		//	Lives for 5 to 5.5 binary minutes (a binary minute is 64 seconds)
 						break;
 				}
-			}
-	return objnum;
+	return objp;
 }
 
-static imobjptridx_t drop_robot_egg(const int type, const int id, const unsigned num, const vms_vector &init_vel, const vms_vector &pos, const vmsegptridx_t segnum)
+bool drop_powerup(d_level_unique_object_state &LevelUniqueObjectState, const d_level_shared_segment_state &LevelSharedSegmentState, d_level_unique_segment_state &LevelUniqueSegmentState, const d_vclip_array &Vclip, int id, const unsigned num, const vms_vector &init_vel, const vms_vector &pos, const vmsegptridx_t segnum, const bool player)
 {
+	bool created = false;
+	for (const auto i : xrange(num))
+	{
+		(void)i;
+		const auto &&obj = drop_powerup(LevelUniqueObjectState, LevelSharedSegmentState, LevelUniqueSegmentState, Vclip, id, init_vel, pos, segnum, player);
+		if (obj == object_none)
+			/* If one drop failed, assume every additional drop will also fail.
+			 */
+			break;
+		created = true;
+	}
+	return created;
+}
+
+namespace {
+
+static bool drop_robot_egg(const d_robot_info_array &Robot_info, const int type, const int id, const unsigned num, const vms_vector &init_vel, const vms_vector &pos, const vmsegptridx_t segnum)
+{
+	if (!num)
+		return false;
 	switch (type)
 	{
 		case OBJ_POWERUP:
-			return drop_powerup(Vclip, id, num, init_vel, pos, segnum, false);
+			return drop_powerup(LevelUniqueObjectState, LevelSharedSegmentState, LevelUniqueSegmentState, Vclip, id, num, init_vel, pos, segnum, false);
 		case OBJ_ROBOT:
 			break;
 		default:
 			con_printf(CON_URGENT, DXX_STRINGIZE_FL(__FILE__, __LINE__, "ignoring invalid object type; expected OBJ_POWERUP or OBJ_ROBOT, got type=%i, id=%i"), type, id);
-			return object_none;
+			return false;
 	}
-	imobjptridx_t	objnum = object_none;
-	unsigned count;
 	auto &Polygon_models = LevelSharedPolygonModelState.Polygon_models;
-	auto &Robot_info = LevelSharedRobotInfoState.Robot_info;
-
-			for (count=0; count<num; count++) {
+	bool created = false;
+	for (const auto count : xrange(num))
+	{
+		(void)count;
 				int	rand_scale;
 				auto new_velocity = vm_vec_normalized_quick(init_vel);
 				const auto old_mag = vm_vec_mag_quick(init_vel);
@@ -980,54 +1193,59 @@ static imobjptridx_t drop_robot_egg(const int type, const int id, const unsigned
 //				new_pos.z += (d_rand()-16384)*6;
 
 #if defined(DXX_BUILD_DESCENT_I)
-				const auto robot_id = ObjId[type];
+				/* ObjId appears to serve as both a polygon_model_index and as
+				 * a robot index.
+				 */
+				const auto robot_id = static_cast<unsigned>(ObjId[type]);
 #elif defined(DXX_BUILD_DESCENT_II)
 				const auto robot_id = id;
 #endif
-				const auto &&obj = robot_create(id, segnum, new_pos, &vmd_identity_matrix, Polygon_models[Robot_info[robot_id].model_num].rad, ai_behavior::AIB_NORMAL);
-
-				objnum = obj;
-				if (objnum == object_none)
-				{
-					Int3();
-					return object_none;
-				}
-
+				const auto &&objp = robot_create(Robot_info, id, segnum, new_pos, &vmd_identity_matrix, Polygon_models[Robot_info[robot_id].model_num].rad, ai_behavior::AIB_NORMAL);
+				if (objp == object_none)
+					break;
+				auto &obj = *objp;
+				created = true;
+				++LevelUniqueObjectState.accumulated_robots;
+				++GameUniqueState.accumulated_robots;
 				if (Game_mode & GM_MULTI)
 				{
-					Net_create_objnums[Net_create_loc++] = objnum;
+					Net_create_objnums[Net_create_loc++] = objp;
 				}
 				//Set polygon-object-specific data
 
-				obj->rtype.pobj_info.model_num = Robot_info[get_robot_id(obj)].model_num;
-				obj->rtype.pobj_info.subobj_flags = 0;
+				obj.rtype.pobj_info.model_num = Robot_info[get_robot_id(obj)].model_num;
+				obj.rtype.pobj_info.subobj_flags = 0;
 
 				//set Physics info
 		
-				obj->mtype.phys_info.velocity = new_velocity;
+				obj.mtype.phys_info.velocity = new_velocity;
 
-				obj->mtype.phys_info.mass = Robot_info[get_robot_id(obj)].mass;
-				obj->mtype.phys_info.drag = Robot_info[get_robot_id(obj)].drag;
+				obj.mtype.phys_info.mass = Robot_info[get_robot_id(obj)].mass;
+				obj.mtype.phys_info.drag = Robot_info[get_robot_id(obj)].drag;
 
-				obj->mtype.phys_info.flags |= (PF_LEVELLING);
+				obj.mtype.phys_info.flags |= (PF_LEVELLING);
 
-				obj->shields = Robot_info[get_robot_id(obj)].strength;
+				obj.shields = Robot_info[get_robot_id(obj)].strength;
 
-				ai_local		*ailp = &obj->ctype.ai_info.ail;
+				ai_local		*ailp = &obj.ctype.ai_info.ail;
 				ailp->player_awareness_type = player_awareness_type_t::PA_WEAPON_ROBOT_COLLISION;
 				ailp->player_awareness_time = F1_0*3;
-				obj->ctype.ai_info.CURRENT_STATE = AIS_LOCK;
-				obj->ctype.ai_info.GOAL_STATE = AIS_LOCK;
-				obj->ctype.ai_info.REMOTE_OWNER = -1;
+				obj.ctype.ai_info.CURRENT_STATE = AIS_LOCK;
+				obj.ctype.ai_info.GOAL_STATE = AIS_LOCK;
+				obj.ctype.ai_info.REMOTE_OWNER = -1;
 			}
 
 #if defined(DXX_BUILD_DESCENT_II)
 			// At JasenW's request, robots which contain robots
 			// sometimes drop shields.
 			if (d_rand() > 16384)
-				drop_powerup(Vclip, POW_SHIELD_BOOST, 1, init_vel, pos, segnum, false);
+			{
+				const auto &&objp = drop_powerup(LevelUniqueObjectState, LevelSharedSegmentState, LevelUniqueSegmentState, Vclip, POW_SHIELD_BOOST, init_vel, pos, segnum, false);
+				if (objp != object_none)
+					created = true;
+			}
 #endif
-	return objnum;
+	return created;
 }
 
 #if defined(DXX_BUILD_DESCENT_II)
@@ -1052,7 +1270,9 @@ static bool skip_create_egg_powerup(const object &player, powerup_type_t powerup
 }
 #endif
 
-imobjptridx_t object_create_robot_egg(const int type, const int id, const int num, const vms_vector &init_vel, const vms_vector &pos, const vmsegptridx_t segnum)
+}
+
+bool object_create_robot_egg(const d_robot_info_array &Robot_info, const int type, const int id, const unsigned num, const vms_vector &init_vel, const vms_vector &pos, const vmsegptridx_t segnum)
 {
 #if defined(DXX_BUILD_DESCENT_II)
 	auto &Objects = LevelUniqueObjectState.Objects;
@@ -1062,39 +1282,41 @@ imobjptridx_t object_create_robot_egg(const int type, const int id, const int nu
 		if (type == OBJ_POWERUP)
 		{
 			if (skip_create_egg_powerup(get_local_plrobj(), static_cast<powerup_type_t>(id)))
-				return object_none;
+				return false;
 		}
 	}
 #endif
-	return drop_robot_egg(type, id, num, init_vel, pos, segnum);
+	return drop_robot_egg(Robot_info, type, id, num, init_vel, pos, segnum);
 }
 
-imobjptridx_t object_create_robot_egg(const vmobjptr_t objp)
+bool object_create_robot_egg(const d_robot_info_array &Robot_info, object_base &objp)
 {
-	return object_create_robot_egg(objp->contains_type, objp->contains_id, objp->contains_count, objp->mtype.phys_info.velocity, objp->pos, vmsegptridx(objp->segnum));
+	return object_create_robot_egg(Robot_info, objp.contains_type, objp.contains_id, objp.contains_count, objp.mtype.phys_info.velocity, objp.pos, vmsegptridx(objp.segnum));
 }
 
 //	-------------------------------------------------------------------------------------------------------
 //	Put count objects of type type (eg, powerup), id = id (eg, energy) into *objp, then drop them!  Yippee!
 //	Returns created object number.
-imobjptridx_t call_object_create_egg(const object_base &objp, const unsigned count, const int id)
+imobjptridx_t call_object_create_egg(const object_base &objp, const int id)
+{
+	return drop_powerup(LevelUniqueObjectState, LevelSharedSegmentState, LevelUniqueSegmentState, Vclip, id, objp.mtype.phys_info.velocity, objp.pos, vmsegptridx(objp.segnum), true);
+}
+
+void call_object_create_egg(const object_base &objp, const unsigned count, const int id)
 {
 	if (count > 0) {
-		return drop_powerup(Vclip, id, count, objp.mtype.phys_info.velocity, objp.pos, vmsegptridx(objp.segnum), true);
+		drop_powerup(LevelUniqueObjectState, LevelSharedSegmentState, LevelUniqueSegmentState, Vclip, id, count, objp.mtype.phys_info.velocity, objp.pos, vmsegptridx(objp.segnum), true);
 	}
-
-	return object_none;
 }
 
 //what vclip does this explode with?
-int get_explosion_vclip(const object_base &obj, explosion_vclip_stage stage)
+int get_explosion_vclip(const d_robot_info_array &Robot_info, const object_base &obj, explosion_vclip_stage stage)
 {
 	if (obj.type == OBJ_ROBOT)
 	{
 		const auto vclip_ptr = stage == explosion_vclip_stage::s0
 			? &robot_info::exp1_vclip_num
 			: &robot_info::exp2_vclip_num;
-		auto &Robot_info = LevelSharedRobotInfoState.Robot_info;
 		const auto vclip_num = Robot_info[get_robot_id(obj)].*vclip_ptr;
 		if (vclip_num > -1)
 			return vclip_num;
@@ -1105,6 +1327,8 @@ int get_explosion_vclip(const object_base &obj, explosion_vclip_stage stage)
 	return VCLIP_SMALL_EXPLOSION;		//default
 }
 
+namespace {
+
 //blow up a polygon model
 static void explode_model(object_base &obj)
 {
@@ -1112,7 +1336,7 @@ static void explode_model(object_base &obj)
 
 	const auto poly_model_num = obj.rtype.pobj_info.model_num;
 	const auto dying_model_num = Dying_modelnums[poly_model_num];
-	const auto model_num = (dying_model_num != -1)
+	const auto model_num = (dying_model_num != polygon_model_index::None)
 		? (obj.rtype.pobj_info.model_num = dying_model_num)
 		: poly_model_num;
 	auto &Polygon_models = LevelSharedPolygonModelState.Polygon_models;
@@ -1133,7 +1357,7 @@ static void explode_model(object_base &obj)
 static void maybe_delete_object(object_base &del_obj)
 {
 	const auto dead_modelnum = Dead_modelnums[del_obj.rtype.pobj_info.model_num];
-	if (dead_modelnum != -1)
+	if (dead_modelnum != polygon_model_index::None)
 	{
 		del_obj.rtype.pobj_info.model_num = dead_modelnum;
 		del_obj.flags |= OF_DESTROYED;
@@ -1146,16 +1370,18 @@ static void maybe_delete_object(object_base &del_obj)
 	}
 }
 
+}
+
 //	-------------------------------------------------------------------------------------------------------
 //blow up an object.  Takes the object to destroy, and the point of impact
-void explode_object(const vmobjptridx_t hitobj,fix delay_time)
+void explode_object(d_level_unique_object_state &LevelUniqueObjectState, const d_robot_info_array &Robot_info, const d_level_shared_segment_state &LevelSharedSegmentState, d_level_unique_segment_state &LevelUniqueSegmentState, const vmobjptridx_t hitobj, const fix delay_time)
 {
 	if (hitobj->flags & OF_EXPLODING) return;
 
 	if (delay_time) {		//wait a little while before creating explosion
 		//create a placeholder object to do the delay, with id==-1
-		auto obj = obj_create(OBJ_FIREBALL, -1, vmsegptridx(hitobj->segnum), hitobj->pos, &vmd_identity_matrix, 0,
-						CT_EXPLOSION,MT_NONE,RT_NONE);
+		const auto &&obj = obj_create(LevelUniqueObjectState, LevelSharedSegmentState, LevelUniqueSegmentState, OBJ_FIREBALL, -1, vmsegptridx(hitobj->segnum), hitobj->pos, &vmd_identity_matrix, 0,
+						object::control_type::explosion, object::movement_type::None, RT_NONE);
 		if (obj == object_none ) {
 			maybe_delete_object(hitobj);		//no explosion, die instantly
 			Int3();
@@ -1172,10 +1398,9 @@ void explode_object(const vmobjptridx_t hitobj,fix delay_time)
 	else {
 		int vclip_num;
 
-		vclip_num = get_explosion_vclip(hitobj, explosion_vclip_stage::s0);
+		vclip_num = get_explosion_vclip(Robot_info, hitobj, explosion_vclip_stage::s0);
 
-		auto expl_obj = object_create_explosion(vmsegptridx(hitobj->segnum), hitobj->pos, fixmul(hitobj->size,EXPLOSION_SCALE), vclip_num);
-	
+		const imobjptr_t expl_obj = object_create_explosion_without_damage(Vclip, vmsegptridx(hitobj->segnum), hitobj->pos, fixmul(hitobj->size, EXPLOSION_SCALE), vclip_num);
 		if (! expl_obj) {
 			maybe_delete_object(hitobj);		//no explosion, die instantly
 			return;
@@ -1184,8 +1409,8 @@ void explode_object(const vmobjptridx_t hitobj,fix delay_time)
 		//don't make debris explosions have physics, because they often
 		//happen when the debris has hit the wall, so the fireball is trying
 		//to move into the wall, which shows off FVI problems.   	
-		if (hitobj->type!=OBJ_DEBRIS && hitobj->movement_type==MT_PHYSICS) {
-			expl_obj->movement_type = MT_PHYSICS;
+		if (hitobj->type!=OBJ_DEBRIS && hitobj->movement_source==object::movement_type::physics) {
+			expl_obj->movement_source = object::movement_type::physics;
 			expl_obj->mtype.phys_info = hitobj->mtype.phys_info;
 		}
 	
@@ -1196,61 +1421,58 @@ void explode_object(const vmobjptridx_t hitobj,fix delay_time)
 	}
 
 	hitobj->flags |= OF_EXPLODING;		//say that this is blowing up
-	hitobj->control_type = CT_NONE;		//become inert while exploding
+	hitobj->control_source = object::control_type::None;		//become inert while exploding
 
 }
 
-
 //do whatever needs to be done for this piece of debris for this frame
-void do_debris_frame(const vmobjptridx_t obj)
+void do_debris_frame(const d_robot_info_array &Robot_info, const vmobjptridx_t obj)
 {
-	Assert(obj->control_type == CT_DEBRIS);
+	assert(obj->control_source == object::control_type::debris);
 
 	if (obj->lifeleft < 0)
-		explode_object(obj,0);
-
+		explode_object(LevelUniqueObjectState, Robot_info, LevelSharedSegmentState, LevelUniqueSegmentState, obj, 0);
 }
 
 //do whatever needs to be done for this explosion for this frame
-void do_explosion_sequence(const vmobjptr_t obj)
+void do_explosion_sequence(const d_robot_info_array &Robot_info, object &obj)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vmobjptr = Objects.vmptr;
 	auto &vmobjptridx = Objects.vmptridx;
-	Assert(obj->control_type == CT_EXPLOSION);
-	auto &Robot_info = LevelSharedRobotInfoState.Robot_info;
+	assert(obj.control_source == object::control_type::explosion);
 
 	//See if we should die of old age
-	if (obj->lifeleft <= 0 ) 	{	// We died of old age
-		obj->flags |= OF_SHOULD_BE_DEAD;
-		obj->lifeleft = 0;
+	if (obj.lifeleft <= 0 ) 	{	// We died of old age
+		obj.flags |= OF_SHOULD_BE_DEAD;
+		obj.lifeleft = 0;
 	}
 
 	//See if we should create a secondary explosion
-	if (obj->lifeleft <= obj->ctype.expl_info.spawn_time) {
-		auto del_obj = vmobjptridx(obj->ctype.expl_info.delete_objnum);
+	if (obj.lifeleft <= obj.ctype.expl_info.spawn_time) {
+		auto del_obj = vmobjptridx(obj.ctype.expl_info.delete_objnum);
 		auto &spawn_pos = del_obj->pos;
 		Assert(del_obj->type==OBJ_ROBOT || del_obj->type==OBJ_CLUTTER || del_obj->type==OBJ_CNTRLCEN || del_obj->type == OBJ_PLAYER);
 		Assert(del_obj->segnum != segment_none);
 
 		const auto &&expl_obj = [&]{
-			const auto vclip_num = get_explosion_vclip(del_obj, explosion_vclip_stage::s1);
+			const auto vclip_num = get_explosion_vclip(Robot_info, del_obj, explosion_vclip_stage::s1);
 #if defined(DXX_BUILD_DESCENT_II)
 			if (del_obj->type == OBJ_ROBOT)
 			{
 				const auto &ri = Robot_info[get_robot_id(del_obj)];
 				if (ri.badass)
-					return object_create_badass_explosion(object_none, vmsegptridx(del_obj->segnum), spawn_pos, fixmul(del_obj->size, EXPLOSION_SCALE), vclip_num, F1_0 * ri.badass, i2f(4) * ri.badass, i2f(35) * ri.badass, object_none);
+					return object_create_badass_explosion(Robot_info, object_none, vmsegptridx(del_obj->segnum), spawn_pos, fixmul(del_obj->size, EXPLOSION_SCALE), vclip_num, F1_0 * ri.badass, i2f(4) * ri.badass, i2f(35) * ri.badass, object_none);
 			}
 #endif
-			return object_create_explosion(vmsegptridx(del_obj->segnum), spawn_pos, fixmul(del_obj->size, EXPLOSION_SCALE), vclip_num);
+			return object_create_explosion_without_damage(Vclip, vmsegptridx(del_obj->segnum), spawn_pos, fixmul(del_obj->size, EXPLOSION_SCALE), vclip_num);
 		}();
 
 		if ((del_obj->contains_count > 0) && !(Game_mode & GM_MULTI)) { // Multiplayer handled outside of this code!!
 			//	If dropping a weapon that the player has, drop energy instead, unless it's vulcan, in which case drop vulcan ammo.
 			if (del_obj->contains_type == OBJ_POWERUP)
 				maybe_replace_powerup_with_energy(del_obj);
-			object_create_robot_egg(del_obj);
+			object_create_robot_egg(Robot_info, del_obj);
 		} else if ((del_obj->type == OBJ_ROBOT) && !(Game_mode & GM_MULTI)) { // Multiplayer handled outside this code!!
 			auto &robptr = Robot_info[get_robot_id(del_obj)];
 			if (robptr.contains_count) {
@@ -1259,12 +1481,12 @@ void do_explosion_sequence(const vmobjptr_t obj)
 					del_obj->contains_type = robptr.contains_type;
 					del_obj->contains_id = robptr.contains_id;
 					maybe_replace_powerup_with_energy(del_obj);
-					object_create_robot_egg(del_obj);
+					object_create_robot_egg(Robot_info, del_obj);
 				}
 			}
 #if defined(DXX_BUILD_DESCENT_II)
 			if (robot_is_thief(robptr))
-				drop_stolen_items(del_obj);
+				drop_stolen_items_local(LevelUniqueObjectState, LevelSharedSegmentState, LevelUniqueSegmentState, Vclip, vmsegptridx(del_obj->segnum), del_obj->mtype.phys_info.velocity, del_obj->pos, LevelUniqueObjectState.ThiefState.Stolen_items);
 			else if (robot_is_companion(robptr))
 			{
 				DropBuddyMarker(del_obj);
@@ -1274,10 +1496,10 @@ void do_explosion_sequence(const vmobjptr_t obj)
 
 		auto &robptr = Robot_info[get_robot_id(del_obj)];
 		if (robptr.exp2_sound_num > -1)
-			digi_link_sound_to_pos(robptr.exp2_sound_num, vmsegptridx(del_obj->segnum), 0, spawn_pos, 0, F1_0);
+			digi_link_sound_to_pos(robptr.exp2_sound_num, vmsegptridx(del_obj->segnum), sidenum_t::WLEFT, spawn_pos, 0, F1_0);
 			//PLAY_SOUND_3D( Robot_info[del_obj->id].exp2_sound_num, spawn_pos, del_obj->segnum  );
 
-		obj->ctype.expl_info.spawn_time = -1;
+		obj.ctype.expl_info.spawn_time = -1;
 
 		//make debris
 		if (del_obj->render_type==RT_POLYOBJ)
@@ -1287,8 +1509,8 @@ void do_explosion_sequence(const vmobjptr_t obj)
 		//If num_objects < MAX_USED_OBJECTS, expl_obj could be set to dead before this setting causing the delete_obj not to be removed. If so, directly delete del_obj
 		if (expl_obj && !(expl_obj->flags & OF_SHOULD_BE_DEAD))
 		{
-			if (del_obj->movement_type == MT_PHYSICS) {
-				expl_obj->movement_type = MT_PHYSICS;
+			if (del_obj->movement_source == object::movement_type::physics) {
+				expl_obj->movement_source = object::movement_type::physics;
 				expl_obj->mtype.phys_info = del_obj->mtype.phys_info;
 			}
 
@@ -1302,9 +1524,9 @@ void do_explosion_sequence(const vmobjptr_t obj)
 	}
 
 	//See if we should delete an object
-	if (obj->lifeleft <= obj->ctype.expl_info.delete_time) {
-		const auto &&del_obj = vmobjptr(obj->ctype.expl_info.delete_objnum);
-		obj->ctype.expl_info.delete_time = -1;
+	if (obj.lifeleft <= obj.ctype.expl_info.delete_time) {
+		const auto &&del_obj = vmobjptr(obj.ctype.expl_info.delete_objnum);
+		obj.ctype.expl_info.delete_time = -1;
 		maybe_delete_object(del_obj);
 	}
 }
@@ -1318,13 +1540,13 @@ void do_explosion_sequence(const vmobjptr_t obj)
 #endif
 
 //explode the given wall
-void explode_wall(fvcvertptr &vcvertptr, const vcsegptridx_t segnum, const unsigned sidenum, wall &w)
+void explode_wall(fvcvertptr &vcvertptr, const vcsegptridx_t segnum, const sidenum_t sidenum, wall &w)
 {
-	if (w.flags & WALL_EXPLODING)
+	if (w.flags & wall_flag::exploding)
 		/* Already exploding */
 		return;
 	w.explode_time_elapsed = 0;
-	w.flags |= WALL_EXPLODING;
+	w.flags |= wall_flag::exploding;
 	++ Num_exploding_walls;
 
 	//play one long sound for whole door wall explosion
@@ -1332,8 +1554,12 @@ void explode_wall(fvcvertptr &vcvertptr, const vcsegptridx_t segnum, const unsig
 	digi_link_sound_to_pos( SOUND_EXPLODING_WALL,segnum, sidenum, pos, 0, F1_0 );
 }
 
-void do_exploding_wall_frame(wall &w1)
+unsigned do_exploding_wall_frame(const d_robot_info_array &Robot_info, wall &w1)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
+	auto &WallAnims = GameSharedState.WallAnims;
+	assert(w1.flags & wall_flag::exploding);
 	fix w1_explode_time_elapsed = w1.explode_time_elapsed;
 	const fix oldfrac = fixdiv(w1_explode_time_elapsed, EXPL_WALL_TIME);
 
@@ -1344,37 +1570,44 @@ void do_exploding_wall_frame(wall &w1)
 
 	const auto w1sidenum = w1.sidenum;
 	const auto &&seg = vmsegptridx(w1.segnum);
+	unsigned walls_updated = 0;
 	if (w1_explode_time_elapsed > (EXPL_WALL_TIME * 3) / 4)
 	{
 		const auto &&csegp = seg.absolute_sibling(seg->shared_segment::children[w1sidenum]);
 		const auto cside = find_connect_side(seg, csegp);
 
 		const auto a = w1.clip_num;
-		const auto n = WallAnims[a].num_frames;
-		wall_set_tmap_num(WallAnims[a], seg, w1sidenum, csegp, cside, n - 1);
+		auto &wa = WallAnims[a];
+		const auto n = wa.num_frames;
+		wall_set_tmap_num(wa, seg, w1sidenum, csegp, cside, n - 1);
 
 		auto &Walls = LevelUniqueWallSubsystemState.Walls;
 		auto &vmwallptr = Walls.vmptr;
-		auto &w2 = *vmwallptr(csegp->shared_segment::sides[cside].wall_num);
-		assert(&w1 != &w2);
-		assert((w1.flags & WALL_EXPLODING) || (w2.flags & WALL_EXPLODING));
-		w1.flags |= WALL_BLASTED;
-		w2.flags |= WALL_BLASTED;
-		if (w1_explode_time_elapsed >= EXPL_WALL_TIME)
+
+		auto cwall_num = csegp->shared_segment::sides[cside].wall_num;
+		if (cwall_num != wall_none)
 		{
-			unsigned num_exploding_walls = Num_exploding_walls;
-			if (w1.flags & WALL_EXPLODING)
+			auto &w2 = *vmwallptr(cwall_num);
+			assert(&w1 != &w2);
+			w2.flags |= wall_flag::blasted;
+			assert((w1.flags & wall_flag::exploding) || (w2.flags & wall_flag::exploding));
+			if (w1_explode_time_elapsed >= EXPL_WALL_TIME && w2.flags & wall_flag::exploding)
 			{
-				w1.flags &= ~WALL_EXPLODING;
-				-- num_exploding_walls;
+				w2.flags &= ~wall_flag::exploding;
+				++ walls_updated;
 			}
-			if (w2.flags & WALL_EXPLODING)
-			{
-				w2.flags &= ~WALL_EXPLODING;
-				-- num_exploding_walls;
-			}
-			Num_exploding_walls = num_exploding_walls;
 		}
+		else
+			assert(w1.flags & wall_flag::exploding);
+
+		w1.flags |= wall_flag::blasted;
+		if (w1_explode_time_elapsed >= EXPL_WALL_TIME && w1.flags & wall_flag::exploding)
+		{
+			w1.flags &= ~wall_flag::exploding;
+			++ walls_updated;
+		}
+
+		Num_exploding_walls -= walls_updated;
 	}
 
 	const fix newfrac = fixdiv(w1_explode_time_elapsed, EXPL_WALL_TIME);
@@ -1385,11 +1618,10 @@ void do_exploding_wall_frame(wall &w1)
 		/* for loop would exit with zero iterations if this `if` is
 		 * true.  Skip the setup for the loop in that case.
 		 */
-		return;
+		return walls_updated;
 
 	const auto vertnum_list = get_side_verts(seg, w1sidenum);
 
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
 	auto &v0 = *vcvertptr(vertnum_list[0]);
 	auto &v1 = *vcvertptr(vertnum_list[1]);
@@ -1414,9 +1646,9 @@ void do_exploding_wall_frame(wall &w1)
 		vm_vec_scale_add2(pos, w1normal0, size * (EXPL_WALL_TOTAL_FIREBALLS - e) / EXPL_WALL_TOTAL_FIREBALLS);
 
 		if (e & 3)		//3 of 4 are normal
-			object_create_explosion(seg, pos, size, VCLIP_SMALL_EXPLOSION);
+			object_create_explosion_without_damage(Vclip, seg, pos, size, VCLIP_SMALL_EXPLOSION);
 		else
-			object_create_badass_explosion(object_none, seg, pos,
+			object_create_badass_explosion(Robot_info, object_none, seg, pos,
 										   size,
 										   VCLIP_SMALL_EXPLOSION,
 										   i2f(4),		// damage strength
@@ -1425,30 +1657,31 @@ void do_exploding_wall_frame(wall &w1)
 										   object_none		//	parent id
 			);
 	}
+	return walls_updated;
 }
 
 #if defined(DXX_BUILD_DESCENT_II)
 //creates afterburner blobs behind the specified object
-void drop_afterburner_blobs(const vmobjptr_t obj, int count, fix size_scale, fix lifetime)
+void drop_afterburner_blobs(object &obj, int count, fix size_scale, fix lifetime)
 {
-	auto pos_left = vm_vec_scale_add(obj->pos, obj->orient.fvec, -obj->size);
-	vm_vec_scale_add2(pos_left, obj->orient.rvec, -obj->size/4);
-	const auto pos_right = vm_vec_scale_add(pos_left, obj->orient.rvec, obj->size/2);
+	auto pos_left = vm_vec_scale_add(obj.pos, obj.orient.fvec, -obj.size);
+	vm_vec_scale_add2(pos_left, obj.orient.rvec, -obj.size/4);
+	const auto pos_right = vm_vec_scale_add(pos_left, obj.orient.rvec, obj.size/2);
 
 	if (count == 1)
 		vm_vec_avg(pos_left, pos_left, pos_right);
 
-	const auto &&objseg = Segments.vmptridx(obj->segnum);
+	const auto &&objseg = Segments.vmptridx(obj.segnum);
 	{
 		const auto &&segnum = find_point_seg(LevelSharedSegmentState, LevelUniqueSegmentState, pos_left, objseg);
 	if (segnum != segment_none)
-		object_create_explosion(segnum, pos_left, size_scale, VCLIP_AFTERBURNER_BLOB );
+		object_create_explosion_without_damage(Vclip, segnum, pos_left, size_scale, VCLIP_AFTERBURNER_BLOB);
 	}
 
 	if (count > 1) {
 		const auto &&segnum = find_point_seg(LevelSharedSegmentState, LevelUniqueSegmentState, pos_right, objseg);
 		if (segnum != segment_none) {
-			auto blob_obj = object_create_explosion(segnum, pos_right, size_scale, VCLIP_AFTERBURNER_BLOB );
+			const auto &&blob_obj = object_create_explosion_without_damage(Vclip, segnum, pos_right, size_scale, VCLIP_AFTERBURNER_BLOB);
 			if (lifetime != -1 && blob_obj != object_none)
 				blob_obj->lifeleft = lifetime;
 		}
@@ -1477,7 +1710,10 @@ void expl_wall_read_n_swap(fvmwallptr &vmwallptr, PHYSFS_File *const fp, const i
 			d.sidenum = SWAPINT(d.sidenum);
 			d.time = SWAPINT(d.time);
 		}
-		const icsegidx_t dseg = d.segnum;
+		const auto s = segnum_t{static_cast<uint16_t>(d.segnum)};
+		if (!vmsegidx_t::check_nothrow_index(s))
+			continue;
+		const icsegidx_t dseg = s;
 		if (dseg == segment_none)
 			continue;
 		range_for (auto &&wp, vmwallptr)
@@ -1485,9 +1721,9 @@ void expl_wall_read_n_swap(fvmwallptr &vmwallptr, PHYSFS_File *const fp, const i
 			auto &w = *wp;
 			if (w.segnum != dseg)
 				continue;
-			if (w.sidenum != d.sidenum)
+			if (underlying_value(w.sidenum) != d.sidenum)
 				continue;
-			w.flags |= WALL_EXPLODING;
+			w.flags |= wall_flag::exploding;
 			w.explode_time_elapsed = d.time;
 			++ num_exploding_walls;
 			break;
@@ -1503,14 +1739,47 @@ void expl_wall_write(fvcwallptr &vcwallptr, PHYSFS_File *const fp)
 	range_for (auto &&wp, vcwallptr)
 	{
 		auto &e = *wp;
-		if (!(e.flags & WALL_EXPLODING))
+		if (!(e.flags & wall_flag::exploding))
 			continue;
 		disk_expl_wall d;
 		d.segnum = e.segnum;
-		d.sidenum = e.sidenum;
+		d.sidenum = underlying_value(e.sidenum);
 		d.time = e.explode_time_elapsed;
 		PHYSFS_write(fp, &d, sizeof(d), 1);
 	}
+}
+
+//	------------------------------------------------------------------------------------------------------
+//	Choose segment to recreate thief in.
+vmsegidx_t choose_thief_recreation_segment(fvcsegptr &vcsegptr, fvcwallptr &vcwallptr, const vcsegidx_t plrseg)
+{
+	static constexpr std::integral_constant<connected_segment_raw_distances::segment_distance_count_type, 20> thief_max_depth{};
+	static constexpr std::integral_constant<connected_segment_raw_distances::segment_distance_count_type, thief_max_depth / 2> thief_min_depth{};
+	static_assert(thief_min_depth >= connected_segment_raw_distances::minimum_supported_max_depth);
+	const connected_segment_raw_distances rd(vcsegptr, vcwallptr, thief_max_depth, plrseg);
+	auto mrd = std::minstd_rand(d_rand());
+	/* connected_segment_raw_distances explicitly avoids reporting any
+	 * segment with a ->special of segment_special::controlcen, even if that
+	 * segment is in range.  Therefore, any returned segment of the
+	 * appropriate distance is usable.
+	 */
+	static_assert(rd.count_segments_at_depth.valid_index(thief_max_depth));
+	static_assert(rd.count_segments_at_depth.valid_index(thief_min_depth + 1u));
+	for (const unsigned candidate_depth : xrange(thief_max_depth, thief_min_depth, xrange_descending()))
+	{
+		if (const auto sn = rd.scan_segment_depths(candidate_depth, mrd))
+			return *sn;
+	}
+	/* This can be reached if there are no segments found at any of the
+	 * acceptable depths.  If the origin segment is in a small room with
+	 * no passable exits, this can happen.
+	 *
+	 * Give up and pick a completely random segment.  This is compatible
+	 * with retail Descent 2.
+	 */
+	using distribution_type = typename std::underlying_type<segnum_t>::type;
+	std::uniform_int_distribution uid(distribution_type{0}, static_cast<distribution_type>(Highest_segment_index));
+	return segnum_t{uid(mrd)};
 }
 #endif
 }

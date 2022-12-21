@@ -45,70 +45,71 @@ namespace dcx {
 
 int ui_button_any_drawn = 0;
 
-void ui_get_button_size(const grs_font &cv_font, const char *text, int &width, int &height)
+gr_string_size ui_get_button_size(const grs_font &cv_font, const char *text)
 {
-	gr_get_string_size(cv_font, text, &width, &height, nullptr);
-	width += BUTTON_EXTRA_WIDTH * 2 + 6;
-	height += BUTTON_EXTRA_HEIGHT * 2 + 6;
+	const auto r = gr_get_string_size(cv_font, text);
+	return {r.width + BUTTON_EXTRA_WIDTH * 2 + 6, r.height + BUTTON_EXTRA_HEIGHT * 2 + 6};
 }
 
+namespace {
 
-void ui_draw_button(UI_DIALOG *dlg, UI_GADGET_BUTTON * button)
+void ui_draw_button(UI_DIALOG &dlg, UI_GADGET_BUTTON &button)
 {
 #if 0  //ndef OGL
-	if ((button->status==1) || (button->position != button->oldposition))
+	if ((button.status==1) || (button.position != button.oldposition))
 #endif
 	{
 		ui_button_any_drawn = 1;
-		gr_set_current_canvas( button->canvas );
+		gr_set_current_canvas(button.canvas);
 		auto &canvas = *grd_curcanv;
-		color_t color = 0;
+		color_palette_index color{0};
 
-		gr_set_fontcolor(canvas, dlg->keyboard_focus_gadget == button
+		gr_set_fontcolor(canvas, dlg.keyboard_focus_gadget == &button
 			? CRED
-			: (!button->user_function && button->dim_if_no_function
+			: (!button.user_function && button.dim_if_no_function
 				? CGREY
 				: CBLACK
 			), -1);
 
-		button->status = 0;
-		if (!button->text.empty())
+		if (!button.text.empty())
 		{
 			unsigned offset;
-			if (button->position == 0)
+			if (button.position == 0)
 			{
-				ui_draw_box_out(canvas, 0, 0, button->width-1, button->height-1);
+				ui_draw_box_out(canvas, 0, 0, button.width-1, button.height-1);
 				offset = 0;
 			}
 			else
 			{
-				ui_draw_box_in(canvas, 0, 0, button->width-1, button->height-1);
+				ui_draw_box_in(canvas, 0, 0, button.width-1, button.height-1);
 				offset = 1;
 			}
-			ui_string_centered(canvas, Middle(button->width) + offset, Middle(button->height) + offset, button->text.c_str());
+			ui_string_centered(canvas, Middle(button.width) + offset, Middle(button.height) + offset, button.text.c_str());
 		} else {
 			unsigned left, top, right, bottom;
-			if (button->position == 0)
+			if (button.position == 0)
 			{
 				left = top = 1;
-				right = button->width - 1;
-				bottom = button->height - 1;
+				right = button.width - 1;
+				bottom = button.height - 1;
 			}
 			else
 			{
 				left = top = 2;
-				right = button->width;
-				bottom = button->height;
+				right = button.width;
+				bottom = button.height;
 			}
-			gr_rect(canvas, 0, 0, button->width, button->height, CBLACK);
+			gr_rect(canvas, 0, 0, button.width, button.height, CBLACK);
 			gr_rect(canvas, left, top, right, bottom, color);
 		}
 	}
 }
 
-std::unique_ptr<UI_GADGET_BUTTON> ui_add_gadget_button(UI_DIALOG * dlg, short x, short y, short w, short h, const char * text, int (*function_to_call)())
+}
+
+std::unique_ptr<UI_GADGET_BUTTON> ui_add_gadget_button(UI_DIALOG &dlg, short x, short y, short w, short h, const char *const text, int (*const function_to_call)())
 {
-	std::unique_ptr<UI_GADGET_BUTTON> button{ui_gadget_add<UI_GADGET_BUTTON>( dlg, x, y, x+w-1, y+h-1)};
+	auto button = ui_gadget_add<UI_GADGET_BUTTON>(dlg, x, y, x + w - 1, y + h - 1);
 
 	if ( text )
 	{
@@ -128,79 +129,70 @@ std::unique_ptr<UI_GADGET_BUTTON> ui_add_gadget_button(UI_DIALOG * dlg, short x,
 	return button;
 }
 
-
-window_event_result ui_button_do(UI_DIALOG *dlg, UI_GADGET_BUTTON * button,const d_event &event)
+window_event_result UI_GADGET_BUTTON::event_handler(UI_DIALOG &dlg, const d_event &event)
 {
 	window_event_result rval = window_event_result::ignored;
 	
-	button->oldposition = button->position;
-	button->pressed = 0;
+	oldposition = position;
+	pressed = 0;
 
 	if (event.type == EVENT_MOUSE_BUTTON_DOWN || event.type == EVENT_MOUSE_BUTTON_UP)
 	{
-		int OnMe;
-
-		OnMe = ui_mouse_on_gadget( button );
+		const auto OnMe = ui_mouse_on_gadget(*this);
 
 		if (B1_JUST_PRESSED && OnMe)
 		{
-			button->position = 1;
+			position = 1;
 			rval = window_event_result::handled;
 		}
 		else if (B1_JUST_RELEASED)
 		{
-			if ((button->position == 1) && OnMe)
-				button->pressed = 1;
+			if ((position == 1) && OnMe)
+				pressed = 1;
 
-			button->position = 0;
+			position = 0;
 		}
 	}
 
 	
 	if (event.type == EVENT_KEY_COMMAND)
 	{
-		int keypress;
-		
-		keypress = event_key_get(event);
-
-		if	((keypress == button->hotkey) ||
-			((keypress == button->hotkey1) && button->user_function1) || 
-			((dlg->keyboard_focus_gadget==button) && ((keypress==KEY_SPACEBAR) || (keypress==KEY_ENTER)) ))
+		const auto keypress = event_key_get(event);
+		if (keypress == hotkey ||
+			(keypress == hotkey1 && user_function1) || 
+			(dlg.keyboard_focus_gadget == this && (keypress == KEY_SPACEBAR || keypress == KEY_ENTER)))
 		{
-			button->position = 2;
+			position = 2;
 			rval = window_event_result::handled;
 		}
 	}
 	else if (event.type == EVENT_KEY_RELEASE)
 	{
-		int keypress;
-		
-		keypress = event_key_get(event);
-		
-		button->position = 0;
+		const auto keypress = event_key_get(event);
+		position = 0;
 
-		if	((keypress == button->hotkey) ||
-			((dlg->keyboard_focus_gadget==button) && ((keypress==KEY_SPACEBAR) || (keypress==KEY_ENTER)) ))
-			button->pressed = 1;
+		if (keypress == hotkey ||
+			(dlg.keyboard_focus_gadget == this && (keypress == KEY_SPACEBAR || keypress == KEY_ENTER)))
+			pressed = 1;
 
-		if ((keypress == button->hotkey1) && button->user_function1)
+		if (keypress == hotkey1 && user_function1)
 		{
-			button->user_function1();
+			user_function1();
 			rval = window_event_result::handled;
 		}
 	}
 
 	if (event.type == EVENT_WINDOW_DRAW)
-		ui_draw_button( dlg, button );
+		ui_draw_button(dlg, *this);
 
-	if (button->pressed && button->user_function )
+	if (pressed && user_function )
 	{
-		button->user_function();
+		user_function();
 		return window_event_result::handled;
 	}
-	else if (button->pressed)
+	else if (pressed)
 	{
-		rval = ui_gadget_send_event(dlg, EVENT_UI_GADGET_PRESSED, button);
+		rval = ui_gadget_send_event(dlg, EVENT_UI_GADGET_PRESSED, *this);
 		if (rval == window_event_result::ignored)
 			rval = window_event_result::handled;
 	}

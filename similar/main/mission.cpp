@@ -36,12 +36,9 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "inferno.h"
 #include "window.h"
 #include "mission.h"
-#include "gameseq.h"
 #include "gamesave.h"
-#include "titles.h"
 #include "piggy.h"
 #include "console.h"
-#include "songs.h"
 #include "polyobj.h"
 #include "dxxerror.h"
 #include "config.h"
@@ -51,16 +48,17 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "ignorecase.h"
 #include "physfsx.h"
 #include "physfs_list.h"
-#include "bm.h"
 #include "event.h"
 #if defined(DXX_BUILD_DESCENT_II)
 #include "movie.h"
 #endif
 #include "null_sentinel_iterator.h"
 
-#include "compiler-make_unique.h"
+#include "compiler-poison.h"
 #include "compiler-range_for.h"
 #include "d_enumerate.h"
+#include "d_zip.h"
+#include <memory>
 
 #define BIMD1_BRIEFING_FILE		"briefing.txb"
 
@@ -71,10 +69,19 @@ using std::min;
 #define MISSION_EXTENSION_DESCENT_II	".mn2"
 #endif
 
+#define CON_PRIORITY_DEBUG_MISSION_LOAD	CON_DEBUG
+
+namespace {
+
+using mission_candidate_search_path = std::array<char, PATH_MAX>;
+
+}
+
+namespace dsx {
+
 namespace {
 
 struct mle;
-using mission_candidate_search_path = array<char, PATH_MAX>;
 using mission_list_type = std::vector<mle>;
 
 //mission list entry
@@ -127,9 +134,35 @@ struct mission_subdir_stats
 	}
 };
 
-const char *prepare_mission_list_count_dirbuf(array<char, 12> &dirbuf, const std::size_t immediate_directories)
+struct mission_name_and_version
 {
-	if (immediate_directories)
+#if defined(DXX_BUILD_DESCENT_II)
+	const Mission::descent_version_type descent_version = {};
+#endif
+	char *const name = nullptr;
+	mission_name_and_version() = default;
+	mission_name_and_version(Mission::descent_version_type, char *);
+};
+
+mission_name_and_version::mission_name_and_version(Mission::descent_version_type const v, char *const n) :
+#if defined(DXX_BUILD_DESCENT_II)
+	descent_version(v),
+#endif
+	name(n)
+{
+#if defined(DXX_BUILD_DESCENT_I)
+	(void)v;
+#endif
+}
+
+const char *prepare_mission_list_count_dirbuf(std::array<char, 12> &dirbuf, const std::size_t immediate_directories)
+{
+	/* Limit the count of directories to what can be formatted
+	 * successfully without truncation.  If a user has more than this
+	 * many directories, an empty string will be used instead of showing
+	 * the actual count.
+	 */
+	if (immediate_directories && immediate_directories <= 99999)
 	{
 		snprintf(dirbuf.data(), dirbuf.size(), "DIR:%zu; ", immediate_directories);
 		return dirbuf.data();
@@ -142,155 +175,176 @@ mle::mle(const char *const name, std::vector<mle> &&d) :
 {
 	mission_subdir_stats ss;
 	ss.count(directory);
-	array<char, 12> dirbuf;
+	std::array<char, 12> dirbuf;
 	snprintf(mission_name.data(), mission_name.size(), "%s/ [%sMSN:L%zu;T%zu]", name, prepare_mission_list_count_dirbuf(dirbuf, ss.immediate_directories), ss.immediate_missions, ss.total_missions);
+}
+
+static const mle *compare_mission_predicate_to_leaf(const mission_entry_predicate mission_predicate, const mle &candidate, const char *candidate_filesystem_name)
+{
+#if defined(DXX_BUILD_DESCENT_II)
+	if (mission_predicate.check_version && mission_predicate.descent_version != candidate.descent_version)
+	{
+		con_printf(CON_PRIORITY_DEBUG_MISSION_LOAD, DXX_STRINGIZE_FL(__FILE__, __LINE__, "mission version check requires %u, but found %u; skipping string comparison for mission \"%s\""), static_cast<unsigned>(mission_predicate.descent_version), static_cast<unsigned>(candidate.descent_version), candidate.path.data());
+		return nullptr;
+	}
+#endif
+	if (!d_stricmp(mission_predicate.filesystem_name, candidate_filesystem_name))
+	{
+		con_printf(CON_PRIORITY_DEBUG_MISSION_LOAD, DXX_STRINGIZE_FL(__FILE__, __LINE__, "found mission \"%s\"[\"%s\"] at %p"), candidate.path.data(), &*candidate.filename, &candidate);
+		return &candidate;
+	}
+	con_printf(CON_PRIORITY_DEBUG_MISSION_LOAD, DXX_STRINGIZE_FL(__FILE__, __LINE__, "want mission \"%s\", no match for mission \"%s\"[\"%s\"] at %p"), mission_predicate.filesystem_name, candidate.path.data(), &*candidate.filename, &candidate);
+	return nullptr;
+}
+
+static const mle *compare_mission_by_guess(const mission_entry_predicate mission_predicate, const mle &candidate)
+{
+	if (candidate.directory.empty())
+		return compare_mission_predicate_to_leaf(mission_predicate, candidate, &*candidate.filename);
+	{
+		const unsigned long size = candidate.directory.size();
+		con_printf(CON_PRIORITY_DEBUG_MISSION_LOAD, DXX_STRINGIZE_FL(__FILE__, __LINE__, "want mission \"%s\", check %lu missions under \"%s\""), mission_predicate.filesystem_name, size, candidate.path.data());
+	}
+	range_for (auto &i, candidate.directory)
+	{
+		if (const auto r = compare_mission_by_guess(mission_predicate, i))
+			return r;
+	}
+	con_printf(CON_PRIORITY_DEBUG_MISSION_LOAD, DXX_STRINGIZE_FL(__FILE__, __LINE__, "no matches under \"%s\""), candidate.path.data());
+	return nullptr;
+}
+
+static const mle *compare_mission_by_pathname(const mission_entry_predicate mission_predicate, const mle &candidate)
+{
+	if (candidate.directory.empty())
+		return compare_mission_predicate_to_leaf(mission_predicate, candidate, candidate.path.data());
+	const auto mission_name = mission_predicate.filesystem_name;
+	const auto path_length = candidate.path.size();
+	if (!strncmp(mission_name, candidate.path.data(), path_length) && mission_name[path_length] == '/')
+	{
+		{
+			const unsigned long size = candidate.directory.size();
+			con_printf(CON_PRIORITY_DEBUG_MISSION_LOAD, DXX_STRINGIZE_FL(__FILE__, __LINE__, "want mission pathname \"%s\", check %lu missions under \"%s\""), mission_predicate.filesystem_name, size, candidate.path.data());
+		}
+		range_for (auto &i, candidate.directory)
+		{
+			if (const auto r = compare_mission_by_pathname(mission_predicate, i))
+				return r;
+		}
+		con_printf(CON_PRIORITY_DEBUG_MISSION_LOAD, DXX_STRINGIZE_FL(__FILE__, __LINE__, "no matches under \"%s\""), candidate.path.data());
+	}
+	else
+		con_printf(CON_PRIORITY_DEBUG_MISSION_LOAD, DXX_STRINGIZE_FL(__FILE__, __LINE__, "want mission pathname \"%s\", ignore non-matching directory \"%s\""), mission_predicate.filesystem_name, candidate.path.data());
+	return nullptr;
 }
 
 }
 
 Mission_ptr Current_mission; // currently loaded mission
 
+}
+
+namespace {
+
 static bool null_or_space(char c)
 {
 	return !c || isspace(static_cast<unsigned>(c));
 }
 
-// Allocate the Level_names, Secret_level_names and Secret_level_table arrays
-static int allocate_levels(void)
+// Allocate the Current_mission->level_names, Current_mission->secret_level_names and Current_mission->secret_level_table arrays
+static void allocate_levels(const unsigned count_regular_level, const unsigned count_secret_level)
 {
-	Level_names = make_unique<d_fname[]>(Last_level);
-	if (Last_secret_level)
+	Current_mission->level_names = std::make_unique<d_fname[]>(count_regular_level);
+	Current_mission->last_level = count_regular_level;
+	Current_mission->n_secret_levels = count_secret_level;
+	Current_mission->last_secret_level = -static_cast<signed>(count_secret_level);
+	if (count_secret_level)
 	{
-		N_secret_levels = -Last_secret_level;
-		Secret_level_names = make_unique<d_fname[]>(N_secret_levels);
-		Secret_level_table = make_unique<ubyte[]>(N_secret_levels);
+		auto secret_level_names = std::make_unique<d_fname[]>(count_secret_level);
+		auto secret_level_table = std::make_unique<uint8_t[]>(count_secret_level);
+		Current_mission->secret_level_names = std::move(secret_level_names);
+		Current_mission->secret_level_table = std::move(secret_level_table);
 	}
-	
-	return 1;
+}
+
+static void allocate_shareware_levels(const unsigned count_regular_level, const unsigned count_secret_level)
+{
+	Current_mission->briefing_text_filename = BIMD1_BRIEFING_FILE;
+	Current_mission->ending_text_filename = BIMD1_ENDING_FILE_SHARE;
+	allocate_levels(count_regular_level, count_secret_level);
+	//build level names
+	for (const auto &&[idx, name] : enumerate(unchecked_partial_range(Current_mission->level_names.get(), count_regular_level), 1u))
+		snprintf(&name[0u], name.size(), "level%02u.sdl", idx);
+}
+
+static void build_rdl_regular_level_names(const unsigned count_regular_level, std::unique_ptr<d_fname[]> &names)
+{
+	for (auto &&[idx, name] : enumerate(unchecked_partial_range(names.get(), count_regular_level), 1u))
+		snprintf(&name[0u], name.size(), "level%02u.rdl", idx);
+}
+
+static void build_rdl_secret_level_names(const unsigned count_secret_level, std::unique_ptr<d_fname[]> &names)
+{
+	for (auto &&[idx, name] : enumerate(unchecked_partial_range(names.get(), count_secret_level), 1u))
+		snprintf(&name[0u], name.size(), "levels%1u.rdl", idx);
 }
 
 //
 //  Special versions of mission routines for d1 builtins
 //
 
-static const char *load_mission_d1()
+static void load_mission_d1()
 {
 	switch (PHYSFSX_fsize("descent.hog"))
 	{
 		case D1_SHAREWARE_MISSION_HOGSIZE:
 		case D1_SHAREWARE_10_MISSION_HOGSIZE:
-			N_secret_levels = 0;
-	
-			Last_level = 7;
-			Last_secret_level = 0;
-			
-			if (!allocate_levels())
-			{
-				Current_mission.reset();
-				return "Failed to allocate level memory for Descent 1 shareware";
-			}
-	
-			//build level names
-			for (int i=0;i<Last_level;i++)
-				snprintf(&Level_names[i][0u], Level_names[i].size(), "level%02d.sdl", i+1);
-			Briefing_text_filename = BIMD1_BRIEFING_FILE;
-			Ending_text_filename = BIMD1_ENDING_FILE_SHARE;
+			allocate_shareware_levels(7, 0);
 			break;
 		case D1_MAC_SHARE_MISSION_HOGSIZE:
-			N_secret_levels = 0;
-	
-			Last_level = 3;
-			Last_secret_level = 0;
-	
-			if (!allocate_levels())
-			{
-				Current_mission.reset();
-				return "Failed to allocate level memory for Descent 1 Mac shareware";
-			}
-			
-			//build level names
-			for (int i=0;i<Last_level;i++)
-				snprintf(&Level_names[i][0u], Level_names[i].size(), "level%02d.sdl", i+1);
-			Briefing_text_filename = BIMD1_BRIEFING_FILE;
-			Ending_text_filename = BIMD1_ENDING_FILE_SHARE;
+			allocate_shareware_levels(3, 0);
 			break;
 		case D1_OEM_MISSION_HOGSIZE:
 		case D1_OEM_10_MISSION_HOGSIZE:
 			{
-			N_secret_levels = 1;
-	
 			constexpr unsigned last_level = 15;
-			constexpr int last_secret_level = -1;
-			Last_level = last_level;
-			Last_secret_level = last_secret_level;
-	
-			if (!allocate_levels())
-			{
-				Current_mission.reset();
-				return "Failed to allocate level memory for Descent 1 OEM";
-			}
-			
+			constexpr unsigned last_secret_level = 1;
+			allocate_levels(last_level, last_secret_level);
 			//build level names
-			for (unsigned i = 0; i < last_level - 1; ++i)
+			build_rdl_regular_level_names(last_level - 1, Current_mission->level_names);
 			{
-				auto &ln = Level_names[i];
-				snprintf(&ln[0u], ln.size(), "level%02u.rdl", i + 1);
-			}
-			{
-				auto &ln = Level_names[last_level - 1];
+				auto &ln = Current_mission->level_names[last_level - 1];
 				snprintf(&ln[0u], ln.size(), "saturn%02d.rdl", last_level);
 			}
-			for (int i = 0; i < -last_secret_level; ++i)
-			{
-				auto &sn = Secret_level_names[i];
-				snprintf(&sn[0u], sn.size(), "levels%1d.rdl", i + 1);
-			}
-			Secret_level_table[0] = 10;
-			Briefing_text_filename = "briefsat.txb";
-			Ending_text_filename = BIMD1_ENDING_FILE_OEM;
+			build_rdl_secret_level_names(last_secret_level, Current_mission->secret_level_names);
+			Current_mission->secret_level_table[0] = 10;
+			Current_mission->briefing_text_filename = "briefsat.txb";
+			Current_mission->ending_text_filename = BIMD1_ENDING_FILE_OEM;
 			}
 			break;
 		default:
 			Int3();
-			DXX_BOOST_FALLTHROUGH;
+			[[fallthrough]];
 		case D1_MISSION_HOGSIZE:
 		case D1_MISSION_HOGSIZE2:
 		case D1_10_MISSION_HOGSIZE:
 		case D1_MAC_MISSION_HOGSIZE:
 			{
-			N_secret_levels = 3;
-	
-			constexpr unsigned last_level = BIMD1_LAST_LEVEL;
-			constexpr int last_secret_level = BIMD1_LAST_SECRET_LEVEL;
-			Last_level = last_level;
-			Last_secret_level = last_secret_level;
-	
-			if (!allocate_levels())
-			{
-				Current_mission.reset();
-				return "Failed to allocate level memory for Descent 1";
-			}
+			constexpr unsigned last_level = 27;
+			constexpr unsigned last_secret_level = 3;
+			allocate_levels(last_level, last_secret_level);
 
 			//build level names
-			for (unsigned i = 0; i < last_level; ++i)
-			{
-				auto &ln = Level_names[i];
-				snprintf(&ln[0u], ln.size(), "level%02u.rdl", i + 1);
-			}
-			for (int i = 0; i < -last_secret_level; ++i)
-			{
-				auto &sn = Secret_level_names[i];
-				snprintf(&sn[0u], sn.size(), "levels%1d.rdl", i + 1);
-			}
-			Secret_level_table[0] = 10;
-			Secret_level_table[1] = 21;
-			Secret_level_table[2] = 24;
-			Briefing_text_filename = BIMD1_BRIEFING_FILE;
-			Ending_text_filename = "endreg.txb";
+			build_rdl_regular_level_names(last_level, Current_mission->level_names);
+			build_rdl_secret_level_names(last_secret_level, Current_mission->secret_level_names);
+			Current_mission->secret_level_table[0] = 10;
+			Current_mission->secret_level_table[1] = 21;
+			Current_mission->secret_level_table[2] = 24;
+			Current_mission->briefing_text_filename = BIMD1_BRIEFING_FILE;
+			Current_mission->ending_text_filename = "endreg.txb";
 			break;
 			}
 	}
-	return nullptr;
 }
 
 #if defined(DXX_BUILD_DESCENT_II)
@@ -298,7 +352,7 @@ static const char *load_mission_d1()
 //  Special versions of mission routines for shareware
 //
 
-static const char *load_mission_shareware()
+static void load_mission_shareware()
 {
     Current_mission->mission_name.copy_if(SHAREWARE_MISSION_NAME);
     Current_mission->descent_version = Mission::descent_version_type::descent2;
@@ -307,43 +361,24 @@ static const char *load_mission_shareware()
     switch (Current_mission->builtin_hogsize)
 	{
 		case MAC_SHARE_MISSION_HOGSIZE:
-			N_secret_levels = 1;
-
-			Last_level = 4;
-			Last_secret_level = -1;
-
-			if (!allocate_levels())
-			{
-				Current_mission.reset();
-				return "Failed to allocate level memory for Descent 2 Mac shareware";
-			}
-			
+			allocate_levels(4, 1);
 			// mac demo is using the regular hog and rl2 files
-			Level_names[0] = "d2leva-1.rl2";
-			Level_names[1] = "d2leva-2.rl2";
-			Level_names[2] = "d2leva-3.rl2";
-			Level_names[3] = "d2leva-4.rl2";
-			Secret_level_names[0] = "d2leva-s.rl2";
+			Current_mission->level_names[0] = "d2leva-1.rl2";
+			Current_mission->level_names[1] = "d2leva-2.rl2";
+			Current_mission->level_names[2] = "d2leva-3.rl2";
+			Current_mission->level_names[3] = "d2leva-4.rl2";
+			Current_mission->secret_level_names[0] = "d2leva-s.rl2";
 			break;
 		default:
 			Int3();
-			DXX_BOOST_FALLTHROUGH;
+			[[fallthrough]];
 		case SHAREWARE_MISSION_HOGSIZE:
-			N_secret_levels = 0;
-
-			Last_level = 3;
-			Last_secret_level = 0;
-
-			if (!allocate_levels())
-			{
-				Current_mission.reset();
-				return "Failed to allocate level memory for Descent 2 shareware";
-			}
-			Level_names[0] = "d2leva-1.sl2";
-			Level_names[1] = "d2leva-2.sl2";
-			Level_names[2] = "d2leva-3.sl2";
+			allocate_levels(3, 0);
+			Current_mission->level_names[0] = "d2leva-1.sl2";
+			Current_mission->level_names[1] = "d2leva-2.sl2";
+			Current_mission->level_names[2] = "d2leva-3.sl2";
+			break;
 	}
-	return nullptr;
 }
 
 
@@ -351,35 +386,25 @@ static const char *load_mission_shareware()
 //  Special versions of mission routines for Diamond/S3 version
 //
 
-static const char *load_mission_oem()
+static void load_mission_oem()
 {
     Current_mission->mission_name.copy_if(OEM_MISSION_NAME);
     Current_mission->descent_version = Mission::descent_version_type::descent2;
     Current_mission->anarchy_only_flag = 0;
     
-	N_secret_levels = 2;
-
-	Last_level = 8;
-	Last_secret_level = -2;
-
-	if (!allocate_levels())
-	{
-		Current_mission.reset();
-		return "Failed to allocate level memory for Descent 2 OEM";
-	}
-	Level_names[0] = "d2leva-1.rl2";
-	Level_names[1] = "d2leva-2.rl2";
-	Level_names[2] = "d2leva-3.rl2";
-	Level_names[3] = "d2leva-4.rl2";
-	Secret_level_names[0] = "d2leva-s.rl2";
-	Level_names[4] = "d2levb-1.rl2";
-	Level_names[5] = "d2levb-2.rl2";
-	Level_names[6] = "d2levb-3.rl2";
-	Level_names[7] = "d2levb-4.rl2";
-	Secret_level_names[1] = "d2levb-s.rl2";
-	Secret_level_table[0] = 1;
-	Secret_level_table[1] = 5;
-	return nullptr;
+	allocate_levels(8, 2);
+	Current_mission->level_names[0] = "d2leva-1.rl2";
+	Current_mission->level_names[1] = "d2leva-2.rl2";
+	Current_mission->level_names[2] = "d2leva-3.rl2";
+	Current_mission->level_names[3] = "d2leva-4.rl2";
+	Current_mission->secret_level_names[0] = "d2leva-s.rl2";
+	Current_mission->level_names[4] = "d2levb-1.rl2";
+	Current_mission->level_names[5] = "d2levb-2.rl2";
+	Current_mission->level_names[6] = "d2levb-3.rl2";
+	Current_mission->level_names[7] = "d2levb-4.rl2";
+	Current_mission->secret_level_names[1] = "d2levb-s.rl2";
+	Current_mission->secret_level_table[0] = 1;
+	Current_mission->secret_level_table[1] = 5;
 }
 #endif
 
@@ -387,7 +412,6 @@ static const char *load_mission_oem()
 static int istok(const char *buf,const char *tok)
 {
 	return d_strnicmp(buf,tok,strlen(tok)) == 0;
-
 }
 
 //returns ptr to string after '=' & white space, or NULL if no '='
@@ -406,28 +430,70 @@ static char *get_value(char *buf)
 	return NULL;		//error!
 }
 
-//reads a line, returns ptr to value of passed parm.  returns NULL if none
-static char *get_parm_value(PHYSFSX_gets_line_t<80> &buf, const char *const parm, PHYSFS_File *const f)
+static mission_name_and_version get_any_mission_type_name_value(PHYSFSX_gets_line_t<80> &buf, PHYSFS_File *const f, const Mission::descent_version_type descent_version)
 {
 	if (!PHYSFSX_fgets(buf,f))
-		return NULL;
-
-	if (istok(buf,parm))
-		return get_value(buf);
-	else
-		return NULL;
+		return {};
+	if (istok(buf, "name"))
+		return {descent_version, get_value(buf)};
+#if defined(DXX_BUILD_DESCENT_II)
+	if (descent_version == Mission::descent_version_type::descent1)
+		/* If reading a Descent 1 `.msn` file, do not check for the
+		 * extended mission types.  D1X-Rebirth would ignore them, so
+		 * D2X-Rebirth should also ignore them.
+		 */
+		return {};
+	struct name_type_pair
+	{
+		/* std::pair cannot be used here because direct initialization
+		 * from a string literal fails to compile.
+		 */
+		char name[7];
+		Mission::descent_version_type descent_version;
+	};
+	static constexpr name_type_pair mission_name_type_values[] = {
+		{"xname", Mission::descent_version_type::descent2x},	// enhanced mission
+		{"zname", Mission::descent_version_type::descent2z},	// super-enhanced mission
+		{"!name", Mission::descent_version_type::descent2a},	// extensible-enhanced mission
+	};
+	for (auto &&[name, descent_version] : mission_name_type_values)
+	{
+		if (istok(buf, name))
+			return {descent_version, get_value(buf)};
+	}
+#endif
+	return {};
 }
 
 static bool ml_sort_func(const mle &e0,const mle &e1)
 {
+	const auto d0 = e0.directory.empty();
+	const auto d1 = e1.directory.empty();
+	if (d0 != d1)
+		/* If d0 is a directory and d1 is a mission, or if d0 is a
+		 * mission and d1 is a directory, then apply a special case.
+		 *
+		 * Consider d0 to be less (and therefore ordered earlier) if d1
+		 * is a mission.  This moves directories to the top of the list.
+		 */
+		return d1;
+	/* If both d0 and d1 are directories, or if both are missions, then
+	 * apply the usual sorting rule.  This makes directories sort
+	 * as usual relative to each other.
+	 */
 	return d_stricmp(e0.mission_name,e1.mission_name) < 0;
+}
+
 }
 
 //returns 1 if file read ok, else 0
 namespace dsx {
+
+namespace {
+
 static int read_mission_file(mission_list_type &mission_list, mission_candidate_search_path &pathname)
 {
-	if (const auto mfile = PHYSFSX_openReadBuffered(pathname.data()))
+	if (const auto mfile = PHYSFSX_openReadBuffered(pathname.data()).first)
 	{
 		std::string str_pathname = pathname.data();
 		const auto idx_last_slash = str_pathname.find_last_of('/');
@@ -435,43 +501,37 @@ static int read_mission_file(mission_list_type &mission_list, mission_candidate_
 		const auto idx_file_extension = str_pathname.find_first_of('.', idx_filename);
 		if (idx_file_extension == str_pathname.npos)
 			return 0;	//missing extension
+		if (idx_file_extension >= DXX_MAX_MISSION_PATH_LENGTH)
+			return 0;	// path too long, would be truncated in save game files
 		str_pathname.resize(idx_file_extension);
 		mission_list.emplace_back(Mission_path(std::move(str_pathname), idx_filename));
 		mle *mission = &mission_list.back();
-#if defined(DXX_BUILD_DESCENT_II)
+#if defined(DXX_BUILD_DESCENT_I)
+		constexpr auto descent_version = Mission::descent_version_type::descent1;
+#elif defined(DXX_BUILD_DESCENT_II)
 		// look if it's .mn2 or .msn
-		mission->descent_version = (pathname[idx_file_extension + 3] == MISSION_EXTENSION_DESCENT_II[3])
+		auto descent_version = (pathname[idx_file_extension + 3] == MISSION_EXTENSION_DESCENT_II[3])
 			? Mission::descent_version_type::descent2
 			: Mission::descent_version_type::descent1;
 #endif
 		mission->anarchy_only_flag = 0;
 
 		PHYSFSX_gets_line_t<80> buf;
-		auto p = get_parm_value(buf, "name",mfile);
+		const auto &&nv = get_any_mission_type_name_value(buf, mfile, descent_version);
 
+		if (const auto p = nv.name) {
 #if defined(DXX_BUILD_DESCENT_II)
-		if (!p) {		//try enhanced mission
-			PHYSFSX_fseek(mfile,0,SEEK_SET);
-			p = get_parm_value(buf, "xname",mfile);
-		}
-
-		if (!p) {       //try super-enhanced mission!
-			PHYSFSX_fseek(mfile,0,SEEK_SET);
-			p = get_parm_value(buf, "zname",mfile);
-		}
-
-		if (!p) {       //try extensible-enhanced mission!
-			PHYSFSX_fseek(mfile,0,SEEK_SET);
-			p = get_parm_value(buf, "!name",mfile);
-		}
+			mission->descent_version = nv.descent_version;
 #endif
-
-		if (p) {
 			char *t;
 			if ((t=strchr(p,';'))!=NULL)
+			{
 				*t=0;
-			t = p + strlen(p)-1;
-			while (isspace(*t))
+				--t;
+			}
+			else
+				t = p + strlen(p) - 1;
+			while (isspace(static_cast<unsigned>(*t)))
 				*t-- = 0; // remove trailing whitespace
 			mission->mission_name.copy_if(p, mission->mission_name.size() - 1);
 		}
@@ -486,7 +546,7 @@ static int read_mission_file(mission_list_type &mission_list, mission_candidate_
 		{
 			if (istok(temp,"type"))
 			{
-				p = get_value(temp);
+				const auto p = get_value(temp);
 				//get mission type
 				if (p)
 					mission->anarchy_only_flag = istok(p,"anarchy");
@@ -498,9 +558,7 @@ static int read_mission_file(mission_list_type &mission_list, mission_candidate_
 
 	return 0;
 }
-}
 
-namespace dsx {
 static void add_d1_builtin_mission_to_list(mission_list_type &mission_list)
 {
     int size;
@@ -526,7 +584,7 @@ static void add_d1_builtin_mission_to_list(mission_list_type &mission_list)
 	default:
 		Warning("Unknown D1 hogsize %d\n", size);
 		Int3();
-		DXX_BOOST_FALLTHROUGH;
+		[[fallthrough]];
 	case D1_MISSION_HOGSIZE:
 	case D1_MISSION_HOGSIZE2:
 	case D1_10_MISSION_HOGSIZE:
@@ -543,7 +601,6 @@ static void add_d1_builtin_mission_to_list(mission_list_type &mission_list)
 	mission->descent_version = Mission::descent_version_type::descent1;
 	mission->builtin_hogsize = 0;
 #endif
-}
 }
 
 #if defined(DXX_BUILD_DESCENT_II)
@@ -574,7 +631,7 @@ static void add_builtin_mission_to_list(mission_list_type &mission_list, d_fname
 	default:
 		Warning("Unknown hogsize %d, trying %s\n", size, FULL_MISSION_FILENAME MISSION_EXTENSION_DESCENT_II);
 		Int3();
-		DXX_BOOST_FALLTHROUGH;
+		[[fallthrough]];
 	case FULL_MISSION_HOGSIZE:
 	case FULL_10_MISSION_HOGSIZE:
 	case MAC_FULL_MISSION_HOGSIZE:
@@ -593,9 +650,7 @@ static void add_builtin_mission_to_list(mission_list_type &mission_list, d_fname
 }
 #endif
 
-namespace dsx {
-
-static void add_missions_to_list(mission_list_type &mission_list, mission_candidate_search_path &path, const mission_candidate_search_path::iterator rel_path, const int anarchy_mode)
+static void add_missions_to_list(mission_list_type &mission_list, mission_candidate_search_path &path, const mission_candidate_search_path::iterator rel_path, const mission_filter_mode mission_filter)
 {
 	/* rel_path must point within the array `path`.
 	 * rel_path must point to the null that follows a possibly empty
@@ -607,27 +662,29 @@ static void add_missions_to_list(mission_list_type &mission_list, mission_candid
 	 * recurse into subdirectories and to open individual missions will
 	 * not work correctly.
 	 */
-	assert(std::distance(path.begin(), rel_path) < path.size());
+	assert(std::distance(path.begin(), rel_path) < path.size() - 1);
 	assert(!*rel_path);
 	assert(path.begin() == rel_path || *std::prev(rel_path) == '/');
 	const std::size_t space_remaining = std::distance(rel_path, path.end());
+	*rel_path = '.';
+	*std::next(rel_path) = 0;
 	range_for (const auto i, PHYSFSX_uncounted_list{PHYSFS_enumerateFiles(path.data())})
 	{
 		/* Add 1 to include the terminating null. */
 		const std::size_t il = strlen(i) + 1;
-		/* Add 1 for the slash in case it is a directory. */
-		if (il + 1 >= space_remaining)
+		/* Add 2 for the slash+dot in case it is a directory. */
+		if (il + 2 >= space_remaining)
 			continue;	// path is too long
 
 		auto j = std::copy_n(i, il, rel_path);
 		const char *ext;
 		if (PHYSFS_isDirectory(path.data()))
 		{
-			auto null = std::prev(j);
+			const auto null = std::prev(j);
 			*j = 0;
 			*null = '/';
 			mission_list_type sublist;
-			add_missions_to_list(sublist, path, j, anarchy_mode);
+			add_missions_to_list(sublist, path, j, mission_filter);
 			*null = 0;
 			const auto found = sublist.size();
 			if (!found)
@@ -644,7 +701,10 @@ static void add_missions_to_list(mission_list_type &mission_list, mission_candid
 				mission_list.emplace_back(std::move(sli));
 			}
 			else
+			{
+				std::sort(sublist.begin(), sublist.end(), ml_sort_func);
 				mission_list.emplace_back(path.data(), std::move(sublist));
+			}
 		}
 		else if (il > 5 &&
 			((ext = &i[il - 5], !d_strnicmp(ext, MISSION_EXTENSION_DESCENT_I))
@@ -654,7 +714,7 @@ static void add_missions_to_list(mission_list_type &mission_list, mission_candid
 			))
 			if (read_mission_file(mission_list, path))
 			{
-				if (anarchy_mode || !mission_list.back().anarchy_only_flag)
+				if (mission_filter != mission_filter_mode::exclude_anarchy || !mission_list.back().anarchy_only_flag)
 				{
 					mission_list.back().builtin_hogsize = 0;
 				}
@@ -667,9 +727,15 @@ static void add_missions_to_list(mission_list_type &mission_list, mission_candid
 			break;
 		}
 		*rel_path = 0;	// chop off the entry
+		DXX_POISON_MEMORY(std::span(std::next(rel_path), path.end()), 0xcc);
 	}
 }
+
 }
+
+}
+
+namespace {
 
 /* move <mission_name> to <place> on mission list, increment <place> */
 static void promote (mission_list_type &mission_list, const char *const name, std::size_t &top_place)
@@ -684,6 +750,8 @@ static void promote (mission_list_type &mission_list, const char *const name, st
 		}
 }
 
+}
+
 Mission::~Mission()
 {
     // May become more complex with the editor
@@ -695,15 +763,15 @@ Mission::~Mission()
 		}
 }
 
-
-
 //fills in the global list of missions.  Returns the number of missions
 //in the list.  If anarchy_mode is set, then also add anarchy-only missions.
 
 namespace dsx {
-static mission_list_type build_mission_list(int anarchy_mode)
-{
 
+namespace {
+
+static mission_list_type build_mission_list(const mission_filter_mode mission_filter)
+{
 	//now search for levels on disk
 
 //@@Took out this code because after this routine was called once for
@@ -726,7 +794,8 @@ static mission_list_type build_mission_list(int anarchy_mode)
 #endif
 	add_d1_builtin_mission_to_list(mission_list);
 	mission_candidate_search_path search_str = {{MISSION_DIR}};
-	add_missions_to_list(mission_list, search_str, search_str.begin() + sizeof(MISSION_DIR) - 1, anarchy_mode);
+	DXX_POISON_MEMORY(std::span(std::next(search_str.begin(), sizeof(MISSION_DIR)), search_str.end()), 0xcc);
+	add_missions_to_list(mission_list, search_str, search_str.begin() + sizeof(MISSION_DIR) - 1, mission_filter);
 	
 	// move original missions (in story-chronological order)
 	// to top of mission list
@@ -741,6 +810,7 @@ static mission_list_type build_mission_list(int anarchy_mode)
 		std::sort(next(begin(mission_list), top_place), end(mission_list), ml_sort_func);
 	return mission_list;
 }
+
 }
 
 #if defined(DXX_BUILD_DESCENT_II)
@@ -748,7 +818,16 @@ static mission_list_type build_mission_list(int anarchy_mode)
 
 int load_mission_ham()
 {
-	read_hamfile();
+	read_hamfile(LevelSharedRobotInfoState); // intentionally can also read from the HOG
+
+	if (Piggy_hamfile_version >= pig_hamfile_version::_3)
+	{
+		// re-read sounds in case mission has custom .sXX
+		Num_sound_files = 0;
+		read_sndfile(0);
+		piggy_read_sounds();
+	}
+
 	if (Current_mission->descent_version == Mission::descent_version_type::descent2a &&
 		Current_mission->alternate_ham_file)
 	{
@@ -765,13 +844,8 @@ int load_mission_ham()
 		char althog[PATH_MAX];
 		snprintf(althog, sizeof(althog), MISSION_DIR "%.*s.hog", l - 4, static_cast<const char *>(*altham));
 		char *p = althog + sizeof(MISSION_DIR) - 1;
-		int exists = PHYSFSX_contfile_init(p, 0);
-		if (!exists) {
-			exists = PHYSFSX_contfile_init(p = althog, 0);
-		}
+		const auto mount_hog = make_PHYSFSX_ComputedPathMount(p, althog, physfs_search_path::prepend);
 		bm_read_extra_robots(*altham, Mission::descent_version_type::descent2z);
-		if (exists)
-			PHYSFSX_contfile_close(p);
 		return 1;
 	}
 	else if (Current_mission->descent_version == Mission::descent_version_type::descent2a ||
@@ -779,20 +853,23 @@ int load_mission_ham()
 				Current_mission->descent_version == Mission::descent_version_type::descent2x)
 	{
 		char t[50];
-		snprintf(t,sizeof(t), "%s.ham", Current_mission_filename);
+		snprintf(t,sizeof(t), "%s.ham", &*Current_mission->filename);
 		bm_read_extra_robots(t, Current_mission->descent_version);
 		return 1;
 	} else
 		return 0;
 }
 #endif
+}
+
+namespace {
 
 #define tex ".tex"
-static void set_briefing_filename(d_fname &f, const char *const v, std::size_t d)
+static void set_briefing_filename(d_fname &f, const std::span<const char> v)
 {
-	f.copy_if(v, d);
-	f.copy_if(d, tex);
-	if (!PHYSFSX_exists(static_cast<const char *>(f), 1) && !(f.copy_if(++d, "txb"), PHYSFSX_exists(static_cast<const char *>(f), 1))) // check if this file exists ...
+	f.copy_if(v.data(), v.size());
+	f.copy_if(v.size(), tex);
+	if (!PHYSFSX_exists(static_cast<const char *>(f), 1) && !(f.copy_if(v.size() + 1, "txb"), PHYSFSX_exists(static_cast<const char *>(f), 1))) // check if this file exists ...
 		f = {};
 }
 
@@ -802,38 +879,39 @@ static void set_briefing_filename(d_fname &f, const char *const v)
 	auto a = [](char c) {
 		return !c || c == '.';
 	};
-	auto i = std::find_if(v, next(v, f.size() - sizeof(tex)), a);
+	const auto &&i = ranges::find_if(v, next(v, f.size() - sizeof(tex)), a);
 	std::size_t d = std::distance(v, i);
-	set_briefing_filename(f, v, d);
+	set_briefing_filename(f, {v, d});
 }
 
-static void record_briefing(d_fname &f, array<char, PATH_MAX> &buf)
+static void record_briefing(d_fname &f, std::array<char, PATH_MAX> &buf)
 {
 	const auto v = get_value(buf.data());
 	if (!v)
 		return;
-	const std::size_t d = std::distance(v, std::find_if(v, buf.end(), null_or_space));
+	const std::size_t d = std::distance(v, ranges::find_if(v, buf.end(), null_or_space));
 	if (d >= FILENAME_LEN)
 		return;
 	{
-		set_briefing_filename(f, v, std::min(d, f.size() - sizeof(tex)));
+		set_briefing_filename(f, {v, std::min(d, f.size() - sizeof(tex))});
 	}
 }
 #undef tex
+
+}
 
 //loads the specfied mission from the mission list.
 //build_mission_list() must have been called.
 //Returns true if mission loaded ok, else false.
 namespace dsx {
 
+namespace {
+
 static const char *load_mission(const mle *const mission)
 {
 	char *v;
 
-#if defined(DXX_BUILD_DESCENT_II)
-	close_extra_robot_movie();
-#endif
-	Current_mission = make_unique<Mission>(static_cast<const Mission_path &>(*mission));
+	Current_mission = std::make_unique<Mission>(static_cast<const Mission_path &>(*mission));
 	Current_mission->builtin_hogsize = mission->builtin_hogsize;
 	Current_mission->mission_name.copy_if(mission->mission_name);
 #if defined(DXX_BUILD_DESCENT_II)
@@ -846,31 +924,35 @@ static const char *load_mission(const mle *const mission)
 #endif
 
 	//init vars
-	Last_level = 0;
-	Last_secret_level = 0;
-	Briefing_text_filename = {};
-	Ending_text_filename = {};
-	Secret_level_table.reset();
-	Level_names.reset();
-	Secret_level_names.reset();
+	Current_mission->last_level = 0;
+	Current_mission->last_secret_level = 0;
+	Current_mission->briefing_text_filename = {};
+	Current_mission->ending_text_filename = {};
+	Current_mission->secret_level_table.reset();
+	Current_mission->level_names.reset();
+	Current_mission->secret_level_names.reset();
 
 	// for Descent 1 missions, load descent.hog
 #if defined(DXX_BUILD_DESCENT_II)
 	if (EMULATING_D1)
 #endif
 	{
-		if (!PHYSFSX_contfile_init("descent.hog", 0))
+		std::array<char, PATH_MAX> pathname;
+		if (const auto r = PHYSFSX_addRelToSearchPath("descent.hog", pathname, physfs_search_path::prepend); r != PHYSFS_ERR_OK)
 #if defined(DXX_BUILD_DESCENT_I)
-			Error("descent.hog not available!\n");
+			Error("descent.hog not available!\n%s", PHYSFS_getErrorByCode(r));
 #elif defined(DXX_BUILD_DESCENT_II)
-			Warning("descent.hog not available, this mission may be missing some files required for briefings and exit sequence\n");
+			Warning("descent.hog not available!\n%s\nThis mission may be missing some files required for briefings and exit sequence\n", PHYSFS_getErrorByCode(r));
 #endif
-		if (!d_stricmp(Current_mission_filename, D1_MISSION_FILENAME))
-			return load_mission_d1();
+		if (!d_stricmp(Current_mission->path.c_str(), D1_MISSION_FILENAME))
+		{
+			load_mission_d1();
+			return nullptr;
+		}
 	}
 #if defined(DXX_BUILD_DESCENT_II)
 	else
-		PHYSFSX_contfile_close("descent.hog");
+		PHYSFSX_removeRelFromSearchPath("descent.hog");
 #endif
 
 #if defined(DXX_BUILD_DESCENT_II)
@@ -878,20 +960,22 @@ static const char *load_mission(const mle *const mission)
 		switch (Current_mission->builtin_hogsize) {
 		case SHAREWARE_MISSION_HOGSIZE:
 		case MAC_SHARE_MISSION_HOGSIZE:
-			Briefing_text_filename = "brief2.txb";
-			Ending_text_filename = BIMD2_ENDING_FILE_SHARE;
-			return load_mission_shareware();
+			Current_mission->briefing_text_filename = "brief2.txb";
+			Current_mission->ending_text_filename = BIMD2_ENDING_FILE_SHARE;
+			load_mission_shareware();
+			return nullptr;
 		case OEM_MISSION_HOGSIZE:
-			Briefing_text_filename = "brief2o.txb";
-			Ending_text_filename = BIMD2_ENDING_FILE_OEM;
-			return load_mission_oem();
+			Current_mission->briefing_text_filename = "brief2o.txb";
+			Current_mission->ending_text_filename = BIMD2_ENDING_FILE_OEM;
+			load_mission_oem();
+			return nullptr;
 		default:
 			Int3();
-			DXX_BOOST_FALLTHROUGH;
+			[[fallthrough]];
 		case FULL_MISSION_HOGSIZE:
 		case FULL_10_MISSION_HOGSIZE:
 		case MAC_FULL_MISSION_HOGSIZE:
-			Briefing_text_filename = "robot.txb";
+			Current_mission->briefing_text_filename = "robot.txb";
 			// continue on... (use d2.mn2 from hogfile)
 			break;
 		}
@@ -902,70 +986,43 @@ static const char *load_mission(const mle *const mission)
 
 	auto &msn_extension =
 #if defined(DXX_BUILD_DESCENT_II)
-	(mission->descent_version == Mission::descent_version_type::descent2) ? MISSION_EXTENSION_DESCENT_II :
+	(mission->descent_version != Mission::descent_version_type::descent1) ? MISSION_EXTENSION_DESCENT_II :
 #endif
 		MISSION_EXTENSION_DESCENT_I;
-	array<char, PATH_MAX> mission_filename;
+	std::array<char, PATH_MAX> mission_filename;
 	snprintf(mission_filename.data(), mission_filename.size(), "%s%s", mission->path.c_str(), msn_extension);
 
 	PHYSFSEXT_locateCorrectCase(mission_filename.data());
 
-	auto &&mfile = PHYSFSX_openReadBuffered(mission_filename.data());
+	auto &&[mfile, physfserr] = PHYSFSX_openReadBuffered(mission_filename.data());
 	if (!mfile) {
 		Current_mission.reset();
+		con_printf(CON_NORMAL, DXX_STRINGIZE_FL(__FILE__, __LINE__, "error: failed to open mission \"%s\": %s"), mission_filename.data(), PHYSFS_getErrorByCode(physfserr));
 		return "Failed to open mission file";		//error!
 	}
 
 	//for non-builtin missions, load HOG
 #if defined(DXX_BUILD_DESCENT_II)
-	bool have_mn2_version = false;
+	Current_mission->descent_version = mission->descent_version;
 	if (!PLAYING_BUILTIN_MISSION)
 #endif
 	{
 		strcpy(&mission_filename[mission->path.size() + 1], "hog");		//change extension
-			PHYSFSX_contfile_init(mission_filename.data(), 0);
-		set_briefing_filename(Briefing_text_filename, Current_mission_filename);
-		Ending_text_filename = Briefing_text_filename;
+		std::array<char, PATH_MAX> pathname;
+		PHYSFSX_addRelToSearchPath(mission_filename.data(), pathname, physfs_search_path::prepend);
+		set_briefing_filename(Current_mission->briefing_text_filename, &*Current_mission->filename);
+		Current_mission->ending_text_filename = Current_mission->briefing_text_filename;
 	}
 
 	for (PHYSFSX_gets_line_t<PATH_MAX> buf; PHYSFSX_fgets(buf,mfile);)
 	{
-#if defined(DXX_BUILD_DESCENT_II)
-		if (!have_mn2_version)
-		{
-			if (istok(buf,"name"))
-			{
-				Current_mission->descent_version = Mission::descent_version_type::descent2;
-				have_mn2_version = true;
-			continue;						//already have name, go to next line
-			}
-			if (istok(buf,"xname"))
-			{
-				Current_mission->descent_version = Mission::descent_version_type::descent2x;
-				have_mn2_version = true;
-			continue;						//already have name, go to next line
-			}
-			if (istok(buf,"zname"))
-			{
-				Current_mission->descent_version = Mission::descent_version_type::descent2z;
-				have_mn2_version = true;
-			continue;						//already have name, go to next line
-			}
-			if (istok(buf,"!name"))
-			{
-				Current_mission->descent_version = Mission::descent_version_type::descent2a;
-				have_mn2_version = true;
-			continue;						//already have name, go to next line
-			}
-		}
-#endif
 		if (istok(buf,"type"))
 			continue;						//already have name, go to next line
 		else if (istok(buf,"briefing")) {
-			record_briefing(Briefing_text_filename, buf);
+			record_briefing(Current_mission->briefing_text_filename, buf);
 		}
 		else if (istok(buf,"ending")) {
-			record_briefing(Ending_text_filename, buf);
+			record_briefing(Current_mission->ending_text_filename, buf);
 		}
 		else if (istok(buf,"num_levels")) {
 
@@ -982,21 +1039,23 @@ static const char *load_mission(const mle *const mission)
 					if (*ip && *ip != ';')
 						continue;
 				}
-				Level_names = make_unique<d_fname[]>(n_levels);
-				range_for (auto &i, unchecked_partial_range(Level_names.get(), n_levels))
+				auto names = std::make_unique<d_fname[]>(n_levels);
+				uint8_t level_names_loaded = 0;
+				for (auto &i : unchecked_partial_range(names.get(), n_levels))
 				{
 					if (!PHYSFSX_fgets(buf, mfile))
 						break;
 					auto &line = buf.line();
-					auto s = std::find_if(line.begin(), line.end(), null_or_space);
-					if (i.copy_if(buf.line(), std::distance(line.begin(), s)))
+					const auto &&s = ranges::find_if(line, null_or_space);
+					if (i.copy_if(line, std::distance(line.begin(), s)))
 					{
-						Last_level++;
+						++level_names_loaded;
 					}
 					else
 						break;
 				}
-
+				Current_mission->last_level = level_names_loaded;
+				Current_mission->level_names = std::move(names);
 			}
 		}
 		else if (istok(buf,"num_secrets")) {
@@ -1013,10 +1072,12 @@ static const char *load_mission(const mle *const mission)
 					if (*ip && *ip != ';')
 						continue;
 				}
-				N_secret_levels = n_levels;
-				Secret_level_names = make_unique<d_fname[]>(n_levels);
-				Secret_level_table = make_unique<uint8_t[]>(n_levels);
-				for (int i=0;i<N_secret_levels;i++) {
+				Current_mission->n_secret_levels = n_levels;
+				uint8_t level_names_loaded = 0;
+				auto names = std::make_unique<d_fname[]>(n_levels);
+				auto table = std::make_unique<uint8_t[]>(n_levels);
+				for (auto &&[name, table_cell] : zip(unchecked_partial_range(names.get(), n_levels), unchecked_partial_range(table.get(), n_levels)))
+				{
 					if (!PHYSFSX_fgets(buf, mfile))
 						break;
 					const auto &line = buf.line();
@@ -1031,25 +1092,27 @@ static const char *load_mission(const mle *const mission)
 					auto a = [](char c) {
 						return isspace(static_cast<unsigned>(c));
 					};
-					auto s = std::find_if(lb, t, a);
-					if (Secret_level_names[i].copy_if(line, std::distance(lb, s)))
+					const auto &&s = ranges::find_if(lb, t, a);
+					if (name.copy_if(line, std::distance(lb, s)))
 					{
 						unsigned long ls = strtoul(t + 1, &ip, 10);
-						if (ls < 1 || ls > Last_level)
+						if (ls < 1 || ls > Current_mission->last_level)
 							break;
-						Secret_level_table[i] = ls;
-						Last_secret_level--;
+						table_cell = ls;
+						++ level_names_loaded;
 					}
 					else
 						break;
 				}
-
+				Current_mission->last_secret_level = -static_cast<signed>(level_names_loaded);
+				Current_mission->secret_level_names = std::move(names);
+				Current_mission->secret_level_table = std::move(table);
 			}
 		}
 #if defined(DXX_BUILD_DESCENT_II)
 		else if (Current_mission->descent_version == Mission::descent_version_type::descent2a && buf[0] == '!') {
 			if (istok(buf+1,"ham")) {
-				Current_mission->alternate_ham_file = make_unique<d_fname>();
+				Current_mission->alternate_ham_file = std::make_unique<d_fname>();
 				if ((v=get_value(buf))!=NULL) {
 					unsigned l = strlen(v);
 					if (l <= 4)
@@ -1066,7 +1129,7 @@ static const char *load_mission(const mle *const mission)
 			}
 			else {
 				con_printf(CON_URGENT, "Mission %s uses unsupported critical directive \"%s\".", Current_mission->path.c_str(), static_cast<const char *>(buf));
-				Last_level = 0;
+				Current_mission->last_level = 0;
 				break;
 			}
 		}
@@ -1074,17 +1137,18 @@ static const char *load_mission(const mle *const mission)
 
 	}
 	mfile.reset();
-	if (Last_level <= 0) {
+	if (Current_mission->last_level <= 0)
+	{
 		Current_mission.reset();		//no valid mission loaded
 		return "Failed to parse mission file";
 	}
 
 #if defined(DXX_BUILD_DESCENT_II)
 	// re-read default HAM file, in case this mission brings it's own version of it
-	free_polygon_models();
+	free_polygon_models(LevelSharedPolygonModelState);
 
 	if (load_mission_ham())
-		init_extra_robot_movie(Current_mission_filename);
+		Current_mission->extra_robot_movie = init_extra_robot_movie(&*Current_mission->filename);
 #endif
 	return nullptr;
 }
@@ -1093,58 +1157,147 @@ static const char *load_mission(const mle *const mission)
 
 //loads the named mission if exists.
 //Returns nullptr if mission loaded ok, else error string.
-const char *load_mission_by_name(const char *const mission_name)
+const char *load_mission_by_name (const mission_entry_predicate mission_name, const mission_name_type name_match_mode)
 {
-	auto mission_list = build_mission_list(1);
-	const char *found = nullptr;
-
-	range_for (auto &i, mission_list)
-		if (!d_stricmp(mission_name, &*i.filename))
+	auto &&mission_list = build_mission_list(mission_filter_mode::include_anarchy);
+	{
+		range_for (auto &i, mission_list)
 		{
-			found = load_mission(&i);
-			break;
+			switch (name_match_mode)
+			{
+				case mission_name_type::basename:
+					if (!d_stricmp(mission_name.filesystem_name, &*i.filename))
+						return load_mission(&i);
+					continue;
+				case mission_name_type::pathname:
+				case mission_name_type::guess:
+					if (const auto r = compare_mission_by_pathname(mission_name, i))
+						return load_mission(r);
+					continue;
+				default:
+					return "Unhandled load mission type";
+			}
 		}
-	return found;
+	}
+	if (name_match_mode == mission_name_type::guess)
+	{
+		const auto p = strrchr(mission_name.filesystem_name, '/');
+		const auto &guess_predicate = p
+			? mission_name.with_filesystem_name(p + 1)
+			: mission_name;
+		range_for (auto &i, mission_list)
+		{
+			if (const auto r = compare_mission_by_guess(guess_predicate, i))
+			{
+				con_printf(CON_NORMAL, "%s:%u: request for guessed mission name \"%s\" found \"%s\"", __FILE__, __LINE__, mission_name.filesystem_name, r->path.c_str());
+				return load_mission(r);
+			}
+		}
+	}
+	return "No matching mission found in\ninstalled mission list.";
+}
+
 }
 
 namespace {
 
-class mission_menu
+template <typename tag>
+class unique_menu_tagged_string : std::unique_ptr<char[]>
 {
-	mission_list_type mls;
 public:
+	unique_menu_tagged_string(std::unique_ptr<char[]> p) :
+		std::unique_ptr<char[]>(std::move(p))
+	{
+	}
+	using std::unique_ptr<char[]>::get;
+	operator menu_tagged_string<tag>() const &
+	{
+		return {get()};
+	}
+	operator menu_tagged_string<tag>() const && = delete;
+};
+
+struct mission_menu : listbox
+{
 	static constexpr char listbox_go_up[] = "<..>";
 	using callback_type = window_event_result (*)(void);
+	/* The top level menu stores the mission data in a member variable.
+	 * When this class is the base of toplevel_mission_menu, this
+	 * reference points to that member variable in
+	 * toplevel_mission_menu.
+	 *
+	 * Subdirectory menus do not store a copy of the mission data, and
+	 * instead store a reference to the mission data in the top level
+	 * menu.  When this class is the base of subdirectory_mission_menu,
+	 * this reference points to the member variable in the
+	 * toplevel_mission_menu that created this subdirectory_mission_menu.
+	 *
+	 * The data is not reference counted, because the top level menu
+	 * always outlives the subdirectory menus.
+	 */
 	const mission_list_type &ml;
+	/* listbox stores an unowned pointer to the string pointers that it
+	 * uses.  This member variable stores an owned pointer to the same
+	 * string pointers, so that the string pointers persist for the life
+	 * of the listbox.  The strings are stored elsewhere.
+	 */
 	const std::unique_ptr<const char *[]> listbox_strings;
-	const RAIIdmem<char[]> title;
+	/* listbox stores an unowned pointer to the title string, since some
+	 * listboxes use statically allocated strings.  This member variable
+	 * owns the storage for this listbox's title.
+	 */
+	const unique_menu_tagged_string<menu_title_tag> title;
 	const callback_type when_selected;
-	listbox *containing_listbox = nullptr;
+	virtual window_event_result callback_handler(const d_event &, window_event_result) override;
+	mission_menu(const mission_list_type &rml, const std::size_t count_name_pointer_strings, std::unique_ptr<const char *[]> &&name_pointer_strings, const char *const message, callback_type when_selected, mission_menu *const parent, const int default_item, grs_canvas &canvas) :
+		mission_menu(rml, count_name_pointer_strings, std::move(name_pointer_strings), prepare_title(message, rml), when_selected, parent, default_item, canvas)
+	{
+	}
+protected:
 	mission_menu *parent = nullptr;
-	mission_menu(mission_list_type &&rml, std::unique_ptr<const char *[]> &&mn, const char *const message, const callback_type ws) :
-		mls(std::move(rml)), ml(mls), listbox_strings(std::move(mn)),
-		title(prepare_title(message, ml)), when_selected(ws)
+	mission_menu(const mission_list_type &rml, const std::size_t count_name_pointer_strings, std::unique_ptr<const char *[]> &&name_pointer_strings, unique_menu_tagged_string<menu_title_tag> title_parameter, callback_type when_selected, mission_menu *const parent, const int default_item, grs_canvas &canvas) :
+		listbox(default_item, count_name_pointer_strings, name_pointer_strings.get(), title_parameter, canvas, 1),
+		ml(rml), listbox_strings(std::move(name_pointer_strings)),
+		title(std::move(title_parameter)),
+		when_selected(when_selected), parent(parent)
 	{
 	}
-	mission_menu(const mission_list_type *const p, std::unique_ptr<const char *[]> &&mn, const char *const message, const callback_type ws, mission_menu *const parent_menu) :
-		ml(*p), listbox_strings(std::move(mn)),
-		title(prepare_title(message, ml)), when_selected(ws),
-		parent(parent_menu)
-	{
-	}
-	bool is_submenu() const
-	{
-		return parent != nullptr;
-	}
-	static RAIIdmem<char[]> prepare_title(const char *const message, const mission_list_type &ml)
+	static unique_menu_tagged_string<menu_title_tag> prepare_title(const char *const message, const mission_list_type &ml)
 	{
 		mission_subdir_stats ss;
 		ss.count(ml);
-		array<char, 12> dirbuf;
+		std::array<char, 12> dirbuf;
 		char buf[128];
-		snprintf(buf, sizeof(buf), "%s\n[%sMSN:LOCAL %zu; TOTAL %zu]", message, prepare_mission_list_count_dirbuf(dirbuf, ss.immediate_directories), ss.immediate_missions, ss.total_missions);
-		return RAIIdmem<char[]>(d_strdup(buf));
+		const auto r = 1u + std::snprintf(buf, sizeof(buf), "%s\n[%sMSN:LOCAL %zu; TOTAL %zu]", message, prepare_mission_list_count_dirbuf(dirbuf, ss.immediate_directories), ss.immediate_missions, ss.total_missions);
+		unique_menu_tagged_string<menu_title_tag> p = std::make_unique<char[]>(r);
+		std::memcpy(p.get(), buf, r);
+		return p;
 	}
+};
+
+struct toplevel_mission_menu_storage
+{
+protected:
+	const mission_list_type mission_list_storage;
+	toplevel_mission_menu_storage(mission_list_type &&rml) :
+		mission_list_storage(std::move(rml))
+	{
+	}
+};
+
+struct toplevel_mission_menu : toplevel_mission_menu_storage, mission_menu
+{
+public:
+	toplevel_mission_menu(mission_list_type &&rml, std::unique_ptr<const char *[]> &&name_pointer_strings, const char *const message, callback_type when_selected, const int default_item, grs_canvas &canvas) :
+		toplevel_mission_menu_storage(std::move(rml)),
+		mission_menu(mission_list_storage, mission_list_storage.size(), std::move(name_pointer_strings), message, when_selected, nullptr /* no parent for toplevel menu */, default_item, canvas)
+	{
+	}
+};
+
+struct subdirectory_mission_menu : mission_menu
+{
+	using mission_menu::mission_menu;
 };
 
 constexpr char mission_menu::listbox_go_up[];
@@ -1155,7 +1308,7 @@ struct mission_menu_create_state
 	unsigned initial_selection = UINT_MAX;
 	std::unique_ptr<mission_menu_create_state> submenu;
 	mission_menu_create_state(const std::size_t len) :
-		listbox_strings(make_unique<const char *[]>(len))
+		listbox_strings(std::make_unique<const char *[]>(len))
 	{
 	}
 	mission_menu_create_state(mission_menu_create_state &&) = default;
@@ -1163,18 +1316,17 @@ struct mission_menu_create_state
 
 }
 
-static window_event_result mission_menu_handler(listbox *const lb, const d_event &event, mission_menu *const mm)
+window_event_result mission_menu::callback_handler(const d_event &event, window_event_result)
 {
 	switch (event.type)
 	{
 		case EVENT_WINDOW_CREATED:
-			mm->containing_listbox = lb;
 			break;
 		case EVENT_NEWMENU_SELECTED:
 		{
 			const auto raw_citem = static_cast<const d_select_event &>(event).citem;
 			auto citem = raw_citem;
-			if (mm->is_submenu())
+			if (parent)
 			{
 				if (citem == 0)
 				{
@@ -1182,7 +1334,7 @@ static window_event_result mission_menu_handler(listbox *const lb, const d_event
 					 * not implicitly closed during handling of
 					 * EVENT_WINDOW_CLOSE.
 					 */
-					mm->parent = nullptr;
+					parent = nullptr;
 					return window_event_result::close;
 				}
 				/* Adjust for the "Go up" placeholder item */
@@ -1190,41 +1342,42 @@ static window_event_result mission_menu_handler(listbox *const lb, const d_event
 			}
 			if (citem >= 0)
 			{
-				auto &mli = mm->ml[citem];
+				auto &mli = ml[citem];
 				if (!mli.directory.empty())
 				{
-					auto listbox_strings = make_unique<const char *[]>(mli.directory.size() + 1);
-					listbox_strings[0] = mm->listbox_go_up;
+					/* Increment by 1 to allow the pseudo-entry
+					 * `listbox_go_up`.
+					 */
+					const std::size_t count_name_pointer_strings = mli.directory.size() + 1;
+					auto listbox_strings = std::make_unique<const char *[]>(count_name_pointer_strings);
+					listbox_strings[0] = listbox_go_up;
 					const auto a = [](const mle &m) -> const char * {
 						return m.mission_name;
 					};
 					std::transform(mli.directory.begin(), mli.directory.end(), &listbox_strings[1], a);
-					const auto pls = listbox_strings.get();
-					auto submm = make_unique<mission_menu>(&mli.directory, std::move(listbox_strings), mli.path.c_str(), mm->when_selected, mm);
-					const auto pmm = submm.get();
-					newmenu_listbox1(pmm->title.get(), pmm->ml.size() + 1, pls, 1, 0, mission_menu_handler, std::move(submm));
+					auto submm = window_create<subdirectory_mission_menu>(mli.directory, count_name_pointer_strings, std::move(listbox_strings), mli.path.c_str(), when_selected, this, 0, grd_curscreen->sc_canvas);
+					(void)submm;
 					return window_event_result::handled;
 				}
 				// Chose a mission
 				else if (const auto errstr = load_mission(&mli))
 				{
-					nm_messagebox(nullptr, 1, TXT_OK, "%s\n\n%s\n\n%s", TXT_MISSION_ERROR, errstr, mli.path.c_str());
+					nm_messagebox(menu_title{nullptr}, 1, TXT_OK, "%s\n\n%s\n\n%s", TXT_MISSION_ERROR, errstr, mli.path.c_str());
 					return window_event_result::handled;	// stay in listbox so user can select another one
 				}
-				CGameCfg.LastMission.copy_if(mm->listbox_strings[raw_citem]);
+				CGameCfg.LastMission.copy_if(listbox_strings[raw_citem]);
 			}
-			return (*mm->when_selected)();
+			return (*when_selected)();
 		}
 		case EVENT_WINDOW_CLOSE:
 			/* If the user dismisses the listbox by pressing ESCAPE,
 			 * do not close the parent listbox.
 			 */
-			if (listbox_get_citem(lb) != -1)
-				if (const auto parent = mm->parent)
+			if (listbox_get_citem(*this) != -1)
+				if (parent)
 				{
-					window_close(listbox_get_window(parent->containing_listbox));
+					window_close(parent);
 				}
-			std::default_delete<mission_menu>()(mm);
 			break;
 		default:
 			break;
@@ -1233,42 +1386,63 @@ static window_event_result mission_menu_handler(listbox *const lb, const d_event
 	return window_event_result::ignored;
 }
 
-using mission_menu_create_state_ptr = std::unique_ptr<mission_menu_create_state>;
+namespace {
 
-static mission_menu_create_state_ptr prepare_mission_menu_state(const mission_list_type &mission_list, const char *const LastMission, const std::size_t extra_strings)
+/* Reserve an element to allow the pseudo-entry `listbox_go_up`.
+ */
+constexpr std::integral_constant<std::size_t, 1> mission_subdirectory_extra_strings{};
+
+static std::unique_ptr<mission_menu_create_state> prepare_mission_menu_state(const mission_list_type &mission_list, const char *const LastMission, const std::size_t extra_strings)
 {
 	auto mission_name_to_select = LastMission;
-	auto p = make_unique<mission_menu_create_state>(mission_list.size() + extra_strings);
+	auto p = std::make_unique<mission_menu_create_state>(mission_list.size() + extra_strings);
 	auto &create_state = *p.get();
 	auto listbox_strings = create_state.listbox_strings.get();
 	std::fill_n(listbox_strings, extra_strings, nullptr);
 	listbox_strings += extra_strings;
-	range_for (auto &&e, enumerate(mission_list))
+	for (auto &&[idx, mli] : enumerate(mission_list))
 	{
-		auto &mli = e.value;
 		const char *const mission_name = mli.mission_name;
 		*listbox_strings++ = mission_name;
 		if (!mission_name_to_select)
+			/* Once the mission to select has been found, copy subsequent
+			 * mission names, but skip all the other logic.  There is no need
+			 * to examine subdirectories, because that examination is only for
+			 * finding the mission to select.
+			 */
 			continue;
 		if (!mli.directory.empty())
 		{
-			auto &&substate = prepare_mission_menu_state(mli.directory, mission_name_to_select, 1);
+			/* If this entry represents a subdirectory, prepare a corresponding
+			 * inner state for it.
+			 */
+			auto &&substate = prepare_mission_menu_state(mli.directory, mission_name_to_select, mission_subdirectory_extra_strings);
 			if (substate->initial_selection == UINT_MAX)
+				/* If the subdirectory did not contain the target mission, then
+				 * discard the subdirectory state.  State is only needed and
+				 * maintained for the directories that must be traversed on the
+				 * path to the target mission, because only those directories
+				 * will be automatically opened in the mission choosing dialog.
+				 */
 				continue;
 			substate->listbox_strings[0] = mission_menu::listbox_go_up;
 			create_state.submenu = std::move(substate);
 		}
 		else if (strcmp(mission_name, mission_name_to_select))
 			continue;
-		create_state.initial_selection = e.idx;
+		create_state.initial_selection = idx;
 		mission_name_to_select = nullptr;
 	}
 	return p;
 }
 
-int select_mission(int anarchy_mode, const char *message, window_event_result (*when_selected)(void))
+}
+
+namespace dsx {
+
+int select_mission(const mission_filter_mode mission_filter, const menu_title message, window_event_result (*when_selected)(void))
 {
-	auto mission_list = build_mission_list(anarchy_mode);
+	auto &&mission_list = build_mission_list(mission_filter);
 	int new_mission_num;
 
     if (mission_list.size() <= 1)
@@ -1284,9 +1458,8 @@ int select_mission(int anarchy_mode, const char *message, window_event_result (*
 		auto &create_state = *create_state_ptr.get();
 		mission_menu *parent_mission_menu;
 		{
-			auto mm = make_unique<mission_menu>(std::move(mission_list), std::move(create_state.listbox_strings), message, when_selected);
-			parent_mission_menu = mm.get();
-			newmenu_listbox1(message, parent_mission_menu->ml.size(), parent_mission_menu->listbox_strings.get(), 1, create_state.initial_selection == UINT_MAX ? 0 : create_state.initial_selection, mission_menu_handler, std::move(mm));
+			auto mm = window_create<toplevel_mission_menu>(std::move(mission_list), std::move(create_state.listbox_strings), message, when_selected, create_state.initial_selection == UINT_MAX ? 0 : create_state.initial_selection, grd_curscreen->sc_canvas);
+			parent_mission_menu = mm;
 		}
 		for (auto parent_state = &create_state; const auto substate = parent_state->submenu.get(); parent_state = substate)
 		{
@@ -1296,10 +1469,8 @@ int select_mission(int anarchy_mode, const char *message, window_event_result (*
 			if (parent_initial_selection >= parent_mission_list_size)
 				break;
 			const auto &substate_mission_list = parent_mission_menu->ml[parent_initial_selection];
-			auto mm = make_unique<mission_menu>(&substate_mission_list.directory, std::move(substate->listbox_strings), substate_mission_list.path.c_str(), when_selected, parent_mission_menu);
-			const auto pmm = mm.get();
-			parent_mission_menu = pmm;
-			newmenu_listbox1(pmm->title.get(), pmm->ml.size() + 1, pmm->listbox_strings.get(), 1, substate->initial_selection + 1, mission_menu_handler, std::move(mm));
+			auto submm = window_create<subdirectory_mission_menu>(substate_mission_list.directory, substate_mission_list.directory.size() + mission_subdirectory_extra_strings, std::move(substate->listbox_strings), substate_mission_list.path.c_str(), when_selected, parent_mission_menu, 0, grd_curscreen->sc_canvas);
+			parent_mission_menu = submm;
 		}
     }
 
@@ -1307,6 +1478,7 @@ int select_mission(int anarchy_mode, const char *message, window_event_result (*
 }
 
 #if DXX_USE_EDITOR
+namespace {
 static int write_mission(void)
 {
 	auto &msn_extension =
@@ -1314,14 +1486,14 @@ static int write_mission(void)
 	(Current_mission->descent_version != Mission::descent_version_type::descent1) ? MISSION_EXTENSION_DESCENT_II :
 #endif
 	MISSION_EXTENSION_DESCENT_I;
-	array<char, PATH_MAX> mission_filename;
+	std::array<char, PATH_MAX> mission_filename;
 	snprintf(mission_filename.data(), mission_filename.size(), "%s%s", Current_mission->path.c_str(), msn_extension);
 	
-	auto &&mfile = PHYSFSX_openWriteBuffered(mission_filename.data());
+	auto &&mfile = PHYSFSX_openWriteBuffered(mission_filename.data()).first;
 	if (!mfile)
 	{
 		PHYSFS_mkdir(MISSION_DIR);	//try making directory - in *write* path
-		mfile = PHYSFSX_openWriteBuffered(mission_filename.data());
+		mfile = PHYSFSX_openWriteBuffered(mission_filename.data()).first;
 		if (!mfile)
 			return 0;
 	}
@@ -1351,23 +1523,22 @@ static int write_mission(void)
 
 	PHYSFSX_printf(mfile, "type = %s\n", Current_mission->anarchy_only_flag ? "anarchy" : "normal");
 
-	if (Briefing_text_filename[0])
-		PHYSFSX_printf(mfile, "briefing = %s\n", static_cast<const char *>(Briefing_text_filename));
+	if (Current_mission->briefing_text_filename[0])
+		PHYSFSX_printf(mfile, "briefing = %s\n", static_cast<const char *>(Current_mission->briefing_text_filename));
 
-	if (Ending_text_filename[0])
-		PHYSFSX_printf(mfile, "ending = %s\n", static_cast<const char *>(Ending_text_filename));
+	if (Current_mission->ending_text_filename[0])
+		PHYSFSX_printf(mfile, "ending = %s\n", static_cast<const char *>(Current_mission->ending_text_filename));
 
-	PHYSFSX_printf(mfile, "num_levels = %i\n", Last_level);
+	PHYSFSX_printf(mfile, "num_levels = %i\n", Current_mission->last_level);
 
-	range_for (auto &i, unchecked_partial_range(Level_names.get(), Last_level))
-		PHYSFSX_printf(mfile, "%s\n", static_cast<const char *>(i));
+	for (const char *const i : unchecked_partial_range(Current_mission->level_names.get(), Current_mission->last_level))
+		PHYSFSX_printf(mfile, "%s\n", i);
 
-	if (N_secret_levels)
+	if (const auto n_secret_levels = Current_mission->n_secret_levels)
 	{
-		PHYSFSX_printf(mfile, "num_secrets = %i\n", N_secret_levels);
-
-		for (int i = 0; i < N_secret_levels; i++)
-			PHYSFSX_printf(mfile, "%s,%i\n", static_cast<const char *>(Secret_level_names[i]), Secret_level_table[i]);
+		PHYSFSX_printf(mfile, "num_secrets = %i\n", n_secret_levels);
+		for (const auto &&[name, table_cell] : zip(unchecked_partial_range(Current_mission->secret_level_names.get(), n_secret_levels), unchecked_partial_range(Current_mission->secret_level_table.get(), n_secret_levels)))
+			PHYSFSX_printf(mfile, "%s,%i\n", static_cast<const char *>(name), table_cell);
 	}
 
 #if defined(DXX_BUILD_DESCENT_II)
@@ -1377,29 +1548,30 @@ static int write_mission(void)
 
 	return 1;
 }
+}
 
 void create_new_mission(void)
 {
-	Current_mission = make_unique<Mission>(Mission_path(MISSION_DIR "new_miss", sizeof(MISSION_DIR) - 1));		// limited to eight characters because of savegame format
+	Current_mission = std::make_unique<Mission>(Mission_path(MISSION_DIR "new_miss", sizeof(MISSION_DIR) - 1));		// limited to eight characters because of savegame format
 	Current_mission->mission_name.copy_if("Untitled");
 	Current_mission->builtin_hogsize = 0;
 	Current_mission->anarchy_only_flag = 0;
 	
-	Level_names = make_unique<d_fname[]>(1);
-	if (!Level_names)
+	Current_mission->level_names = std::make_unique<d_fname[]>(1);
+	if (!Current_mission->level_names)
 	{
 		Current_mission.reset();
 		return;
 	}
 
-	Level_names[0] = "GAMESAVE.LVL";
-	Last_level = 1;
-	N_secret_levels = 0;
-	Last_secret_level = 0;
-	Briefing_text_filename = {};
-	Ending_text_filename = {};
-	Secret_level_table.reset();
-	Secret_level_names.reset();
+	Current_mission->level_names[0] = "GAMESAVE.LVL";
+	Current_mission->last_level = 1;
+	Current_mission->n_secret_levels = 0;
+	Current_mission->last_secret_level = 0;
+	Current_mission->briefing_text_filename = {};
+	Current_mission->ending_text_filename = {};
+	Current_mission->secret_level_table.reset();
+	Current_mission->secret_level_names.reset();
 
 #if defined(DXX_BUILD_DESCENT_II)
 	if (Gamesave_current_version > 3)
@@ -1413,3 +1585,5 @@ void create_new_mission(void)
 	write_mission();
 }
 #endif
+
+}

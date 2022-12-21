@@ -34,11 +34,11 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 // Global pointer to current vertices, right now always Vertices.  Set in create_new_mine.
 imsegptridx_t Cursegp = segment_none;        // Pointer to current segment in mine.
 imsegptridx_t Markedsegp = segment_none;     // Marked segment, used in conjunction with *Cursegp to form joints.
-int Curside;             // Side index in 0..MAX_SIDES_PER_SEGMENT of active side.
-int Curedge;             // Current edge on current side, in 0..3
-int Curvert;             // Current vertex on current side, in 0..3
-int AttachSide = WFRONT; // Side on segment to attach.
-int Markedside;          // Marked side on Markedsegp.
+sidenum_t Curside;             // Side index in 0..MAX_SIDES_PER_SEGMENT of active side.
+side_relative_vertnum Curedge;             // Current edge on current side, in 0..3
+side_relative_vertnum Curvert;             // Current vertex on current side, in 0..3
+sidenum_t AttachSide = sidenum_t::WFRONT; // Side on segment to attach.
+sidenum_t Markedside;          // Marked side on Markedsegp.
 
 int Draw_all_segments;   // Set to 1 means draw_world draws all segments in Segments, else draw only connected segments
 
@@ -62,17 +62,8 @@ int         SegSizeMode = 1; // Mode = 0/1 = not/is legal to move bound vertices
 
 //the view for the different windows.
 editor_view LargeView = {0,1, NULL, i2f(100),IDENTITY_MATRIX,f1_0};
-#if ORTHO_VIEWS
-editor_view TopView   = {1,1, NULL, i2f(100),{{f1_0,0,0},{0,0,-f1_0},{0,f1_0,0}},f1_0};
-editor_view FrontView = {2,1, NULL, i2f(100),{{f1_0,0,0},{0,f1_0,0},{0,0,f1_0}},f1_0};
-editor_view RightView = {3,1, NULL, i2f(100),{{0,0,f1_0},{0,f1_0,0},{f1_0,0,0}},f1_0};
-#endif
 
-
-array<editor_view *, ORTHO_VIEWS ? 4 : 1> Views = {{&LargeView,
-#if ORTHO_VIEWS
-	&TopView,&FrontView,&RightView
-#endif
+std::array<editor_view *, 1> Views = {{&LargeView,
 	}};
 
 int	Lock_view_to_cursegp = 1;		// !0 means whenever cursegp changes, view it

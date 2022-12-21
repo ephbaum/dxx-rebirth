@@ -27,15 +27,12 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include <stdlib.h>
 #include "dxxerror.h"
 #include "inferno.h"
+#include "laser.h"
 #include "vclip.h"
 #include "physfs-serial.h"
 #include "render.h"
 #include "weapon.h"
 #include "object.h"
-#if defined(DXX_BUILD_DESCENT_II)
-#include "laser.h"
-#endif
-
 #include "compiler-range_for.h"
 
 //----------------- Variables for video clips -------------------
@@ -59,7 +56,7 @@ void draw_vclip_object(grs_canvas &canvas, const vcobjptridx_t obj, const fix ti
 		if (vc.flags & VF_ROD)
 			draw_object_tmap_rod(canvas, nullptr, obj, vc.frames[bitmapnum]);
 		else {
-			draw_object_blob(canvas, obj, vc.frames[bitmapnum]);
+			draw_object_blob(GameBitmaps, *Viewer, canvas, obj, vc.frames[bitmapnum]);
 		}
 	}
 }
@@ -73,7 +70,7 @@ void draw_weapon_vclip(const d_vclip_array &Vclip, const weapon_info_array &Weap
 	const auto play_time = Vclip[vclip_num].play_time;
 	fix modtime = lifeleft % play_time;
 
-	if (is_proximity_bomb_or_smart_mine_or_placed_mine(get_weapon_id(obj)))
+	if (is_proximity_bomb_or_player_smart_mine_or_placed_mine(get_weapon_id(obj)))
 	{		//make prox bombs spin out of sync
 		int objnum = obj;
 

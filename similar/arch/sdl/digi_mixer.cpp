@@ -14,6 +14,8 @@
  *  -- MD2211 (2006-10-12)
  */
 
+#include <bitset>
+#include <span>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -35,46 +37,112 @@
 #include "maths.h"
 #include "piggy.h"
 #include "u_mem.h"
-
-#include "compiler-make_unique.h"
-
-namespace dsx {
+#include <memory>
+#include "d_bitset.h"
+#include "d_range.h"
+#include "d_underlying_value.h"
 
 #define MIX_DIGI_DEBUG 0
 #define MIX_OUTPUT_FORMAT	AUDIO_S16
 #define MIX_OUTPUT_CHANNELS	2
 
-#define MAX_SOUND_SLOTS 64
 #if !((defined(__APPLE__) && defined(__MACH__)) || defined(macintosh))
 #define SOUND_BUFFER_SIZE 2048
 #else
 #define SOUND_BUFFER_SIZE 1024
 #endif
-#define MIN_VOLUME 10
+
+namespace dcx {
 
 namespace {
 
+template <typename T>
+class unique_span : std::unique_ptr<T[]>
+{
+	using base_type = std::unique_ptr<T[]>;
+	std::size_t extent;
+public:
+	unique_span(const std::size_t e) :
+		base_type(std::make_unique<T[]>(e)),
+		extent(e)
+	{
+	}
+	unique_span(unique_span &&) = default;
+	using base_type::get;
+	/* Require an lvalue input, since the returned pointer is borrowed from
+	 * this object.  If the method is called on an rvalue input, then the
+	 * unique_ptr would be destroyed and free the memory before the returned
+	 * span was destroyed, which would leave the span dangling.
+	 */
+	[[nodiscard]]
+	std::span<T> span() &
+	{
+		return {get(), extent};
+	}
+	[[nodiscard]]
+	std::span<const T> span() const &
+	{
+		return {get(), extent};
+	}
+	std::span<const T> span() const && = delete;
+};
+
+enumerated_bitset<64, sound_channel> channels;
+
+/* channel management */
+static sound_channel digi_mixer_find_channel(const enumerated_bitset<64, sound_channel> &channels, const unsigned max_channels)
+{
+	uint8_t i{};
+	for (; i < max_channels; ++i)
+		if (!channels[(sound_channel{i})])
+			break;
+	return sound_channel{i};
+}
+
 struct RAIIMix_Chunk : public Mix_Chunk
 {
+	RAIIMix_Chunk() = default;
 	~RAIIMix_Chunk()
 	{
 		delete [] abuf;
 	}
+	RAIIMix_Chunk(const RAIIMix_Chunk &) = delete;
+	RAIIMix_Chunk &operator=(const RAIIMix_Chunk &) = delete;
 };
+
+static uint8_t fix2byte(const fix f)
+{
+	if (f >= UINT8_MAX << 8)
+		/* Values greater than this would produce incorrect results if
+		 * shifted and truncated.  As a special case, coerce such values
+		 * to the largest representable return value.
+		 */
+		return UINT8_MAX;
+	return f >> 8;
+}
+
+uint8_t digi_initialised;
+unsigned digi_mixer_max_channels = std::size(channels);
+
+void digi_mixer_free_channel(const int channel_num)
+{
+	if (const std::size_t u = channel_num; channels.valid_index(u))
+		channels.reset(static_cast<sound_channel>(channel_num));
+}
 
 }
 
-static int digi_initialised = 0;
-static int digi_mixer_max_channels = MAX_SOUND_SLOTS;
-static inline int fix2byte(fix f) { return (f / 256) % 256; }
-static array<RAIIMix_Chunk, MAX_SOUNDS> SoundChunks;
-static array<uint8_t, MAX_SOUND_SLOTS> channels;
+}
+
+namespace dsx {
+
+static std::array<RAIIMix_Chunk, MAX_SOUNDS> SoundChunks;
 
 /* Initialise audio */
 int digi_mixer_init()
 {
 #if defined(DXX_BUILD_DESCENT_II)
-	unsigned
+	const unsigned
 #endif
 	digi_sample_rate = SAMPLE_RATE_44K;
 
@@ -92,8 +160,9 @@ int digi_mixer_init()
 	}
 
 	digi_mixer_max_channels = Mix_AllocateChannels(digi_mixer_max_channels);
-	channels = {};
+	channels.reset();
 	Mix_Pause(0);
+	Mix_ChannelFinished(digi_mixer_free_channel);
 
 	digi_initialised = 1;
 
@@ -101,6 +170,10 @@ int digi_mixer_init()
 
 	return 0;
 }
+
+}
+
+namespace dcx {
 
 /* Shut down audio */
 void digi_mixer_close() {
@@ -112,136 +185,236 @@ void digi_mixer_close() {
 	Mix_CloseAudio();
 }
 
-/* channel management */
-static int digi_mixer_find_channel()
+namespace {
+
+/*
+ * Blackman windowed-sinc filter coefficients at 1/4 bandwidth of upsampled
+ * frequency. Chosen for linear phase and approximates ~10th order IIR
+ *
+ * MATLAB/Octave code:
+
+	N = 51;   % Num coeffs (odd)
+	B = 0.25;  % 1/4 band
+	half = (N-1)/2;
+	n = (-half:half); % the sample index
+	% Windowed sinc
+	h_ideal = 2 * B .* sinc(B*n);
+	h_win = blackman(N);
+	b = h_win .* h_ideal.';
+	% Convert to fix point to ultimately apply to signed 16-bit data
+	b_s16 = int32(round(b * (2^16 -1)));  % coeffs!
+
+ */
+constexpr std::size_t FILTER_LEN = 51;
+static constexpr std::array<int32_t, FILTER_LEN> coeffs_quarterband{{
+		0, 0, -7, -25, -35, 0, 94, 200, 205, 0, -395, -751, -702, 0, 1178, 2127,
+		1907, 0, -3050, -5490, -5011, 0, 9275, 20326, 29311, 32767, 29311,
+		20326, 9275, 0, -5011, -5490, -3050, 0, 1907, 2127, 1178, 0, -702,
+		-751, -395, 0, 205, 200, 94, 0, -35, -25, -7, 0, 0
+}},
+// Coefficient set for half-band (e.g. 22050 -> 44100)
+coeffs_halfband{{
+		0, 0, -11, 0, 49, 0, -133, 0, 290, 0, -558, 0, 992, 0, -1666, 0, 2697, 0,
+		-4313, 0, 7086, 0, -13117, 0, 41452, 65535, 41452, 0, -13117, 0, 7086, 0,
+		-4313, 0, 2697, 0, -1666, 0, 992, 0, -558, 0, 290, 0, -133, 0, 49, 0, -11,
+		0, 0
+}};
+
+// Fixed-point FIR filtering
+// Not optimal: consider optimization with 1/4, 1/2 band filters, and symmetric kernels
+static auto filter_fir(const unique_span<int16_t> signal_storage, const std::span<const int32_t, FILTER_LEN> coeffs)
 {
-	for (int i = 0; i < digi_mixer_max_channels; i++)
-		if (channels[i] == 0)
-			return i;
-	return -1;
+	const auto signal{signal_storage.span()};
+	const std::size_t outsize = signal.size();
+	unique_span<int16_t> result(outsize);
+	const auto output{result.span()};
+	// A FIR filter is just a 1D convolution
+	// Keep only signalLen samples
+	for (const auto nn : xrange(outsize))
+	{
+		// Determine start/stop indices for convolved chunk
+		constexpr std::size_t coeffsLen = FILTER_LEN;
+		/* Avoid use of `std::max` here, since `nn + 1 < coeffsLen` would cause
+		 * unsigned subtraction to underflow.
+		 */
+		const std::size_t min_idx = (nn + 1 > coeffsLen ? nn + 1 - coeffsLen : 0u);
+		const std::size_t max_idx = nn;
+		if (min_idx > max_idx)
+			continue;
+
+		int32_t cur_output = 0;  // Increase bit size for fixed point expansion
+		// Sum over each sample * coefficient in this column
+		for (const auto kk : xrange(min_idx, max_idx + 1))
+		{
+			const auto product = int32_t{signal[kk]} * coeffs[nn - kk];
+			cur_output = cur_output + product;
+		}
+
+		// Save and fit back into int16
+		output[nn] = int16_t(cur_output >> 16);  // Arithmetic shift
+	}
+	return result;
 }
 
-static void digi_mixer_free_channel(int channel_num)
+static auto upsample(const std::span<const uint8_t> input, const std::size_t upsampledLen, const std::size_t factor)
 {
-	channels[channel_num] = 0;
+	/* Caution: `output` is sparsely initialized, so the value-initialization
+	 * from `make_unique` is necessary.  This site cannot be converted to
+	 * `make_unique_for_overwrite`.
+	 */
+	unique_span<int16_t> result(upsampledLen);
+	const auto output{result.span()};
+	for (const auto ii : xrange(input.size()))
+	{
+		// Save input sample, convert to signed, and scale
+		output[ii*factor] = 256 * (int16_t(input[ii]) - 128);
+	}
+	return result;
 }
+
+static auto replicateChannel(const unique_span<int16_t> input_storage, const std::size_t outsize, const std::size_t chFactor)
+{
+	const auto input{input_storage.span()};
+	auto result = std::make_unique<Uint8[]>(outsize);
+	const auto output = reinterpret_cast<int16_t *>(result.get());
+	for (const auto ii : xrange(input.size()))
+	{
+		// Duplicate and interleave as many channels as needed
+		std::fill_n(std::next(output, ii * chFactor), chFactor, input[ii]);
+	}
+	return result;
+}
+
+static std::unique_ptr<Uint8[]> convert_audio(const std::span<const uint8_t> input, const std::size_t outsize, const int upFactor, const std::size_t chFactor)
+{
+	const auto upsampledLen = input.size() * upFactor;
+
+	// We expect a 4x upscaling 11025 -> 44100
+	// But maybe 2x for d2x in some cases
+	auto &coeffs = upFactor ? coeffs_halfband : coeffs_quarterband;
+
+	return replicateChannel(
+	// First upsample
+	// Apply LPF filter to smooth out upscaled points
+	// There will be some uniform amplitude loss here, but less than -3dB
+		filter_fir(upsample(input, upsampledLen, upFactor), coeffs),
+		outsize, chFactor);
+}
+
+}
+
+}
+
+namespace dsx {
+
+namespace {
 
 /*
  * Play-time conversion. Performs output conversion only once per sound effect used.
  * Once the sound sample has been converted, it is cached in SoundChunks[]
  */
-static void mixdigi_convert_sound(int i)
+static void mixdigi_convert_sound(const unsigned i)
 {
-	SDL_AudioCVT cvt;
-	Uint8 *data = GameSounds[i].data;
-	Uint32 dlen = GameSounds[i].length;
-	int freq;
+	if (SoundChunks[i].abuf)
+		//proceed only if not converted yet
+		return;
+	const auto data = GameSounds[i].span();
 	int out_freq;
-	Uint16 out_format;
 	int out_channels;
 #if defined(DXX_BUILD_DESCENT_I)
 	out_freq = digi_sample_rate;
-	out_format = MIX_OUTPUT_FORMAT;
 	out_channels = MIX_OUTPUT_CHANNELS;
-	freq = GameSounds[i].freq;
+	const auto freq = GameSounds[i].freq;
 #elif defined(DXX_BUILD_DESCENT_II)
+	Uint16 out_format;
 	Mix_QuerySpec(&out_freq, &out_format, &out_channels); // get current output settings
-	freq = GameArg.SndDigiSampleRate;
+	const auto freq = GameArg.SndDigiSampleRate;
 #endif
 
-	if (SoundChunks[i].abuf) return; //proceed only if not converted yet
-
-	if (data)
+	if (!data.empty())
 	{
-		if (SDL_BuildAudioCVT(&cvt, AUDIO_U8, 1, freq, out_format, out_channels, out_freq) == -1)
-		{
-			con_printf(CON_URGENT, "%s:%u: SDL_BuildAudioCVT failed: sound=%i dlen=%u freq=%i out_format=%i out_channels=%i out_freq=%i", __FILE__, __LINE__, i, dlen, freq, out_format, out_channels, out_freq);
-			return;
-		}
+		// Create output memory
+		int upFactor = out_freq / freq;  // Should be integer, 2 or 4
+		int formatFactor = 2;  // U8 -> S16 is two bytes
+		int convertedSize = data.size() * upFactor * out_channels * formatFactor;
 
-		auto cvtbuf = make_unique<Uint8[]>(dlen * cvt.len_mult);
-		cvt.buf = cvtbuf.get();
-		cvt.len = dlen;
-		memcpy(cvt.buf, data, dlen);
-		if (SDL_ConvertAudio(&cvt))
-		{
-			con_printf(CON_URGENT, "%s:%u: SDL_ConvertAudio failed: sound=%i dlen=%u freq=%i out_format=%i out_channels=%i out_freq=%i", __FILE__, __LINE__, i, dlen, freq, out_format, out_channels, out_freq);
-			return;
-		}
+		auto cvtbuf = convert_audio(data, convertedSize, upFactor, out_channels);
 
 		SoundChunks[i].abuf = cvtbuf.release();
-		SoundChunks[i].alen = cvt.len_cvt;
+		SoundChunks[i].alen = convertedSize;
 		SoundChunks[i].allocated = 1;
 		SoundChunks[i].volume = 128; // Max volume = 128
 	}
 }
 
-// Volume 0-F1_0
-int digi_mixer_start_sound(short soundnum, fix volume, int pan, int looping, int loop_start, int loop_end, sound_object *)
-{
-	int mix_vol = fix2byte(fixmul(digi_volume, volume));
-	int mix_pan = fix2byte(pan);
-	int mix_loop = looping * -1;
-	int channel;
+}
 
-	if (!digi_initialised) return -1;
+// Volume 0-F1_0
+sound_channel digi_mixer_start_sound(short soundnum, const fix volume, const sound_pan pan, const int looping, const int loop_start, const int loop_end, sound_object *)
+{
+	if (!digi_initialised)
+		return sound_channel::None;
 
 	if (soundnum < 0)
-		return -1;
+		return sound_channel::None;
 
-	Assert(GameSounds[soundnum].data != reinterpret_cast<void *>(-1));
+	const unsigned max_channels = digi_mixer_max_channels;
+	if (max_channels > channels.size())
+		return sound_channel::None;
+	const auto c = digi_mixer_find_channel(channels, max_channels);
+	const auto channel = underlying_value(c);
+	if (channel >= max_channels)
+		return sound_channel::None;
 
 	mixdigi_convert_sound(soundnum);
 
+	const int mix_pan = fix2byte(static_cast<fix>(pan));
 #if MIX_DIGI_DEBUG
-	con_printf(CON_DEBUG, "digi_start_sound %d, volume %d, pan %d (start=%d, end=%d)", soundnum, mix_vol, mix_pan, loop_start, loop_end);
+	con_printf(CON_DEBUG, "digi_start_sound %d, volume=%d, pan %d (start=%d, end=%d)", soundnum, volume, mix_pan, loop_start, loop_end);
 #else
 	(void)loop_start;
 	(void)loop_end;
 #endif
 
-	channel = digi_mixer_find_channel();
-	if (channel < 0)
-		return -1;
-
+	const int mix_loop = looping * -1;
 	Mix_PlayChannel(channel, &(SoundChunks[soundnum]), mix_loop);
 	Mix_SetPanning(channel, 255-mix_pan, mix_pan);
-	if (volume > F1_0)
-		Mix_SetDistance(channel, 0);
-	else
-		Mix_SetDistance(channel, 255-mix_vol);
-	channels[channel] = 1;
-	Mix_ChannelFinished(digi_mixer_free_channel);
-
-	return channel;
+	Mix_SetDistance(channel, UINT8_MAX - fix2byte(volume));
+	channels.set(c);
+	return c;
 }
 
-void digi_mixer_set_channel_volume(int channel, int volume)
+}
+
+namespace dcx {
+
+void digi_mixer_set_channel_volume(const sound_channel channel, const int volume)
 {
-	int mix_vol = fix2byte(volume);
 	if (!digi_initialised) return;
-	Mix_SetDistance(channel, 255-mix_vol);
+	Mix_SetDistance(underlying_value(channel), UINT8_MAX - fix2byte(volume));
 }
 
-void digi_mixer_set_channel_pan(int channel, int pan)
+void digi_mixer_set_channel_pan(const sound_channel channel, const sound_pan pan)
 {
-	int mix_pan = fix2byte(pan);
-	Mix_SetPanning(channel, 255-mix_pan, mix_pan);
+	int mix_pan = fix2byte(static_cast<fix>(pan));
+	Mix_SetPanning(underlying_value(channel), 255 - mix_pan, mix_pan);
 }
 
-void digi_mixer_stop_sound(int channel) {
+void digi_mixer_stop_sound(const sound_channel channel)
+{
 	if (!digi_initialised) return;
+	const auto c = underlying_value(channel);
 #if MIX_DIGI_DEBUG
-	con_printf(CON_DEBUG, "digi_stop_sound %d", channel);
+	con_printf(CON_DEBUG, "%s:%u: %d", __FUNCTION__, __LINE__, c);
 #endif
-	Mix_HaltChannel(channel);
-	channels[channel] = 0;
+	Mix_HaltChannel(c);
+	channels.reset(channel);
 }
 
-void digi_mixer_end_sound(int channel)
+void digi_mixer_end_sound(const sound_channel channel)
 {
 	digi_mixer_stop_sound(channel);
-	channels[channel] = 0;
+	channels.reset(channel);
 }
 
 void digi_mixer_set_digi_volume( int dvolume )
@@ -251,12 +424,11 @@ void digi_mixer_set_digi_volume( int dvolume )
 	Mix_Volume(-1, fix2byte(dvolume));
 }
 
-int digi_mixer_is_channel_playing(const int c)
+int digi_mixer_is_channel_playing(const sound_channel c)
 {
 	return channels[c];
 }
 
-void digi_mixer_reset() {}
 void digi_mixer_stop_all_channels()
 {
 	channels = {};

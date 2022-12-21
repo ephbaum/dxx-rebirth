@@ -25,42 +25,44 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #pragma once
 
+#include <random>
 #include "pstypes.h"
 #include "maths.h"
 #include "vecmat.h"
 #include "segment.h"
 
-#ifdef __cplusplus
 #include <utility>
 #include "dxxsconf.h"
 #include "dsx-ns.h"
-#include "compiler-array.h"
+#include <array>
 
 namespace dcx {
 struct segmasks
 {
    short facemask;     //which faces sphere pokes through (12 bits)
-   sbyte sidemask;     //which sides sphere pokes through (6 bits)
-   sbyte centermask;   //which sides center point is on back of (6 bits)
+   sidemask_t sidemask;     //which sides sphere pokes through (6 bits)
+   sidemask_t centermask;   //which sides center point is on back of (6 bits)
 };
 
-struct segment_depth_array_t : public array<ubyte, MAX_SEGMENTS> {};
+struct segment_depth_array_t : public std::array<ubyte, MAX_SEGMENTS> {};
 
-struct side_vertnum_list_t : array<unsigned, 4> {};
+struct side_vertnum_list_t : std::array<vertnum_t, 4> {};
 
-struct vertex_array_list_t : array<unsigned, 6> {};
+struct vertnum_array_list_t : std::array<vertnum_t, 6> {};
+struct vertex_array_list_t : std::array<segment_relative_vertnum, 6> {};
 struct vertex_vertnum_pair
 {
-	unsigned vertex, vertnum;
+	vertnum_t vertex;
+	side_relative_vertnum vertnum;
 };
-using vertex_vertnum_array_list = array<vertex_vertnum_pair, 6>;
+using vertex_vertnum_array_list = std::array<vertex_vertnum_pair, 6>;
 
 #ifdef dsx
-__attribute_warn_unused_result
-uint_fast32_t find_connect_side(vcsegidx_t base_seg, const shared_segment &con_seg);
+[[nodiscard]]
+sidenum_t find_connect_side(vcsegidx_t base_seg, const shared_segment &con_seg);
 
-void compute_center_point_on_side(fvcvertptr &vcvertptr, vms_vector &vp, const shared_segment &sp, unsigned side);
-static inline vms_vector compute_center_point_on_side(fvcvertptr &vcvertptr, const shared_segment &sp, const unsigned side)
+void compute_center_point_on_side(fvcvertptr &vcvertptr, vms_vector &vp, const shared_segment &sp, sidenum_t side);
+static inline vms_vector compute_center_point_on_side(fvcvertptr &vcvertptr, const shared_segment &sp, const sidenum_t side)
 {
 	vms_vector v;
 	return compute_center_point_on_side(vcvertptr, v, sp, side), v;
@@ -74,8 +76,8 @@ static inline vms_vector compute_segment_center(fvcvertptr &vcvertptr, const sha
 }
 
 // Fill in array with four absolute point numbers for a given side
-void get_side_verts(side_vertnum_list_t &vertlist, const shared_segment &seg, unsigned sidenum);
-static inline side_vertnum_list_t get_side_verts(const shared_segment &segnum, const unsigned sidenum)
+void get_side_verts(side_vertnum_list_t &vertlist, const shared_segment &seg, sidenum_t sidenum);
+static inline side_vertnum_list_t get_side_verts(const shared_segment &segnum, const sidenum_t sidenum)
 {
 	side_vertnum_list_t r;
 	return get_side_verts(r, segnum, sidenum), r;
@@ -100,9 +102,9 @@ extern int	Doing_lighting_hack_flag;
 // Note: these are not absolute vertex numbers, but are relative to the segment
 // Note:  for triagulated sides, the middle vertex of each trianle is the one NOT
 //   adjacent on the diagonal edge
-uint_fast32_t create_all_vertex_lists(vertex_array_list_t &vertices, const shared_segment &seg, const shared_side &sidep, uint_fast32_t sidenum);
-__attribute_warn_unused_result
-static inline std::pair<uint_fast32_t, vertex_array_list_t> create_all_vertex_lists(const shared_segment &segnum, const shared_side &sidep, const uint_fast32_t sidenum)
+uint_fast32_t create_all_vertex_lists(vertex_array_list_t &vertices, const shared_segment &seg, const shared_side &sidep, sidenum_t sidenum);
+[[nodiscard]]
+static inline std::pair<uint_fast32_t, vertex_array_list_t> create_all_vertex_lists(const shared_segment &segnum, const shared_side &sidep, const sidenum_t sidenum)
 {
 	vertex_array_list_t r;
 	const auto &&n = create_all_vertex_lists(r, segnum, sidep, sidenum);
@@ -111,18 +113,18 @@ static inline std::pair<uint_fast32_t, vertex_array_list_t> create_all_vertex_li
 #endif
 
 //like create_all_vertex_lists(), but generate absolute point numbers
-uint_fast32_t create_abs_vertex_lists(vertex_array_list_t &vertices, const shared_segment &segnum, const shared_side &sidep, uint_fast32_t sidenum);
+uint_fast32_t create_abs_vertex_lists(vertnum_array_list_t &vertices, const shared_segment &segnum, const shared_side &sidep, sidenum_t sidenum);
 
-__attribute_warn_unused_result
-static inline std::pair<uint_fast32_t, vertex_array_list_t> create_abs_vertex_lists(const shared_segment &segnum, const shared_side &sidep, const uint_fast32_t sidenum)
+[[nodiscard]]
+static inline std::pair<uint_fast32_t, vertnum_array_list_t> create_abs_vertex_lists(const shared_segment &segnum, const shared_side &sidep, const sidenum_t sidenum)
 {
-	vertex_array_list_t r;
+	vertnum_array_list_t r;
 	const auto &&n = create_abs_vertex_lists(r, segnum, sidep, sidenum);
 	return {n, r};
 }
 
-__attribute_warn_unused_result
-static inline std::pair<uint_fast32_t, vertex_array_list_t> create_abs_vertex_lists(const shared_segment &segp, const uint_fast32_t sidenum)
+[[nodiscard]]
+static inline std::pair<uint_fast32_t, vertnum_array_list_t> create_abs_vertex_lists(const shared_segment &segp, const sidenum_t sidenum)
 {
 	return create_abs_vertex_lists(segp, segp.sides[sidenum], sidenum);
 }
@@ -133,9 +135,9 @@ static inline std::pair<uint_fast32_t, vertex_array_list_t> create_abs_vertex_li
 //      If there is one face, it has 4 vertices.
 //      If there are two faces, they both have three vertices, so face #0 is stored in vertices 0,1,2,
 //      face #1 is stored in vertices 3,4,5.
-void create_all_vertnum_lists(vertex_vertnum_array_list &vertnums, const shared_segment &seg, const shared_side &sidep, uint_fast32_t sidenum);
-__attribute_warn_unused_result
-static inline vertex_vertnum_array_list create_all_vertnum_lists(const shared_segment &segnum, const shared_side &sidep, const uint_fast32_t sidenum)
+void create_all_vertnum_lists(vertex_vertnum_array_list &vertnums, const shared_segment &seg, const shared_side &sidep, sidenum_t sidenum);
+[[nodiscard]]
+static inline vertex_vertnum_array_list create_all_vertnum_lists(const shared_segment &segnum, const shared_side &sidep, const sidenum_t sidenum)
 {
 	vertex_vertnum_array_list r;
 	return create_all_vertnum_lists(r, segnum, sidep, sidenum), r;
@@ -199,20 +201,20 @@ void extract_right_vector_from_segment(fvcvertptr &, const shared_segment &sp, v
 // to the center of the top face of the segment.
 void extract_up_vector_from_segment(fvcvertptr &, const shared_segment &sp, vms_vector &vp);
 
-void create_walls_on_side(fvcvertptr &, shared_segment &sp, unsigned sidenum);
+void create_walls_on_side(fvcvertptr &, shared_segment &sp, sidenum_t sidenum);
 
-void validate_segment_side(fvcvertptr &, vmsegptridx_t sp, unsigned sidenum);
+void validate_segment_side(fvcvertptr &, vmsegptridx_t sp, sidenum_t sidenum);
 #endif
 
-void pick_random_point_in_seg(fvcvertptr &vcvertptr, vms_vector &new_pos, const shared_segment &sp);
-static inline vms_vector pick_random_point_in_seg(fvcvertptr &vcvertptr, const shared_segment &sp)
+void pick_random_point_in_seg(fvcvertptr &vcvertptr, vms_vector &new_pos, const shared_segment &sp, std::minstd_rand);
+static inline vms_vector pick_random_point_in_seg(fvcvertptr &vcvertptr, const shared_segment &sp, std::minstd_rand r)
 {
 	vms_vector v;
-	return pick_random_point_in_seg(vcvertptr, v, sp), v;
+	return pick_random_point_in_seg(vcvertptr, v, sp, r), v;
 }
 
 int check_segment_connections(void);
-unsigned set_segment_depths(vcsegidx_t start_seg, const array<uint8_t, MAX_SEGMENTS> *limit, segment_depth_array_t &depths);
+unsigned set_segment_depths(vcsegidx_t start_seg, const std::array<uint8_t, MAX_SEGMENTS> *limit, segment_depth_array_t &depths);
 #if defined(DXX_BUILD_DESCENT_I)
 static inline void flush_fcd_cache() {}
 #elif defined(DXX_BUILD_DESCENT_II)
@@ -221,6 +223,4 @@ void apply_all_changed_light(const d_level_shared_destructible_light_state &Leve
 void	set_ambient_sound_flags(void);
 #endif
 }
-#endif
-
 #endif

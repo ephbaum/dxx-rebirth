@@ -19,7 +19,6 @@ struct g3s_point;
 
 namespace dcx {
 
-extern int Canvas_width,Canvas_height;	//the actual width & height
 extern fix Canv_w2,Canv_h2;				//fixed-point width,height/2
 
 #ifdef __powerc
@@ -28,7 +27,6 @@ extern double fCanv_w2, fCanv_h2;
 
 extern vms_vector Window_scale;
 
-extern fix View_zoom;
 extern vms_vector View_position,Matrix_scale;
 extern vms_matrix View_matrix,Unscaled_matrix;
 

@@ -32,21 +32,15 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "3d.h"
 #include "u_mem.h"
 #include "dxxerror.h"
-#include "key.h"
-#include "mouse.h"
 #include "func.h"
 #include "inferno.h"
 #include "editor/editor.h"
 #include "editor/esegment.h"
 #include "editor/medmisc.h"
-#include "gameseg.h"
 #include "segment.h"
 #include "render.h"
-#include "screens.h"
 #include "object.h"
-#include "texpage.h"		// For texpage_goto_first
 #include "meddraw.h"		// For draw_World
-#include "game.h"
 #include "kdefs.h"
 
 #if DXX_USE_OGL
@@ -118,6 +112,8 @@ int Gameview_lockstep;		//if set, view is locked to Curseg
 
 int ToggleLockstep()
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	Gameview_lockstep = !Gameview_lockstep;
     if (Gameview_lockstep == 0) {
         //if (keypress != KEY_L)
@@ -133,7 +129,6 @@ int ToggleLockstep()
 
 		Cursegp = imsegptridx(ConsoleObject->segnum);
 		med_create_new_segment_from_cursegp();
-		auto &Vertices = LevelSharedVertexState.get_vertices();
 		auto &vcvertptr = Vertices.vcptr;
 		set_view_target_from_segment(vcvertptr, Cursegp);
 		Update_flags = UF_ED_STATE_CHANGED;
@@ -143,10 +138,11 @@ int ToggleLockstep()
 
 int medlisp_delete_segment(void)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
     if (!med_delete_segment(Cursegp)) {
         if (Lock_view_to_cursegp)
 		{
-			auto &Vertices = LevelSharedVertexState.get_vertices();
 			auto &vcvertptr = Vertices.vcptr;
             set_view_target_from_segment(vcvertptr, Cursegp);
 		}
@@ -189,6 +185,8 @@ int medlisp_rotate_segment(void)
 
 int ToggleLockViewToCursegp(void)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	Lock_view_to_cursegp = !Lock_view_to_cursegp;
 	Update_flags = UF_ED_STATE_CHANGED;
 	if (Lock_view_to_cursegp) {
@@ -196,7 +194,6 @@ int ToggleLockViewToCursegp(void)
             diagnostic_message("[ctrl-V] View locked to Cursegp.");
         //else
         //    diagnostic_message("View locked to Cursegp.");
-		auto &Vertices = LevelSharedVertexState.get_vertices();
 		auto &vcvertptr = Vertices.vcptr;
         set_view_target_from_segment(vcvertptr, Cursegp);
     } else {
@@ -313,7 +310,8 @@ int medlisp_update_screen()
 		}
 
 		gr_set_current_canvas(render_canv);
-		render_frame(*grd_curcanv, 0);
+		window_rendered_data window;
+		render_frame(*grd_curcanv, 0, window);
 
 		Assert(render_canv->cv_bitmap.bm_w == show_canv->cv_bitmap.bm_w &&
 				 render_canv->cv_bitmap.bm_h == show_canv->cv_bitmap.bm_h);
@@ -342,12 +340,14 @@ void draw_world_from_game(void)
 }
 
 int UndoCommand()
-{   int u;
+{  
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
+	int u;
 
     u = undo();
     if (Lock_view_to_cursegp)
 	{
-		auto &Vertices = LevelSharedVertexState.get_vertices();
 		auto &vcvertptr = Vertices.vcptr;
 		set_view_target_from_segment(vcvertptr, Cursegp);
 	}
@@ -380,17 +380,18 @@ int ToggleAutosave()
 
 int AttachSegment()
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
    if (med_attach_segment(Cursegp, vmsegptr(&New_segment), Curside, AttachSide)==4) // Used to be WBACK instead of Curside
         diagnostic_message("Cannot attach segment - already a connection on current side.");
    else {
 		if (Lock_view_to_cursegp)
 		{
-			auto &Vertices = LevelSharedVertexState.get_vertices();
 			auto &vcvertptr = Vertices.vcptr;
 			set_view_target_from_segment(vcvertptr, Cursegp);
 		}
 		vm_angvec_make(&Seg_orientation,0,0,0);
-		Curside = WBACK;
+		Curside = sidenum_t::WBACK;
 		Update_flags |= UF_WORLD_CHANGED;
 	   autosave_mine(mine_filename);
 		undo_status[Autosave_count] = "Attach Segment UNDONE.";
@@ -399,22 +400,6 @@ int AttachSegment()
       }
 	return 1;
 }
-
-
-#if ORTHO_VIEWS
-int SyncLargeView()
-{
-	// Make large view be same as one of the orthogonal views.
-	Large_view_index = (Large_view_index + 1) % 3;  // keep in 0,1,2 for top, front, right
-	switch (Large_view_index) {
-		case 0: LargeView.ev_matrix = TopView.ev_matrix; break;
-		case 1: LargeView.ev_matrix = FrontView.ev_matrix; break;
-		case 2: LargeView.ev_matrix = RightView.ev_matrix; break;
-	}
-	Update_flags |= UF_VIEWPOINT_MOVED;
-	return 1;
-}
-#endif
 
 int CreateDefaultNewSegment()
 {

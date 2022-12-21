@@ -15,12 +15,18 @@
 #include "console.h"
 
 #include "dxxsconf.h"
-#include "compiler-array.h"
-#include "compiler-integer_sequence.h"
+#include <array>
+#include <utility>
+
+using namespace dcx;
+
+namespace {
 
 static unsigned short *backBuf1, *backBuf2;
 
 static void dispatchDecoder16(unsigned short **pFrame, unsigned char codeType, const unsigned char **pData, const unsigned char **pOffData, int *pDataRemain, int *curXb, int *curYb);
+
+}
 
 void decodeFrame16(unsigned char *pFrame, const unsigned char *pMap, int mapRemain, const unsigned char *pData, int dataRemain)
 {
@@ -84,6 +90,8 @@ void decodeFrame16(unsigned char *pFrame, const unsigned char *pMap, int mapRema
     }
 }
 
+namespace {
+
 static uint16_t GETPIXEL(const unsigned char **buf, int off)
 {
 	unsigned short val = (*buf)[0+off] | ((*buf)[1+off] << 8);
@@ -102,12 +110,12 @@ struct position_t
 	int x, y;
 };
 
-static inline constexpr position_t relClose(int i)
+static constexpr position_t relClose(int i)
 {
 	return {(i & 0xf) - 8, (i >> 4) - 8};
 }
 
-static inline constexpr position_t relFar0(int i, int sign)
+static constexpr position_t relFar0(int i, int sign)
 {
 	return {
 		sign * (8 + (i % 7)),
@@ -115,7 +123,7 @@ static inline constexpr position_t relFar0(int i, int sign)
 	};
 }
 
-static inline constexpr position_t relFar56(int i, int sign)
+static constexpr position_t relFar56(int i, int sign)
 {
 	return {
 		sign * (-14 + (i - 56) % 29),
@@ -123,18 +131,18 @@ static inline constexpr position_t relFar56(int i, int sign)
 	};
 }
 
-static inline constexpr position_t relFar(int i, int sign)
+static constexpr position_t relFar(int i, int sign)
 {
 	return (i < 56) ? relFar0(i, sign) : relFar56(i, sign);
 }
 
 struct lookup_table_t
 {
-	array<position_t, 256> close, far_p, far_n;
+	std::array<position_t, 256> close, far_p, far_n;
 };
 
 template <std::size_t... N>
-static inline constexpr lookup_table_t genLoopkupTable(index_sequence<N...>)
+static constexpr lookup_table_t genLoopkupTable(std::index_sequence<N...>)
 {
 	return lookup_table_t{
 		{{relClose(N)...}},
@@ -143,7 +151,7 @@ static inline constexpr lookup_table_t genLoopkupTable(index_sequence<N...>)
 	};
 }
 
-constexpr lookup_table_t lookup_table = genLoopkupTable(make_tree_index_sequence<256>());
+constexpr lookup_table_t lookup_table = genLoopkupTable(std::make_index_sequence<256>());
 
 static void copyFrame(unsigned short *pDest, unsigned short *pSrc)
 {
@@ -159,7 +167,7 @@ static void copyFrame(unsigned short *pDest, unsigned short *pSrc)
 
 static void patternRow4Pixels(unsigned short *pFrame,
                               unsigned char pat0, unsigned char pat1,
-                              const array<uint16_t, 4> &p)
+                              const std::array<uint16_t, 4> &p)
 {
     unsigned short mask=0x0003;
     unsigned short shift=0;
@@ -175,7 +183,7 @@ static void patternRow4Pixels(unsigned short *pFrame,
 
 static void patternRow4Pixels2(unsigned short *pFrame,
                                unsigned char pat0,
-                               const array<uint16_t, 4> &p)
+                               const std::array<uint16_t, 4> &p)
 {
     unsigned char mask=0x03;
     unsigned char shift=0;
@@ -210,7 +218,7 @@ static void patternRow4Pixels2(unsigned short *pFrame,
 }
 
 static void patternRow4Pixels2x1(unsigned short *pFrame, unsigned char pat,
-								 const array<uint16_t, 4> &p)
+								 const std::array<uint16_t, 4> &p)
 {
     unsigned char mask=0x03;
     unsigned char shift=0;
@@ -229,7 +237,7 @@ static void patternRow4Pixels2x1(unsigned short *pFrame, unsigned char pat,
 
 static void patternQuadrant4Pixels(unsigned short *pFrame,
 								   unsigned char pat0, unsigned char pat1, unsigned char pat2,
-								   unsigned char pat3, const array<uint16_t, 4> &p)
+								   unsigned char pat3, const std::array<uint16_t, 4> &p)
 {
     unsigned long mask = 0x00000003UL;
     int shift=0;
@@ -250,7 +258,7 @@ static void patternQuadrant4Pixels(unsigned short *pFrame,
 
 
 static void patternRow2Pixels(unsigned short *pFrame, unsigned char pat,
-							  const array<uint16_t, 4> &p)
+							  const std::array<uint16_t, 4> &p)
 {
     unsigned char mask=0x01;
 
@@ -262,7 +270,7 @@ static void patternRow2Pixels(unsigned short *pFrame, unsigned char pat,
 }
 
 static void patternRow2Pixels2(unsigned short *pFrame, unsigned char pat,
-							   const array<uint16_t, 4> &p)
+							   const std::array<uint16_t, 4> &p)
 {
     unsigned short pel;
     unsigned char mask=0x1;
@@ -295,7 +303,7 @@ static void patternRow2Pixels2(unsigned short *pFrame, unsigned char pat,
 }
 
 static void patternQuadrant2Pixels(unsigned short *pFrame, unsigned char pat0,
-								   unsigned char pat1, const array<uint16_t, 4> &p)
+								   unsigned char pat1, const std::array<uint16_t, 4> &p)
 {
     unsigned short mask = 0x0001;
     int i;
@@ -314,8 +322,8 @@ static void patternQuadrant2Pixels(unsigned short *pFrame, unsigned char pat0,
 
 static void dispatchDecoder16(unsigned short **pFrame, unsigned char codeType, const unsigned char **pData, const unsigned char **pOffData, int *pDataRemain, int *curXb, int *curYb)
 {
-	array<uint16_t, 4> p;
-	array<uint8_t, 4> pat;
+	std::array<uint16_t, 4> p;
+	std::array<uint8_t, 4> pat;
     int i, j, k;
     int x, y;
     unsigned short *pDstBak;
@@ -713,4 +721,6 @@ static void dispatchDecoder16(unsigned short **pFrame, unsigned char codeType, c
     }
 
     *pFrame = pDstBak+8;
+}
+
 }

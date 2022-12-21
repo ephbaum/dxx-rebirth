@@ -22,12 +22,10 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #include "u_mem.h"
 #include "gr.h"
-#include "grdef.h"
 #if DXX_USE_OGL
 #include "ogl_init.h"
 #endif
-
-#include "compiler-make_unique.h"
+#include <memory>
 
 namespace dcx {
 
@@ -36,7 +34,7 @@ std::unique_ptr<grs_screen> grd_curscreen;  //active screen
 
 grs_canvas_ptr gr_create_canvas(uint16_t w, uint16_t h)
 {
-	grs_canvas_ptr n = make_unique<grs_main_canvas>();
+	grs_canvas_ptr n = std::make_unique<grs_main_canvas>();
 	unsigned char *pixdata;
 	MALLOC(pixdata, unsigned char, MAX_BMP_SIZE(w, h));
 	gr_init_canvas(*n.get(), pixdata, bm_mode::linear, w, h);
@@ -45,7 +43,7 @@ grs_canvas_ptr gr_create_canvas(uint16_t w, uint16_t h)
 
 grs_subcanvas_ptr gr_create_sub_canvas(grs_canvas &canv, uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
-	auto n = make_unique<grs_subcanvas>();
+	auto n = std::make_unique<grs_subcanvas>();
 	gr_init_sub_canvas(*n.get(), canv, x, y, w, h);
 	return n;
 }
@@ -60,7 +58,7 @@ void gr_init_canvas(grs_canvas &canv, unsigned char *const pixdata, const bm_mod
 	gr_init_bitmap(canv.cv_bitmap, pixtype, 0, 0, w, h, wreal, pixdata);
 }
 
-void gr_init_sub_canvas(grs_canvas &n, grs_canvas &src, uint16_t x, uint16_t y, uint16_t w, uint16_t h)
+void gr_init_sub_canvas(grs_subcanvas &n, grs_canvas &src, uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
 	n.cv_fade_level = src.cv_fade_level;
 	n.cv_font = src.cv_font;
@@ -86,12 +84,12 @@ static unsigned g_cc_line[DXX_DEBUG_CURRENT_CANVAS_ORIGIN];
 static unsigned g_cc_which;
 #endif
 
-void (gr_set_default_canvas)(DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_N_DECL_VARS)
+void gr_set_default_canvas(DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_N_DEFN_VARS)
 {
 	(gr_set_current_canvas)(grd_curscreen->sc_canvas DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_L_PASS_VARS);
 }
 
-void (gr_set_current_canvas)(grs_canvas &canv DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_L_DECL_VARS)
+void gr_set_current_canvas(grs_canvas &canv DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_L_DEFN_VARS)
 {
 #if DXX_DEBUG_CURRENT_CANVAS_ORIGIN > 0
 	const auto which = g_cc_which;
@@ -102,17 +100,17 @@ void (gr_set_current_canvas)(grs_canvas &canv DXX_DEBUG_CURRENT_CANVAS_FILE_LINE
 	grd_curcanv = &canv;
 }
 
-void gr_set_current_canvas2(grs_canvas *canv DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_L_DECL_VARS)
+void gr_set_current_canvas2(grs_canvas *canv DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_L_DEFN_VARS)
 {
 	(gr_set_current_canvas_inline)(canv DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_L_PASS_VARS);
 }
 
-void gr_clear_canvas(grs_canvas &canvas, color_t color)
+void gr_clear_canvas(grs_canvas &canvas, const color_palette_index color)
 {
 	gr_rect(canvas, 0, 0, canvas.cv_bitmap.bm_w - 1, canvas.cv_bitmap.bm_h - 1, color);
 }
 
-void gr_settransblend(grs_canvas &canvas, const int fade_level, const gr_blend blend_func)
+void gr_settransblend(grs_canvas &canvas, const gr_fade_level fade_level, const gr_blend blend_func)
 {
 	canvas.cv_fade_level = fade_level;
 #if DXX_USE_OGL

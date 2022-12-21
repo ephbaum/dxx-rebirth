@@ -35,28 +35,25 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "editor/esegment.h"
 #include "editor/eobject.h"
 
-#include "objpage.h"
 #include "maths.h"
 #include "dxxerror.h"
 #include "kdefs.h"
-#include	"object.h"
+#include "object.h"
 #include "robot.h"
 #include "game.h"
-#include "ai.h"
 #include "bm.h"
 #include "3d.h"		//	For g3_point_to_vec
-#include	"fvi.h"
+#include "fvi.h"
+#include "vclip.h"
 
 #include "powerup.h"
-#include "fuelcen.h"
 #include "hostage.h"
-#include "medrobot.h"
 #include "player.h"
 #include "gameseg.h"
 #include "cntrlcen.h"
 
 #include "compiler-range_for.h"
-#include "segiter.h"
+#include "d_levelstate.h"
 
 #define	OBJ_SCALE		(F1_0/2)
 #define	OBJ_DEL_SIZE	(F1_0/2)
@@ -74,7 +71,7 @@ static objnum_t get_first_object(fvcobjptr &vcobjptr, const unique_segment &seg)
 }
 
 //returns the number of the next object in a segment, skipping the player
-static objnum_t get_next_object(const vmsegptr_t seg,objnum_t id)
+static objnum_t get_next_object(const unique_segment &seg, objnum_t id)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vcobjptr = Objects.vcptr;
@@ -110,7 +107,7 @@ static objnum_t get_next_object(const vmsegptr_t seg,objnum_t id)
 namespace dsx {
 
 //	------------------------------------------------------------------------------------
-int place_object(const vmsegptridx_t segp, const vms_vector &object_pos, short object_type, short object_id)
+int place_object(d_level_unique_object_state &LevelUniqueObjectState, const d_level_shared_polygon_model_state &LevelSharedPolygonModelState, const d_robot_info_array &Robot_info, const d_level_shared_segment_state &LevelSharedSegmentState, d_level_unique_segment_state &LevelUniqueSegmentState, const vmsegptridx_t segp, const vms_vector &object_pos, short object_type, short object_id)
 {
 	vms_matrix seg_matrix;
 
@@ -118,15 +115,14 @@ int place_object(const vmsegptridx_t segp, const vms_vector &object_pos, short o
 
 	imobjptridx_t objnum = object_none;
 	auto &Polygon_models = LevelSharedPolygonModelState.Polygon_models;
-	auto &Robot_info = LevelSharedRobotInfoState.Robot_info;
 	switch (object_type)
 	{
 
 		case OBJ_HOSTAGE:
 		{
-			objnum = obj_create(OBJ_HOSTAGE, -1, 
+			objnum = obj_create(LevelUniqueObjectState, LevelSharedSegmentState, LevelUniqueSegmentState, OBJ_HOSTAGE, -1, 
 					segp,object_pos,&seg_matrix,HOSTAGE_SIZE,
-					CT_NONE,MT_NONE,RT_HOSTAGE);
+					object::control_type::None, object::movement_type::None,RT_HOSTAGE);
 
 			if ( objnum == object_none)
 				return 0;
@@ -136,7 +132,7 @@ int place_object(const vmsegptridx_t segp, const vms_vector &object_pos, short o
 			// Fill in obj->id and other hostage info
 			obj->id = 0;
 
-			obj->control_type = CT_POWERUP;
+			obj->control_source = object::control_type::powerup;
 			
 			obj->rtype.vclip_info.vclip_num = Hostage_vclip_num[object_id];
 			obj->rtype.vclip_info.frametime = Vclip[obj->rtype.vclip_info.vclip_num].frame_time;
@@ -151,7 +147,7 @@ int place_object(const vmsegptridx_t segp, const vms_vector &object_pos, short o
 			else
 				hide_segment = segment_none;
 
-			objnum = robot_create(object_id, segp, object_pos,
+			objnum = robot_create(Robot_info, object_id, segp, object_pos,
 								&seg_matrix, Polygon_models[Robot_info[object_id].model_num].rad,
 								Robot_info[object_id].attack_type ?
 								//	robots which lunge forward to attack cannot have behavior type still.
@@ -181,9 +177,9 @@ int place_object(const vmsegptridx_t segp, const vms_vector &object_pos, short o
 		}
 		case OBJ_POWERUP:
 		{
-			objnum = obj_create(OBJ_POWERUP, object_id,
+			objnum = obj_create(LevelUniqueObjectState, LevelSharedSegmentState, LevelUniqueSegmentState, OBJ_POWERUP, object_id,
 					segp, object_pos, &seg_matrix, Powerup_info[object_id].size,
-					CT_POWERUP, MT_NONE, RT_POWERUP);
+					object::control_type::powerup, object::movement_type::None, RT_POWERUP);
 
 			if ( objnum == object_none)
 				return 0;
@@ -204,9 +200,15 @@ int place_object(const vmsegptridx_t segp, const vms_vector &object_pos, short o
 		}
 		case OBJ_CNTRLCEN: 
 		{
-			objnum = obj_create(OBJ_CNTRLCEN, object_id, segp, object_pos,
-					&seg_matrix, Polygon_models[object_id].rad,
-					CT_CNTRLCEN, MT_NONE, RT_POLYOBJ);
+			const auto model_num =
+#if defined(DXX_BUILD_DESCENT_I)
+			ObjId[object_type];
+#elif defined(DXX_BUILD_DESCENT_II)
+			Reactors[object_id].model_num;
+#endif
+			objnum = obj_create(LevelUniqueObjectState, LevelSharedSegmentState, LevelUniqueSegmentState, OBJ_CNTRLCEN, object_id, segp, object_pos,
+					&seg_matrix, Polygon_models[model_num].rad,
+					object::control_type::cntrlcen, object::movement_type::None, RT_POLYOBJ);
 
 			if ( objnum == object_none)
 				return 0;
@@ -215,19 +217,15 @@ int place_object(const vmsegptridx_t segp, const vms_vector &object_pos, short o
 
 			//Set polygon-object-specific data 
 			obj->shields = 0;	// stored in Reactor_strength or calculated
-#if defined(DXX_BUILD_DESCENT_I)
-			obj->rtype.pobj_info.model_num = ObjId[object_type];
-#elif defined(DXX_BUILD_DESCENT_II)
-			obj->rtype.pobj_info.model_num = Reactors[object_id].model_num;
-#endif
+			obj->rtype.pobj_info.model_num = model_num;
 			obj->rtype.pobj_info.subobj_flags = 0;
 
 			break;
 		}
 		case OBJ_PLAYER:	{
-			objnum = obj_create(OBJ_PLAYER, object_id, segp, object_pos,
+			objnum = obj_create(LevelUniqueObjectState, LevelSharedSegmentState, LevelUniqueSegmentState, OBJ_PLAYER, object_id, segp, object_pos,
 				&seg_matrix, Polygon_models[Player_ship->model_num].rad,
-				CT_NONE, MT_PHYSICS, RT_POLYOBJ);
+				object::control_type::None, object::movement_type::physics, RT_POLYOBJ);
 
 			if ( objnum == object_none)
 				return 0;
@@ -303,10 +301,11 @@ int ObjectMakeCoop(void)
 //	Place current object at center of current segment.
 int ObjectPlaceObject(void)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vmobjptr = Objects.vmptr;
 	int	old_cur_object_index;
-	int	rval;
 	if (Cur_object_type == OBJ_PLAYER)
 	{
 		int num_players = compute_num_players();
@@ -320,12 +319,11 @@ int ObjectPlaceObject(void)
 	}
 
 	//update_due_to_new_segment();
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
 	const auto cur_object_loc = compute_segment_center(vcvertptr, Cursegp);
 
 	old_cur_object_index = Cur_object_index;
-	rval = place_object(Cursegp, cur_object_loc, Cur_object_type, Cur_object_id);
+	const auto rval = place_object(LevelUniqueObjectState, LevelSharedPolygonModelState, LevelSharedRobotInfoState.Robot_info, LevelSharedSegmentState, LevelUniqueSegmentState, Cursegp, cur_object_loc, Cur_object_type, Cur_object_id);
 
 	if (old_cur_object_index != Cur_object_index)
 		vmobjptr(Cur_object_index)->rtype.pobj_info.tmap_override = -1;
@@ -338,15 +336,16 @@ int ObjectPlaceObject(void)
 //	Place current object at center of current segment.
 int ObjectPlaceObjectTmap(void)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
-	int	rval, old_cur_object_index;
-	//update_due_to_new_segment();
 	auto &Vertices = LevelSharedVertexState.get_vertices();
+	int	old_cur_object_index;
+	//update_due_to_new_segment();
 	auto &vcvertptr = Vertices.vcptr;
 	const auto cur_object_loc = compute_segment_center(vcvertptr, Cursegp);
 
 	old_cur_object_index = Cur_object_index;
-	rval = place_object(Cursegp, cur_object_loc, Cur_object_type, Cur_object_id);
+	const auto rval = place_object(LevelUniqueObjectState, LevelSharedPolygonModelState, LevelSharedRobotInfoState.Robot_info, LevelSharedSegmentState, LevelUniqueSegmentState, Cursegp, cur_object_loc, Cur_object_type, Cur_object_id);
 
 	if ((Cur_object_index != old_cur_object_index) && (Objects[Cur_object_index].render_type == RT_POLYOBJ))
 		Objects[Cur_object_index].rtype.pobj_info.tmap_override = CurrentTexture;
@@ -364,23 +363,25 @@ int ObjectSelectNextinSegment(void)
 
 	//Assert(Cur_object_seg == Cursegp);
 
-	const vmsegptr_t objsegp = Cursegp;
+	const unique_segment &objuseg = Cursegp;
 	if (Cur_object_index == object_none) {
-		Cur_object_index = objsegp->objects;
+		Cur_object_index = objuseg.objects;
 	} else {
 		if (Objects[Cur_object_index].segnum != Cursegp)
-			Cur_object_index = objsegp->objects;
+			Cur_object_index = objuseg.objects;
 	}
 
 
 	//Debug: make sure current object is in current segment
 	objnum_t id;
-	for (id=objsegp->objects;(id != Cur_object_index)  && (id != object_none);id=Objects[id].next);
+	for (id = objuseg.objects; id != Cur_object_index && id != object_none; id = Objects[id].next)
+	{
+	}
 	Assert(id == Cur_object_index);		//should have found object
 
 	//	Select the next object, wrapping back to start if we are at the end of the linked list for this segment.
 	if (id != object_none)
-		Cur_object_index = get_next_object(objsegp,Cur_object_index);
+		Cur_object_index = get_next_object(objuseg, Cur_object_index);
 
 	Update_flags |= UF_WORLD_CHANGED;
 
@@ -469,23 +470,22 @@ static int move_object_within_mine(fvmobjptr &vmobjptr, segment_array &Segments,
 {
 	range_for (const auto &&segp, Segments.vmptridx)
 	{
-		if (get_seg_masks(vcvertptr, obj->pos, segp, 0).centermask == 0) {
-			int	fate;
+		if (get_seg_masks(vcvertptr, obj->pos, segp, 0).centermask == sidemask_t{})
+		{
 			fvi_info	hit_info;
-			fvi_query fq;
 
 			//	See if the radius pokes through any wall.
-			fq.p0						= &obj->pos;
-			fq.startseg				= obj->segnum;
-			fq.p1						= &newpos;
-			fq.rad					= obj->size;
-			fq.thisobjnum			= object_none;
-			fq.ignore_obj_list.first = nullptr;
-			fq.flags					= 0;
-
-			fate = find_vector_intersection(fq, hit_info);
-
-			if (fate != HIT_WALL) {
+			const auto fate = find_vector_intersection(fvi_query{
+				obj->pos,
+				newpos,
+				fvi_query::unused_ignore_obj_list,
+				fvi_query::unused_LevelUniqueObjectState,
+				fvi_query::unused_Robot_info,
+				0,
+				object_none,
+			}, obj->segnum, obj->size, hit_info);
+			if (fate != fvi_hit_type::Wall)
+			{
 				if (segp != obj->segnum)
 					obj_relink(vmobjptr, Segments.vmptr, obj, segp);
 				obj->pos = newpos;
@@ -549,11 +549,12 @@ static int ObjectMoveFailed()
 
 static int ObjectMovePos(const vmobjptridx_t obj, vms_vector &&vec, int scale)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vmobjptr = Objects.vmptr;
 	vm_vec_normalize(vec);
 	const auto &&newpos = vm_vec_add(obj->pos, vm_vec_scale(vec, scale));
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
 	if (!verify_object_seg(vmobjptr, Segments, vcvertptr, obj, newpos))
 		obj->pos = newpos;
@@ -564,13 +565,14 @@ static int ObjectMovePos(const vmobjptridx_t obj, vms_vector &&vec, int scale)
 template <typename extract_type, int direction>
 static int ObjectMove()
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vmobjptridx = Objects.vmptridx;
 	const auto i = Cur_object_index;
 	if (i == object_none)
 		return ObjectMoveFailed();
 	const auto &&obj = vmobjptridx(i);
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
 	return ObjectMovePos(obj, extract_type::get(vcvertptr, vcsegptr(obj->segnum)), direction * OBJ_SCALE);
 }
@@ -604,7 +606,9 @@ int	ObjectMoveRight(void)
 //	------------------------------------------------------------------------------------------------------
 int	ObjectSetDefault(void)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vmobjptr = Objects.vmptr;
 	//update_due_to_new_segment();
 
@@ -614,7 +618,6 @@ int	ObjectSetDefault(void)
 	}
 
 	const auto &&objp = vmobjptr(Cur_object_index);
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
 	compute_segment_center(vcvertptr, objp->pos, vcsegptr(objp->segnum));
 
@@ -737,21 +740,19 @@ template int ObjectIncreaseHeadingBig();
 
 static void move_object_to_position(const vmobjptridx_t objp, const vms_vector &newpos)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
-	auto &vmobjptr = Objects.vmptr;
 	auto &Vertices = LevelSharedVertexState.get_vertices();
+	auto &vmobjptr = Objects.vmptr;
 	auto &vcvertptr = Vertices.vcptr;
 	if (get_seg_masks(vcvertptr, newpos, vcsegptr(objp->segnum), objp->size).facemask == 0)
 	{
 		objp->pos = newpos;
 	} else {
 		if (verify_object_seg(vmobjptr, Segments, vcvertptr, objp, newpos)) {
-			int		fate;
-			object	temp_viewer_obj;
-			fvi_query fq;
 			fvi_info	hit_info;
 
-			temp_viewer_obj = *Viewer;
+			auto temp_viewer_obj = *Viewer;
 			auto viewer_segnum = find_object_seg(LevelSharedSegmentState, LevelUniqueSegmentState, *Viewer);
 			temp_viewer_obj.segnum = viewer_segnum;
 
@@ -799,17 +800,17 @@ static void move_object_to_position(const vmobjptridx_t objp, const vms_vector &
 #endif
 			}
 
-			fq.p0						= &temp_viewer_obj.pos;
-			fq.startseg				= temp_viewer_obj.segnum;
-			fq.p1						= &newpos;
-			fq.rad					= temp_viewer_obj.size;
-			fq.thisobjnum			= object_none;
-			fq.ignore_obj_list.first = nullptr;
-			fq.flags					= 0;
-
-			fate = find_vector_intersection(fq, hit_info);
-			if (fate == HIT_WALL) {
-
+			const auto fate = find_vector_intersection(fvi_query{
+				temp_viewer_obj.pos,
+				newpos,
+				fvi_query::unused_ignore_obj_list,
+				fvi_query::unused_LevelUniqueObjectState,
+				fvi_query::unused_Robot_info,
+				0,
+				object_none,
+			}, temp_viewer_obj.segnum, temp_viewer_obj.size, hit_info);
+			if (fate == fvi_hit_type::Wall)
+			{
 				objp->pos = hit_info.hit_pnt;
 				const auto &&segp = find_object_seg(LevelSharedSegmentState, LevelUniqueSegmentState, objp);
 				if (segp != segment_none)

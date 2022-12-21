@@ -34,24 +34,24 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "digi_audio.h"
 #include "sounds.h"
 #include "args.h"
-#include "key.h"
 #include "newdemo.h"
-#include "game.h"
 #include "gameseg.h"
 #include "dxxerror.h"
 #include "wall.h"
 #include "piggy.h"
-#include "text.h"
 #include "kconfig.h"
 #include "config.h"
 
-#include "compiler-begin.h"
-#include "compiler-exchange.h"
 #include "compiler-range_for.h"
+#include "d_levelstate.h"
+#include <iterator>
+#include <utility>
 
 using std::max;
 
 namespace dcx {
+
+namespace {
 
 constexpr std::integral_constant<unsigned, 1> SOF_USED{};		// Set if this sample is used
 constexpr std::integral_constant<unsigned, 4> SOF_LINK_TO_OBJ{};		// Sound is linked to a moving object. If object dies, then finishes play and quits.
@@ -59,8 +59,11 @@ constexpr std::integral_constant<unsigned, 8> SOF_LINK_TO_POS{};		// Sound is li
 constexpr std::integral_constant<unsigned, 16> SOF_PLAY_FOREVER{};		// Play forever (or until level is stopped), otherwise plays once
 constexpr std::integral_constant<unsigned, 32> SOF_PERMANENT{};		// Part of the level, like a waterfall or fan
 
-constexpr std::integral_constant<int, -1> RAIIdigi_sound::invalid_channel;
 constexpr std::integral_constant<unsigned, 150> MAX_SOUND_OBJECTS{};
+
+}
+
+sound_channel SoundQ_channel;
 
 struct sound_object
 {
@@ -70,15 +73,19 @@ struct sound_object
 	fix			max_volume;		// Max volume that this sound is playing at
 	vm_distance max_distance;	// The max distance that this sound can be heard at...
 	int			volume;			// Volume that this sound is playing at
-	int			pan;				// Pan value that this sound is playing at
-	int			channel;			// What channel this is playing on, -1 if not playing
+	sound_pan	pan;				// Pan value that this sound is playing at
+	sound_channel channel;			// What channel this is playing on, sound_channel::None if not playing
 	short			soundnum;		// The sound number that is playing
 	int			loop_start;		// The start point of the loop. -1 means no loop
 	int			loop_end;		// The end point of the loop
-	union {
+	union link {
+		constexpr link() :
+			pos{}
+		{
+		}
 		struct {
 			segnum_t			segnum;				// Used if SOF_LINK_TO_POS field is used
-			uint8_t sidenum;
+			sidenum_t sidenum;
 			vms_vector	position;
 		} pos;
 		struct {
@@ -88,7 +95,9 @@ struct sound_object
 	} link_type;
 };
 
-using sound_objects_t = array<sound_object, MAX_SOUND_OBJECTS>;
+namespace {
+
+using sound_objects_t = std::array<sound_object, MAX_SOUND_OBJECTS>;
 static sound_objects_t SoundObjects;
 static short next_signature=0;
 
@@ -97,16 +106,17 @@ static int N_active_sound_objects;
 static void digi_kill_sound(sound_object &s)
 {
 	s.flags = 0;	// Mark as dead, so some other sound can use this sound
-	if (s.channel > -1)	{
+	if (s.channel != sound_channel::None)
+	{
 		N_active_sound_objects--;
-		digi_stop_sound(exchange(s.channel, -1));
+		digi_stop_sound(std::exchange(s.channel, sound_channel::None));
 	}
 }
 
 static std::pair<sound_objects_t::iterator, sound_objects_t::iterator> find_sound_object_flags0(sound_objects_t &SoundObjects)
 {
 	const auto eso = SoundObjects.end();
-	const auto i = std::find_if(SoundObjects.begin(), eso, [](sound_object &so) { return so.flags == 0; });
+	const auto &&i = ranges::find(SoundObjects.begin(), eso, 0, &sound_object::flags);
 	return {i, eso};
 }
 
@@ -142,6 +152,8 @@ static std::pair<sound_objects_t::iterator, sound_objects_t::iterator> find_soun
 
 }
 
+}
+
 namespace dsx {
 
 /* Find the sound which actually equates to a sound number */
@@ -164,26 +176,26 @@ int digi_xlat_sound(int soundno)
 	return Sounds[soundno];
 }
 
+namespace {
+
 static int digi_unxlat_sound(int soundno)
 {
 	if ( soundno < 0 ) return -1;
 
 	auto &table = (CGameArg.SysLowMem ? AltSounds : Sounds);
-	auto b = begin(table);
-	auto e = end(table);
+	auto b = std::begin(table);
+	auto e = std::end(table);
 	auto i = std::find(b, e, soundno);
 	if (i != e)
 		return std::distance(b, i);
 	throw std::invalid_argument("sound not loaded");
 }
 
-static void digi_get_sound_loc(const vms_matrix &listener, const vms_vector &listener_pos, const vcsegptridx_t listener_seg, const vms_vector &sound_pos, const vcsegptridx_t sound_seg, fix max_volume, int *volume, int *pan, vm_distance max_distance)
+static std::pair<int, sound_pan> digi_get_sound_loc(const vms_matrix &listener, const vms_vector &listener_pos, const vcsegptridx_t listener_seg, const vms_vector &sound_pos, const vcsegptridx_t sound_seg, fix max_volume, vm_distance max_distance)
 {
 
 	vms_vector	vector_to_sound;
 	fix angle_from_ear;
-	*volume = 0;
-	*pan = 0;
 
 	max_distance = (max_distance*5)/4;		// Make all sounds travel 1.25 times as far.
 
@@ -194,19 +206,27 @@ static void digi_get_sound_loc(const vms_matrix &listener, const vms_vector &lis
 		int num_search_segs = f2i(max_distance/20);
 		if ( num_search_segs < 1 ) num_search_segs = 1;
 
-		auto path_distance = find_connected_distance(listener_pos, listener_seg, sound_pos, sound_seg, num_search_segs, WID_RENDPAST_FLAG|WID_FLY_FLAG);
+		auto path_distance = find_connected_distance(listener_pos, listener_seg, sound_pos, sound_seg, num_search_segs, WALL_IS_DOORWAY_FLAG::rendpast | WALL_IS_DOORWAY_FLAG::fly);
 		if ( path_distance > -1 )	{
-			*volume = max_volume - fixdiv(path_distance,max_distance);
-			if (*volume > 0 )	{
+			const int volume = max_volume - fixdiv(path_distance,max_distance);
+			if (volume > 0)
+			{
 				angle_from_ear = vm_vec_delta_ang_norm(listener.rvec,vector_to_sound,listener.uvec);
 				auto cosang = fix_cos(angle_from_ear);
 				if (GameCfg.ReverseStereo) cosang *= -1;
-				*pan = (cosang + F1_0)/2;
-			} else {
-				*volume = 0;
+				return {volume, sound_pan{(cosang + F1_0) / 2}};
 			}
 		}
 	}
+	return {};
+}
+
+static void digi_update_sound_loc(const vms_matrix &listener, const vms_vector &listener_pos, const vcsegptridx_t listener_seg, const vms_vector &sound_pos, const vcsegptridx_t sound_seg, sound_object &so)
+{
+	auto &&[volume, pan] = digi_get_sound_loc(listener, listener_pos, listener_seg, sound_pos, sound_seg, so.max_volume, so.max_distance);
+	so.volume = volume;
+	so.pan = pan;
+}
 
 }
 
@@ -220,7 +240,7 @@ void digi_play_sample_once( int soundno, fix max_volume )
 	if (soundno < 0 ) return;
 
    // start the sample playing
-	digi_start_sound( soundno, max_volume, 0xffff/2, 0, -1, -1, sound_object_none);
+	digi_start_sound(soundno, max_volume, sound_pan{0x7fff}, 0, -1, -1, sound_object_none);
 }
 
 void digi_play_sample( int soundno, fix max_volume )
@@ -233,10 +253,10 @@ void digi_play_sample( int soundno, fix max_volume )
 	if (soundno < 0 ) return;
 
    // start the sample playing
-	digi_start_sound( soundno, max_volume, 0xffff/2, 0, -1, -1, sound_object_none);
+	digi_start_sound(soundno, max_volume, sound_pan{0x7fff}, 0, -1, -1, sound_object_none);
 }
 
-void digi_play_sample_3d(int soundno, int angle, int volume)
+void digi_play_sample_3d(int soundno, const sound_pan angle, int volume)
 {
 	if ( Newdemo_state == ND_STATE_RECORDING )		{
 			newdemo_record_sound_3d_once( soundno, angle, volume );
@@ -252,9 +272,13 @@ void digi_play_sample_3d(int soundno, int angle, int volume)
 	digi_start_sound( soundno, volume, angle, 0, -1, -1, sound_object_none);
 }
 
+namespace {
+
 static void SoundQ_init();
 static void SoundQ_process();
 static void SoundQ_pause();
+
+}
 
 void digi_init_sounds()
 {
@@ -265,11 +289,13 @@ void digi_init_sounds()
 	digi_stop_looping_sound();
 	range_for (auto &i, SoundObjects)
 	{
-		i.channel = -1;
+		i.channel = sound_channel::None;
 		i.flags = 0;	// Mark as dead, so some other sound can use this sound
 	}
 	N_active_sound_objects = 0;
 }
+
+namespace {
 
 // plays a sample that loops forever.
 // Call digi_stop_channe(channel) to stop it.
@@ -281,12 +307,14 @@ static int digi_looping_sound = -1;
 static int digi_looping_volume;
 static int digi_looping_start = -1;
 static int digi_looping_end = -1;
-static int digi_looping_channel = -1;
+static sound_channel digi_looping_channel = sound_channel::None;
 
 static void digi_play_sample_looping_sub()
 {
 	if ( digi_looping_sound > -1 )
-		digi_looping_channel  = digi_start_sound( digi_looping_sound, digi_looping_volume, 0xFFFF/2, 1, digi_looping_start, digi_looping_end, sound_object_none);
+		digi_looping_channel  = digi_start_sound( digi_looping_sound, digi_looping_volume, sound_pan{0x7fff}, 1, digi_looping_start, digi_looping_end, sound_object_none);
+}
+
 }
 
 void digi_play_sample_looping( int soundno, fix max_volume,int loop_start, int loop_end )
@@ -295,7 +323,7 @@ void digi_play_sample_looping( int soundno, fix max_volume,int loop_start, int l
 
 	if (soundno < 0 ) return;
 
-	if (digi_looping_channel>-1)
+	if (digi_looping_channel != sound_channel::None)
 		digi_stop_sound( digi_looping_channel );
 
 	digi_looping_sound = soundno;
@@ -308,18 +336,22 @@ void digi_play_sample_looping( int soundno, fix max_volume,int loop_start, int l
 void digi_change_looping_volume( fix volume )
 {
 	digi_looping_volume = volume;
-	if ( digi_looping_channel > -1 )
+	if (digi_looping_channel != sound_channel::None)
 		digi_set_channel_volume( digi_looping_channel, volume );
 }
+
+namespace {
 
 static void digi_pause_looping_sound()
 {
 	const auto c = digi_looping_channel;
-	if (c > -1)
+	if (c != sound_channel::None)
 	{
-		digi_looping_channel = -1;
+		digi_looping_channel = sound_channel::None;
 		digi_stop_sound(c);
 	}
+}
+
 }
 
 void digi_stop_looping_sound()
@@ -328,28 +360,30 @@ void digi_stop_looping_sound()
 	digi_pause_looping_sound();
 }
 
+namespace {
+
 static void digi_unpause_looping_sound()
 {
 	digi_play_sample_looping_sub();
 }
 
-#if defined(DXX_BUILD_DESCENT_II)
+}
+
 //hack to not start object when loading level
 int Dont_start_sound_objects = 0;
-#endif
+
+namespace {
 
 static void digi_start_sound_object(sound_object &s)
 {
 	// start sample structures
-	s.channel =  -1;
+	s.channel = sound_channel::None;
 
 	if ( s.volume <= 0 )
 		return;
 
-#if defined(DXX_BUILD_DESCENT_II)
 	if ( Dont_start_sound_objects )
 		return;
-#endif
 
 	// only use up to half the sound channels for "permanent" sounts
 	if ((s.flags & SOF_PERMANENT) && (N_active_sound_objects >= max(1, digi_max_channels / 4)))
@@ -364,7 +398,7 @@ static void digi_start_sound_object(sound_object &s)
 										s.loop_start,
 										s.loop_end, &s);
 
-	if (s.channel > -1 )
+	if (s.channel != sound_channel::None)
 		N_active_sound_objects++;
 }
 
@@ -377,33 +411,30 @@ static void digi_link_sound_common(const object_base &viewer, sound_object &so, 
 	so.max_volume = max_volume;
 	so.max_distance = max_distance;
 	so.volume = 0;
-	so.pan = 0;
-#if defined(DXX_BUILD_DESCENT_II)
+	so.pan = {};
 	if (Dont_start_sound_objects) {		//started at level start
 		so.flags |= SOF_PERMANENT;
-		so.channel =  -1;
+		so.channel = sound_channel::None;
 	}
 	else
-#endif
 	{
-		digi_get_sound_loc(viewer.orient, viewer.pos, segnum.absolute_sibling(viewer.segnum),
-                       pos, segnum, so.max_volume,
-                       &so.volume, &so.pan, so.max_distance);
+		digi_update_sound_loc(viewer.orient, viewer.pos, segnum.absolute_sibling(viewer.segnum), pos, segnum, so);
 		digi_start_sound_object(so);
 		// If it's a one-shot sound effect, and it can't start right away, then
 		// just cancel it and be done with it.
-		if ( (so.channel < 0) && (!(so.flags & SOF_PLAY_FOREVER)) )    {
+		if (so.channel == sound_channel::None && !(so.flags & SOF_PLAY_FOREVER))
+		{
 			so.flags = 0;
 			return;
 		}
 	}
 }
 
+}
+
 void digi_link_sound_to_object3(const unsigned org_soundnum, const vcobjptridx_t objnum, const uint8_t forever, const fix max_volume, const sound_stack once, const vm_distance max_distance, const int loop_start, const int loop_end)
 {
-	auto &Objects = LevelUniqueObjectState.Objects;
-	auto &vcobjptr = Objects.vcptr;
-	const auto &&viewer = vcobjptr(Viewer);
+	auto &viewer = *Viewer;
 	int soundnum;
 
 	soundnum = digi_xlat_sound(org_soundnum);
@@ -414,13 +445,21 @@ void digi_link_sound_to_object3(const unsigned org_soundnum, const vcobjptridx_t
 
 	if (soundnum < 0)
 		return;
-	if (GameSounds[soundnum].data==NULL) {
+	if (!GameSounds[soundnum].data)
+	{
 		Int3();
 		return;
 	}
 
 	if ( Newdemo_state == ND_STATE_RECORDING )		{
-		newdemo_record_link_sound_to_object3( org_soundnum, objnum, max_volume, max_distance, loop_start, loop_end );
+		if ( !forever ) { // forever flag is not recorded, use original limited sound objects hack for demo recording
+			auto segnum = vcsegptridx(objnum->segnum);
+			const auto &&[volume, pan] = digi_get_sound_loc(viewer.orient, viewer.pos, segnum.absolute_sibling(viewer.segnum),
+			       objnum->pos, segnum, max_volume,
+			       max_distance);
+			newdemo_record_sound_3d_once( org_soundnum, pan, volume );
+		} else
+			newdemo_record_link_sound_to_object3( org_soundnum, objnum, max_volume, max_distance, loop_start, loop_end );
 	}
 
 	const auto &&f = find_sound_object(SoundObjects, soundnum, objnum, once);
@@ -445,10 +484,11 @@ void digi_link_sound_to_object(const unsigned soundnum, const vcobjptridx_t objn
 	digi_link_sound_to_object2(soundnum, objnum, forever, max_volume, once, vm_distance{256*F1_0});
 }
 
-static void digi_link_sound_to_pos2(fvcobjptr &vcobjptr, const int org_soundnum, const vcsegptridx_t segnum, const unsigned sidenum, const vms_vector &pos, int forever, fix max_volume, const vm_distance max_distance)
+namespace {
+
+static void digi_link_sound_to_pos2(const int org_soundnum, const vcsegptridx_t segnum, const sidenum_t sidenum, const vms_vector &pos, int forever, fix max_volume, const vm_distance max_distance)
 {
-	const auto &&viewer = vcobjptr(Viewer);
-	int volume, pan;
+	auto &viewer = *Viewer;
 	int soundnum;
 
 	soundnum = digi_xlat_sound(org_soundnum);
@@ -459,14 +499,15 @@ static void digi_link_sound_to_pos2(fvcobjptr &vcobjptr, const int org_soundnum,
 
 	if (soundnum < 0)
 		return;
-	if (GameSounds[soundnum].data==NULL) {
+	if (!GameSounds[soundnum].data)
+	{
 		Int3();
 		return;
 	}
 	if (!forever)
 	{
 		// Hack to keep sounds from building up...
-		digi_get_sound_loc(viewer->orient, viewer->pos, segnum.absolute_sibling(viewer->segnum), pos, segnum, max_volume, &volume, &pan, max_distance);
+		const auto &&[volume, pan] = digi_get_sound_loc(viewer.orient, viewer.pos, segnum.absolute_sibling(viewer.segnum), pos, segnum, max_volume, max_distance);
 		digi_play_sample_3d(org_soundnum, pan, volume);
 		return;
 	}
@@ -483,15 +524,15 @@ static void digi_link_sound_to_pos2(fvcobjptr &vcobjptr, const int org_soundnum,
 	digi_link_sound_common(viewer, so, pos, forever, max_volume, max_distance, soundnum, segnum);
 }
 
-void digi_link_sound_to_pos(const unsigned soundnum, const vcsegptridx_t segnum, const unsigned sidenum, const vms_vector &pos, const int forever, const fix max_volume)
+}
+
+void digi_link_sound_to_pos(const unsigned soundnum, const vcsegptridx_t segnum, const sidenum_t sidenum, const vms_vector &pos, const int forever, const fix max_volume)
 {
-	auto &Objects = LevelUniqueObjectState.Objects;
-	auto &vcobjptr = Objects.vcptr;
-	digi_link_sound_to_pos2(vcobjptr, soundnum, segnum, sidenum, pos, forever, max_volume, vm_distance{F1_0 * 256});
+	digi_link_sound_to_pos2(soundnum, segnum, sidenum, pos, forever, max_volume, vm_distance{F1_0 * 256});
 }
 
 //if soundnum==-1, kill any sound
-void digi_kill_sound_linked_to_segment(const vmsegidx_t segnum, const unsigned sidenum, int soundnum)
+void digi_kill_sound_linked_to_segment(const vmsegidx_t segnum, const sidenum_t sidenum, int soundnum)
 {
 	if (soundnum != -1)
 		soundnum = digi_xlat_sound(soundnum);
@@ -520,6 +561,8 @@ void digi_kill_sound_linked_to_object(const vcobjptridx_t objnum)
 	}
 }
 
+namespace {
+
 //	John's new function, 2/22/96.
 static void digi_record_sound_objects()
 {
@@ -535,9 +578,11 @@ static void digi_record_sound_objects()
 
 static int was_recording = 0;
 
+}
+
 void digi_sync_sounds()
 {
-	int oldvolume, oldpan;
+	int oldvolume;
 
 	if ( Newdemo_state == ND_STATE_RECORDING)	{
 		if ( !was_recording )	{
@@ -553,17 +598,18 @@ void digi_sync_sounds()
 		return;
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vcobjptr = Objects.vcptr;
-	const auto &&viewer = vcobjptr(Viewer);
+	const auto viewer = Viewer;
 	range_for (auto &s, SoundObjects)
 	{
 		if (s.flags & SOF_USED)
 		{
 			oldvolume = s.volume;
-			oldpan = s.pan;
+			const auto oldpan = s.pan;
 
 			if ( !(s.flags & SOF_PLAY_FOREVER) )	{
 			 	// Check if its done.
-				if (s.channel > -1 ) {
+				if (s.channel != sound_channel::None)
+				{
 					if ( !digi_is_channel_playing(s.channel) )	{
 						digi_end_sound( s.channel );
 						s.flags = 0;	// Mark as dead, so some other sound can use this sound
@@ -574,11 +620,9 @@ void digi_sync_sounds()
 			}
 
 			if ( s.flags & SOF_LINK_TO_POS )	{
-				digi_get_sound_loc(viewer->orient, viewer->pos, vcsegptridx(viewer->segnum), s.link_type.pos.position, vcsegptridx(s.link_type.pos.segnum), s.max_volume,
-                                &s.volume, &s.pan, s.max_distance );
-
+				digi_update_sound_loc(viewer->orient, viewer->pos, vcsegptridx(viewer->segnum), s.link_type.pos.position, vcsegptridx(s.link_type.pos.segnum), s);
 			} else if ( s.flags & SOF_LINK_TO_OBJ )	{
-				const auto objp = [&vcobjptr, &s]{
+				const object &objp = [&vcobjptr, &s]{
 					if (Newdemo_state != ND_STATE_PLAYBACK)
 						return vcobjptr(s.link_type.obj.objnum);
 					auto objnum = newdemo_find_object(s.link_type.obj.objsignature);
@@ -587,9 +631,10 @@ void digi_sync_sounds()
 					return vcobjptr(object_first);
 				}();
 
-				if ((objp->type==OBJ_NONE) || (objp->signature!=s.link_type.obj.objsignature))	{
+				if ((objp.type==OBJ_NONE) || (objp.signature!=s.link_type.obj.objsignature))	{
 					// The object that this is linked to is dead, so just end this sound if it is looping.
-					if ( s.channel>-1 )	{
+					if (s.channel != sound_channel::None)
+					{
 						if (s.flags & SOF_PLAY_FOREVER)
 							digi_stop_sound( s.channel );
 						else
@@ -599,8 +644,7 @@ void digi_sync_sounds()
 					s.flags = 0;	// Mark as dead, so some other sound can use this sound
 					continue;		// Go on to next sound...
 				} else {
-					digi_get_sound_loc(viewer->orient, viewer->pos, vcsegptridx(viewer->segnum), objp->pos, vcsegptridx(objp->segnum), s.max_volume,
-                                   &s.volume, &s.pan, s.max_distance );
+					digi_update_sound_loc(viewer->orient, viewer->pos, vcsegptridx(viewer->segnum), objp.pos, vcsegptridx(objp.segnum), s);
 				}
 			}
 
@@ -609,9 +653,9 @@ void digi_sync_sounds()
 					// Sound is too far away, so stop it from playing.
 
 					const auto c = s.channel;
-					if (c > -1)
+					if (c != sound_channel::None)
 					{
-						s.channel = -1;
+						s.channel = sound_channel::None;
 						if (s.flags & SOF_PLAY_FOREVER)
 							digi_stop_sound(c);
 						else
@@ -625,7 +669,8 @@ void digi_sync_sounds()
 					}
 
 				} else {
-					if (s.channel<0)	{
+					if (s.channel == sound_channel::None)
+					{
 						digi_start_sound_object(s);
 					} else {
 						digi_set_channel_volume( s.channel, s.volume );
@@ -634,7 +679,7 @@ void digi_sync_sounds()
 			}
 
 			if (oldpan != s.pan) 	{
-				if (s.channel>-1)
+				if (s.channel != sound_channel::None)
 					digi_set_channel_pan( s.channel, s.pan );
 			}
 
@@ -650,9 +695,9 @@ void digi_pause_digi_sounds()
 		if (!(s.flags & SOF_USED))
 			continue;
 		const auto c = s.channel;
-		if (c > -1)
+		if (c != sound_channel::None)
 		{
-			s.channel = -1;
+			s.channel = sound_channel::None;
 			if (! (s.flags & SOF_PLAY_FOREVER))
 				s.flags = 0;	// Mark as dead, so some other sound can use this sound
 			N_active_sound_objects--;
@@ -675,10 +720,10 @@ void digi_resume_digi_sounds()
 void digi_end_soundobj(sound_object &s)
 {
 	Assert(s.flags & SOF_USED);
-	Assert(s.channel > -1);
+	assert(s.channel != sound_channel::None);
 
 	N_active_sound_objects--;
-	s.channel = -1;
+	s.channel = sound_channel::None;
 }
 
 void digi_stop_digi_sounds()
@@ -688,7 +733,8 @@ void digi_stop_digi_sounds()
 	{
 		if (s.flags & SOF_USED)
 		{
-			if ( s.channel > -1 )	{
+			if (s.channel != sound_channel::None)
+			{
 				digi_stop_sound( s.channel );
 				N_active_sound_objects--;
 			}
@@ -701,16 +747,17 @@ void digi_stop_digi_sounds()
 }
 
 #ifndef NDEBUG
-int verify_sound_channel_free( int channel )
+void verify_sound_channel_free(const sound_channel channel)
 {
 	const auto predicate = [channel](const sound_object &s) {
 		return (s.flags & SOF_USED) && s.channel == channel;
 	};
 	if (std::any_of(SoundObjects.begin(), SoundObjects.end(), predicate))
 		throw std::runtime_error("sound busy");
-	return 0;
 }
 #endif
+
+namespace {
 
 struct sound_q
 {
@@ -720,19 +767,20 @@ struct sound_q
 
 #define MAX_LIFE F1_0*30		// After being queued for 30 seconds, don't play it
 static int SoundQ_head, SoundQ_tail, SoundQ_num;
-int SoundQ_channel;
-static array<sound_q, 32> SoundQ;
+static std::array<sound_q, 32> SoundQ;
 
 void SoundQ_init()
 {
 	SoundQ_head = SoundQ_tail = 0;
 	SoundQ_num = 0;
-	SoundQ_channel = -1;
+	SoundQ_channel = sound_channel::None;
 }
 
 void SoundQ_pause()
 {
-	SoundQ_channel = -1;
+	SoundQ_channel = sound_channel::None;
+}
+
 }
 
 void SoundQ_end()
@@ -742,13 +790,16 @@ void SoundQ_end()
 	if (SoundQ_head >= SoundQ.size())
 		SoundQ_head = 0;
 	SoundQ_num--;
-	SoundQ_channel = -1;
+	SoundQ_channel = sound_channel::None;
 }
+
+namespace {
 
 void SoundQ_process()
 {
-	if ( SoundQ_channel > -1 )	{
-		if ( digi_is_channel_playing(SoundQ_channel) )
+	if (const auto channel = SoundQ_channel; channel != sound_channel::None)
+	{
+		if (digi_is_channel_playing(channel))
 			return;
 		SoundQ_end();
 	}
@@ -757,13 +808,14 @@ void SoundQ_process()
 		sound_q * q = &SoundQ[SoundQ_head];
 
 		if ( q->time_added+MAX_LIFE > timer_query() )	{
-			SoundQ_channel = digi_start_sound(q->soundnum, F1_0+1, 0xFFFF/2, 0, -1, -1, sound_object_none);
+			SoundQ_channel = digi_start_sound(q->soundnum, F1_0+1, sound_pan{0x7fff}, 0, -1, -1, sound_object_none);
 			return;
 		} else {
 			// expired; remove from Queue
 	  		SoundQ_end();
 		}
 	}
+}
 }
 
 void digi_start_sound_queued( short soundnum, fix volume )

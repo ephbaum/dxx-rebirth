@@ -38,9 +38,18 @@ enum class MissileViewMode : uint8_t
 	EnabledSelfOnly,
 	EnabledSelfAndAllies,
 };
+
+enum class cockpit_3d_view : uint8_t
+{
+	None,
+	Escort,
+	Rear,
+	Coop,
+	Marker,
+};
 #endif
 
-#ifdef __cplusplus
+#include "gameplayopt.h"
 #include <cstdint>
 
 #define N_SAVE_SLOTS    10
@@ -70,14 +79,18 @@ void plyr_save_stats();
 
 struct hli
 {
-	array<char, 9> Shortname;
+	std::array<char, 9> Shortname;
 	uint8_t LevelNum;
 };
 
-#if defined(DXX_BUILD_DESCENT_I) || defined(DXX_BUILD_DESCENT_II)
+#ifdef dsx
 #include "kconfig.h"
 #include "multi.h"
+#include "fwd-game.h"
 #include "fwd-weapon.h"
+#include "d_array.h"
+
+namespace dcx {
 
 enum class FiringAutoselectMode : uint8_t
 {
@@ -107,47 +120,84 @@ enum MouselookMode : uint8_t
 	MPAnarchy = 4,
 };
 
+enum class player_config_keyboard_index : std::size_t
+{
+	turn_lr,
+	pitch_ud,
+	slide_lr,
+	slide_ud,
+	bank_lr,
+};
+
+enum class player_config_mouse_index : std::size_t
+{
+	turn_lr,
+	pitch_ud,
+	slide_lr,
+	slide_ud,
+	bank_lr,
+	throttle,
+};
+
+enum class player_config_joystick_index : std::size_t
+{
+	turn_lr,
+	pitch_ud,
+	slide_lr,
+	slide_ud,
+	bank_lr,
+	throttle,
+};
+
+}
+
+namespace dsx {
+
 struct player_config : prohibit_void_ptr<player_config>
 {
 	ubyte ControlType;
 	HudType HudMode;
 	RespawnPress RespawnMode;
 	uint8_t MouselookFlags;
-	using primary_weapon_order = array<uint8_t, MAX_PRIMARY_WEAPONS + 1>;
-	using secondary_weapon_order = array<uint8_t, MAX_SECONDARY_WEAPONS + 1>;
+	uint8_t PitchLockFlags;
+	using primary_weapon_order = std::array<uint8_t, MAX_PRIMARY_WEAPONS + 1>;
+	using secondary_weapon_order = std::array<uint8_t, MAX_SECONDARY_WEAPONS + 1>;
 	primary_weapon_order PrimaryOrder;
 	secondary_weapon_order SecondaryOrder;
 	struct KeySettings {
-		array<uint8_t, MAX_CONTROLS> Keyboard,
+		enumerated_array<uint8_t, MAX_CONTROLS, dxx_kconfig_ui_kc_keyboard> Keyboard;
 #if DXX_MAX_JOYSTICKS
-			Joystick,
+		enumerated_array<uint8_t, MAX_CONTROLS, dxx_kconfig_ui_kc_joystick> Joystick;
 #endif
-			Mouse;
+		enumerated_array<uint8_t, MAX_CONTROLS, dxx_kconfig_ui_kc_mouse> Mouse;
 	} KeySettings;
-	array<ubyte, MAX_DXX_REBIRTH_CONTROLS> KeySettingsRebirth;
+	std::array<uint8_t, MAX_DXX_REBIRTH_CONTROLS> KeySettingsRebirth;
 	Difficulty_level_type DefaultDifficulty;
 	int AutoLeveling;
 	uint16_t NHighestLevels;
-	array<hli, MAX_MISSIONS> HighestLevels;
-	array<int, 5> KeyboardSens;
-	array<int, 6> JoystickSens;
-	array<int, 6> JoystickDead;
-	array<int, 6> JoystickLinear;
-	array<int, 6> JoystickSpeed;
+	std::array<hli, MAX_MISSIONS> HighestLevels;
+	enumerated_array<int, 5, player_config_keyboard_index> KeyboardSens;
+	enumerated_array<int, 6, player_config_joystick_index> JoystickSens;
+	enumerated_array<int, 6, player_config_joystick_index> JoystickDead;
+	enumerated_array<int, 6, player_config_joystick_index> JoystickLinear;
+	enumerated_array<int, 6, player_config_joystick_index> JoystickSpeed;
 	ubyte MouseFlightSim;
-	array<int, 6> MouseSens;
-        array<int, 6> MouseOverrun;
+	enumerated_array<int, 6, player_config_mouse_index> MouseSens;
+	enumerated_array<int, 6, player_config_mouse_index> MouseOverrun;
 	int MouseFSDead;
 	int MouseFSIndicator;
-	array<cockpit_mode_t, 2> CockpitMode; // 0 saves the "real" cockpit, 1 also saves letterbox and rear. Used to properly switch between modes and restore the real one.
+	std::array<cockpit_mode_t, 2> CockpitMode; // 0 saves the "real" cockpit, 1 also saves letterbox and rear. Used to properly switch between modes and restore the real one.
 #if defined(DXX_BUILD_DESCENT_II)
-	array<int, 2> Cockpit3DView;
+	enumerated_array<cockpit_3d_view, 2, gauge_inset_window_view> Cockpit3DView = {{{
+		cockpit_3d_view::None,
+		cockpit_3d_view::None,
+	}}};
 #endif
-	array<ntstring<MAX_MESSAGE_LEN - 1>, 4> NetworkMessageMacro;
+	std::array<ntstring<MAX_MESSAGE_LEN - 1>, 4> NetworkMessageMacro;
 	int NetlifeKills;
 	int NetlifeKilled;
 	ubyte ReticleType;
-	array<int, 4> ReticleRGBA;
+	std::array<int, 4> ReticleRGBA;
 	int ReticleSize;
 #if defined(DXX_BUILD_DESCENT_II)
 	MissileViewMode MissileViewEnabled;
@@ -184,7 +234,10 @@ struct player_config : prohibit_void_ptr<player_config>
 		int AlphaBlendEClips;
 	};
 	int DynLightColor;
+	d_sp_gameplay_options SPGameplayOptions;
 };
+
+}
 #endif
 
 extern struct player_config PlayerCfg;
@@ -201,14 +254,14 @@ extern const struct player_config::KeySettings DefaultKeySettings;
 
 void write_player_file();
 
-int new_player_config();
+void new_player_config();
 
 int read_player_file();
 
 // set a new highest level for player for this mission
 }
 #endif
-void set_highest_level(int levelnum);
+void set_highest_level(uint8_t levelnum);
 
 // gets the player's highest level from the file for this mission
 int get_highest_level(void);
@@ -219,5 +272,4 @@ void read_netgame_profile(struct netgame_info *ng);
 void write_netgame_profile(struct netgame_info *ng);
 }
 
-#endif
 #endif

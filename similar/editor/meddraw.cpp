@@ -38,26 +38,18 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "editor/esegment.h"
 #include "wall.h"
 #include "switch.h"
-#include "key.h"
-#include "mouse.h"
 #include "dxxerror.h"
-#include "medlisp.h"
 #include "u_mem.h"
 #include "render.h"
-#include "game.h"
-#include "kdefs.h"
 #include "func.h"
 #include "textures.h"
-#include "screens.h"
-#include "texmap.h"
 #include "object.h"
-#include "fuelcen.h"
 #include "meddraw.h"
 #include "d_enumerate.h"
+#include "d_levelstate.h"
 #include "d_range.h"
 #include "compiler-range_for.h"
 #include "segiter.h"
-#include "d_range.h"
 #include "d_zip.h"
 
 #if DXX_USE_OGL
@@ -85,6 +77,12 @@ using std::min;
 
 constexpr std::integral_constant<unsigned, MAX_VERTICES * 4> MAX_EDGES{};
 
+namespace {
+
+enum class packed_edge : uint8_t
+{
+};
+
 static int     Search_mode=0;                      //if true, searching for segments at given x,y
 static int Search_x,Search_y;
 static int	Automap_test=0;		//	Set to 1 to show wireframe in automap mode.
@@ -106,38 +104,34 @@ static void draw_seg_objects(grs_canvas &canvas, const unique_segment &seg)
 	}
 }
 
-#if DXX_USE_OGL
-#define draw_line(C,P0,P1,c)	draw_line(P0,P1,c)
-#define draw_segment(C,S,c)	draw_segment(S,c)
-#define draw_listed_segments(C,S,c)	draw_listed_segments(S,c)
-#endif
-static void draw_line(grs_canvas &canvas, const unsigned pnum0, const unsigned pnum1, const uint8_t color)
+static void draw_line(const g3_draw_line_context &context, const vertnum_t pnum0, const vertnum_t pnum1)
 {
-	g3_draw_line(canvas, Segment_points[pnum0], Segment_points[pnum1], color);
+	g3_draw_line(context, Segment_points[pnum0], Segment_points[pnum1]);
 }
 
 // ----------------------------------------------------------------------------
-static void draw_segment(grs_canvas &canvas, const shared_segment &seg, const uint8_t color)
+static void draw_segment(const g3_draw_line_context &context, const shared_segment &seg)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	if (seg.segnum == segment_none)		//this segment doesn't exitst
 		return;
 
 	auto &svp = seg.verts;
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
-	if (!rotate_list(vcvertptr, svp).uand)
+	if (rotate_list(vcvertptr, svp).uand == clipping_code::None)
 	{		//all off screen?
-		range_for (const unsigned i, xrange(4u))
-			draw_line(canvas, svp[i], svp[i+4], color);
+		for (const uint8_t i : xrange(4u))
+			draw_line(context, svp[(segment_relative_vertnum{i})], svp[(segment_relative_vertnum{static_cast<uint8_t>(i + 4)})]);
 
-		range_for (const unsigned i, xrange(3u))
+		for (const uint8_t i : xrange(3u))
 		{
-			draw_line(canvas, svp[i], svp[i+1], color);
-			draw_line(canvas, svp[i+4], svp[i+4+1], color);
+			draw_line(context, svp[(segment_relative_vertnum{i})], svp[(segment_relative_vertnum{static_cast<uint8_t>(i + 1)})]);
+			draw_line(context, svp[(segment_relative_vertnum{static_cast<uint8_t>(i + 4)})], svp[(segment_relative_vertnum{static_cast<uint8_t>(i + 4 + 1)})]);
 		}
 
-		draw_line(canvas, svp[0], svp[3], color);
-		draw_line(canvas, svp[4], svp[3+4], color);
+		draw_line(context, svp[segment_relative_vertnum::_0], svp[segment_relative_vertnum::_3]);
+		draw_line(context, svp[segment_relative_vertnum::_4], svp[segment_relative_vertnum::_7]);
 	}
 }
 
@@ -145,9 +139,10 @@ static void draw_segment(grs_canvas &canvas, const shared_segment &seg, const ui
 static void check_segment(const vmsegptridx_t seg)
 {
 	auto &svp = seg->verts;
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
-	if (!rotate_list(vcvertptr, svp).uand)
+	if (rotate_list(vcvertptr, svp).uand == clipping_code::None)
 	{		//all off screen?
 #if DXX_USE_OGL
 		g3_end_frame();
@@ -165,14 +160,14 @@ static void check_segment(const vmsegptridx_t seg)
 
 		range_for (auto &fn, Side_to_verts)
 		{
-			array<cg3s_point *, 3> vert_list;
-			vert_list[0] = &Segment_points[seg->verts[fn[0]]];
-			vert_list[1] = &Segment_points[seg->verts[fn[1]]];
-			vert_list[2] = &Segment_points[seg->verts[fn[2]]];
+			std::array<cg3s_point *, 3> vert_list;
+			vert_list[0] = &Segment_points[seg->verts[fn[side_relative_vertnum::_0]]];
+			vert_list[1] = &Segment_points[seg->verts[fn[side_relative_vertnum::_1]]];
+			vert_list[2] = &Segment_points[seg->verts[fn[side_relative_vertnum::_2]]];
 			g3_check_and_draw_poly(*grd_curcanv, vert_list, color);
 
-			vert_list[1] = &Segment_points[seg->verts[fn[2]]];
-			vert_list[2] = &Segment_points[seg->verts[fn[3]]];
+			vert_list[1] = &Segment_points[seg->verts[fn[side_relative_vertnum::_2]]];
+			vert_list[2] = &Segment_points[seg->verts[fn[side_relative_vertnum::_3]]];
 			g3_check_and_draw_poly(*grd_curcanv, vert_list, color);
 		}
 		}
@@ -185,35 +180,35 @@ static void check_segment(const vmsegptridx_t seg)
 }
 
 // ----------------------------------------------------------------------------
-static void draw_seg_side(const shared_segment &seg, const unsigned side, const uint8_t color)
+static void draw_seg_side(const shared_segment &seg, const sidenum_t side, const color_palette_index color)
 {
 	auto &svp = seg.verts;
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
-	if (!rotate_list(vcvertptr, svp).uand)
+	if (rotate_list(vcvertptr, svp).uand == clipping_code::None)
 	{		//all off screen?
-		int i;
-
 		auto &stv = Side_to_verts[side];
-		for (i=0;i<3;i++)
-			draw_line(*grd_curcanv, svp[stv[i]], svp[stv[i+1]], color);
-
-		draw_line(*grd_curcanv, svp[stv[i]], svp[stv[0]], color);
+		g3_draw_line_context context{*grd_curcanv, color};
+		for (const auto i : MAX_VERTICES_PER_SIDE)
+			draw_line(context, svp[stv[i]], svp[stv[next_side_vertex(i)]]);
 	}
 }
 
-static void draw_side_edge(const shared_segment &seg, const unsigned side, const unsigned edge, const uint8_t color)
+static void draw_side_edge(const shared_segment &seg, const sidenum_t side, const side_relative_vertnum edge, const color_palette_index color)
 {
 	auto &svp = seg.verts;
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
-	if (!rotate_list(vcvertptr, svp).uand)		//on screen?
+	if (rotate_list(vcvertptr, svp).uand == clipping_code::None)		//on screen?
 	{
 		auto &stv = Side_to_verts[side];
-		draw_line(*grd_curcanv, svp[stv[edge]], svp[stv[(edge + 1) % 4]], color);
+		draw_line(g3_draw_line_context{*grd_curcanv, color}, svp[stv[edge]], svp[stv[next_side_vertex(edge)]]);
 	}
 }
 
+__attribute__((used))
 int Show_triangulations=0;
 
 //edge types - lower number types have precedence
@@ -224,161 +219,121 @@ int Show_triangulations=0;
 
 #define ET_EMPTY		255	//this entry in array is empty
 
-//colors for those types
-//int edge_colors[] = {BM_RGB(45/2,45/2,45/2),
-//							BM_RGB(45/3,45/3,45/3),		//BM_RGB(0,0,45),	//
-//							BM_RGB(45/4,45/4,45/4)};	//BM_RGB(0,45,0)};	//
-
 static
 #if defined(DXX_BUILD_DESCENT_I)
-const
+constexpr
 #endif
-array<color_t, 3> edge_colors{{54, 59, 64}};
-
-namespace {
+std::array<color_palette_index, 3> edge_colors{{54, 59, 64}};
 
 struct seg_edge
 {
-	union {
-		struct {int v0,v1;} __pack__ n;
-		long vv;
-	}v;
+	vertnum_t v0, v1;
 	ushort	type;
 	ubyte		face_count, backface_count;
 };
 
-}
-
-static array<seg_edge, MAX_EDGES> edge_list;
-static array<int, MAX_EDGES> used_list;	//which entries in edge_list have been used
+static std::array<seg_edge, MAX_EDGES> edge_list;
+static std::array<int, MAX_EDGES> used_list;	//which entries in edge_list have been used
 static int n_used;
 
 static unsigned edge_list_size;		//set each frame
 
-#define HASH(a,b)  ((a*5+b) % edge_list_size)
+static constexpr packed_edge pack_edge(const unsigned a, const unsigned b)
+{
+	return static_cast<packed_edge>((a << 3) | b);
+}
 
 //define edge numberings
-constexpr int edges[] = {
-		0*8+1,	// edge  0
-		0*8+3,	// edge  1
-		0*8+4,	// edge  2
-		1*8+2,	// edge  3
-		1*8+5,	//	edge  4
-		2*8+3,	//	edge  5
-		2*8+6,	//	edge  6
-		3*8+7,	//	edge  7
-		4*8+5,	//	edge  8
-		4*8+7,	//	edge  9
-		5*8+6,	//	edge 10
-		6*8+7,	//	edge 11
+constexpr std::array<packed_edge, 24> edges = {{
+	pack_edge(0, 1),	// edge  0
+	pack_edge(0, 3),	// edge  1
+	pack_edge(0, 4),	// edge  2
+	pack_edge(1, 2),	// edge  3
+	pack_edge(1, 5),	//	edge  4
+	pack_edge(2, 3),	//	edge  5
+	pack_edge(2, 6),	//	edge  6
+	pack_edge(3, 7),	//	edge  7
+	pack_edge(4, 5),	//	edge  8
+	pack_edge(4, 7),	//	edge  9
+	pack_edge(5, 6),	//	edge 10
+	pack_edge(6, 7),	//	edge 11
 
-		0*8+5,	//	right cross
-		0*8+7,	// top cross
-		1*8+3,	//	front  cross
-		2*8+5,	// bottom cross
-		2*8+7,	// left cross
-		4*8+6,	//	back cross
+	pack_edge(0, 5),	//	right cross
+	pack_edge(0, 7),	// top cross
+	pack_edge(1, 3),	//	front  cross
+	pack_edge(2, 5),	// bottom cross
+	pack_edge(2, 7),	// left cross
+	pack_edge(4, 6),	//	back cross
 
 //crosses going the other way
 
-		1*8+4,	//	other right cross
-		3*8+4,	// other top cross
-		0*8+2,	//	other front  cross
-		1*8+6,	// other bottom cross
-		3*8+6,	// other left cross
-		5*8+7,	//	other back cross
-};
+	pack_edge(1, 4),	//	other right cross
+	pack_edge(3, 4),	// other top cross
+	pack_edge(0, 2),	//	other front  cross
+	pack_edge(1, 6),	// other bottom cross
+	pack_edge(3, 6),	// other left cross
+	pack_edge(5, 7),	//	other back cross
+}};
 
 #define N_NORMAL_EDGES			12		//the normal edges of a box
 #define N_EXTRA_EDGES			12		//ones created by triangulation
 #define N_EDGES_PER_SEGMENT (N_NORMAL_EDGES+N_EXTRA_EDGES)
 
-using std::swap;
-
 //given two vertex numbers on a segment (range 0..7), tell what edge number it is
-static int find_edge_num(int v0,int v1)
+static std::size_t find_edge_num(const segment_relative_vertnum ev0, const segment_relative_vertnum ev1)
 {
-	int		i;
-	int		vv;
-	const int		*edgep = edges;
-
-	if (v0 > v1) swap(v0,v1);
-
-	vv = v0*8+v1;
-
-//	for (i=0;i<N_EDGES_PER_SEGMENT;i++)
-//		if (edges[i]==vv) return i;
-
-	for (i=N_EDGES_PER_SEGMENT; i; i--)
-		if (*edgep++ == vv)
-			return (N_EDGES_PER_SEGMENT-i);
-
-	Error("Could not find edge for %d,%d",v0,v1);
-
-	//return -1;
+	const auto &&[v0, v1] = std::minmax(ev0, ev1);
+	const auto vv = pack_edge(static_cast<uint8_t>(v0), static_cast<uint8_t>(v1));
+	const auto iter = std::find(edges.begin(), edges.end(), vv);
+	return std::distance(edges.begin(), iter);
 }
 
-
 //finds edge, filling in edge_ptr. if found old edge, returns index, else return -1
-static int find_edge(int v0,int v1,seg_edge **edge_ptr)
+static std::pair<seg_edge &, std::size_t> find_edge(const vertnum_t v0, const vertnum_t v1)
 {
-	long vv;
-	int hash,oldhash;
-	int ret;
+	const auto &&hash_object = std::hash<vertnum_t>{};
+	const auto initial_hash_slot = (hash_object(v0) ^ (hash_object(v1) << 10)) % edge_list_size;
 
-	vv = (v1<<16) + v0;
-
-	oldhash = hash = HASH(v0,v1);
-
-	ret = -1;
-
-	while (ret==-1) {
-
-		if (edge_list[hash].type == ET_EMPTY) ret=0;
-		else if (edge_list[hash].v.vv == vv) ret=1;
+	for (auto current_hash_slot = initial_hash_slot;;)
+	{
+		auto &e = edge_list[current_hash_slot];
+		if (e.type == ET_EMPTY)
+			return {e, UINT32_MAX};
+		else if (e.v0 == v0 && e.v1 == v1)
+			return {e, current_hash_slot};
 		else {
-			if (++hash==edge_list_size) hash=0;
-			if (hash==oldhash) Error("Edge list full!");
+			if (++ current_hash_slot == edge_list_size)
+				current_hash_slot = 0;
+			if (current_hash_slot == initial_hash_slot)
+				throw std::runtime_error("edge list full: search wrapped without finding a free slot");
 		}
 	}
-
-	*edge_ptr = &edge_list[hash];
-
-	if (ret == 0)
-		return -1;
-	else
-		return hash;
-
 }
 
 //adds an edge to the edge list
-static void add_edge(int v0,int v1,ubyte type)
+static void add_edge(const vertnum_t ev0, const vertnum_t ev1, const uint8_t type)
 {
-	int found;
+	const auto &&[v0, v1] = std::minmax(ev0, ev1);
+	auto &&[e, current_hash_slot] = find_edge(v0, v1);
 
-	seg_edge *e;
-
-	if (v0 > v1) swap(v0,v1);
-
-	found = find_edge(v0,v1,&e);
-
-	if (found == -1) {
-		e->v.n.v0 = v0;
-		e->v.n.v1 = v1;
-		e->type = type;
-		used_list[n_used] = e - edge_list.begin();
+	if (current_hash_slot == UINT32_MAX)
+	{
+		e.v0 = v0;
+		e.v1 = v1;
+		e.type = type;
+		used_list[n_used] = &e - edge_list.begin();
 		if (type == ET_FACING)
-			edge_list[used_list[n_used]].face_count++;
+			e.face_count++;
 		else if (type == ET_NOTFACING)
-			edge_list[used_list[n_used]].backface_count++;
+			e.backface_count++;
 		n_used++;
 	} else {
-		if (type < e->type)
-			e->type = type;
+		if (e.type > type)
+			e.type = type;
 		if (type == ET_FACING)
-			edge_list[found].face_count++;
+			e.face_count++;
 		else if (type == ET_NOTFACING)
-			edge_list[found].backface_count++;
+			e.backface_count++;
 	}
 }
 
@@ -386,32 +341,27 @@ static void add_edge(int v0,int v1,ubyte type)
 static void add_edges(const shared_segment &seg)
 {
 	auto &svp = seg.verts;
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
-	if (!rotate_list(vcvertptr, svp).uand)
+	if (rotate_list(vcvertptr, svp).uand == clipping_code::None)
 	{		//all off screen?
 		int	i,fn,vn;
 		int	flag;
-		ubyte	edge_flags[N_EDGES_PER_SEGMENT];
-
+		std::array<uint8_t, std::size(edges)> edge_flags;
 		for (i=0;i<N_NORMAL_EDGES;i++) edge_flags[i]=ET_NOTUSED;
 		for (;i<N_EDGES_PER_SEGMENT;i++) edge_flags[i]=ET_NOTEXTANT;
 
-		range_for (auto &&e, enumerate(seg.sides))
+		for (auto &&[idx, sidep] : enumerate(seg.sides))
 		{
-			auto &sidep = e.value;
 			int	num_vertices;
-			const auto v = create_all_vertex_lists(seg, sidep, e.idx);
-			const auto &num_faces = v.first;
-			const auto &vertex_list = v.second;
+			const auto &&[num_faces, vertex_list] = create_all_vertex_lists(seg, sidep, idx);
 			if (num_faces == 1)
 				num_vertices = 4;
 			else
 				num_vertices = 3;
 
 			for (fn=0; fn<num_faces; fn++) {
-				int	en;
-
 				//Note: normal check appears to be the wrong way since the normals points in, but we're looking from the outside
 				if (g3_check_normal_facing(vcvertptr(seg.verts[vertex_list[fn*3]]), sidep.normals[fn]))
 					flag = ET_NOTFACING;
@@ -420,53 +370,55 @@ static void add_edges(const shared_segment &seg)
 
 				auto v0 = &vertex_list[fn*3];
 				for (vn=0; vn<num_vertices-1; vn++) {
-
-					// en = find_edge_num(vertex_list[fn*3 + vn], vertex_list[fn*3 + (vn+1)%num_vertices]);
-					en = find_edge_num(*v0, *(v0+1));
-					
-					if (en!=edge_none)
+					if (const auto en = find_edge_num(*v0, *(v0 + 1)); en != edges.size())
 						if (flag < edge_flags[en]) edge_flags[en] = flag;
 
 					v0++;
 				}
-				en = find_edge_num(*v0, vertex_list[fn*3]);
-				if (en!=edge_none)
+				if (const auto en = find_edge_num(*v0, vertex_list[fn * 3]); en != edges.size())
 					if (flag < edge_flags[en]) edge_flags[en] = flag;
 			}
 		}
 
 		for (i=0; i<N_EDGES_PER_SEGMENT; i++)
 			if (i<N_NORMAL_EDGES || (edge_flags[i]!=ET_NOTEXTANT && Show_triangulations))
-				add_edge(seg.verts[edges[i] / 8], seg.verts[edges[i] & 7], edge_flags[i]);
+			{
+				const uint8_t e0 = static_cast<uint8_t>(edges[i]) >> 3;
+				const uint8_t e1 = static_cast<uint8_t>(edges[i]) & 7;
+				add_edge(seg.verts[(segment_relative_vertnum{e0})], seg.verts[(segment_relative_vertnum{e1})], edge_flags[i]);
+			}
 	}
 }
 
 // ----------------------------------------------------------------------------
-static void draw_trigger_side(const shared_segment &seg, const unsigned side, const uint8_t color)
+static void draw_trigger_side(const shared_segment &seg, const sidenum_t side, const color_palette_index color)
 {
 	auto &svp = seg.verts;
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
-	if (!rotate_list(vcvertptr, svp).uand)
+	if (rotate_list(vcvertptr, svp).uand == clipping_code::None)
 	{		//all off screen?
 		// Draw diagonals
 		auto &stv = Side_to_verts[side];
-		draw_line(*grd_curcanv, svp[stv[0]], svp[stv[2]], color);
+		draw_line(g3_draw_line_context{*grd_curcanv, color}, svp[stv[side_relative_vertnum::_0]], svp[stv[side_relative_vertnum::_2]]);
 	}
 }
 
 // ----------------------------------------------------------------------------
-static void draw_wall_side(const shared_segment &seg, const unsigned side, const uint8_t color)
+static void draw_wall_side(const shared_segment &seg, const sidenum_t side, const color_palette_index color)
 {
 	auto &svp = seg.verts;
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
-	if (!rotate_list(vcvertptr, svp).uand)
+	if (rotate_list(vcvertptr, svp).uand == clipping_code::None)
 	{		//all off screen?
 		// Draw diagonals
+		g3_draw_line_context context{*grd_curcanv, color};
 		auto &stv = Side_to_verts[side];
-		draw_line(*grd_curcanv, svp[stv[0]], svp[stv[2]], color);
-		draw_line(*grd_curcanv, svp[stv[1]], svp[stv[3]], color);
+		draw_line(context, svp[stv[side_relative_vertnum::_0]], svp[stv[side_relative_vertnum::_2]]);
+		draw_line(context, svp[stv[side_relative_vertnum::_1]], svp[stv[side_relative_vertnum::_3]]);
 	}
 }
 
@@ -481,7 +433,7 @@ static void draw_wall_side(const shared_segment &seg, const unsigned side, const
 
 // ----------------------------------------------------------------------------------------------------------------
 // Draws special walls (for now these are just removable walls.)
-static void draw_special_wall(const shared_segment &seg, const unsigned side)
+static void draw_special_wall(const shared_segment &seg, const sidenum_t side)
 {
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
 	auto &vcwallptr = Walls.vcptr;
@@ -491,9 +443,9 @@ static void draw_special_wall(const shared_segment &seg, const unsigned side)
 		if (type != WALL_OPEN)
 		{
 			const auto flags = w.flags;
-			if (flags & WALL_DOOR_LOCKED)
-				return (flags & WALL_DOOR_AUTO) ? WALL_AUTO_DOOR_LOCKED_COLOR : WALL_DOOR_LOCKED_COLOR;
-			if (flags & WALL_DOOR_AUTO)
+			if (flags & wall_flag::door_locked)
+				return (flags & wall_flag::door_auto) ? WALL_AUTO_DOOR_LOCKED_COLOR : WALL_DOOR_LOCKED_COLOR;
+			if (flags & wall_flag::door_auto)
 				return WALL_AUTO_DOOR_COLOR;
 			if (type == WALL_BLASTABLE)
 				return WALL_BLASTABLE_COLOR;
@@ -530,14 +482,12 @@ static void draw_mine_sub(const vmsegptridx_t segnum,int depth, visited_segment_
 
 		if (depth != 0) {
 			const shared_segment &sseg = *mine_ptr;
-			range_for (const auto &&ez, enumerate(zip(sseg.children, sseg.sides)))
+			for (const auto &&[idx, child_segnum, sside] : enumerate(zip(sseg.children, sseg.sides)))
 			{
-				const auto child_segnum = std::get<0>(ez.value);
 				if (IS_CHILD(child_segnum))
 				{
-					auto &sside = std::get<1>(ez.value);
 					if (sside.wall_num != wall_none)
-						draw_special_wall(mine_ptr, ez.idx);
+						draw_special_wall(mine_ptr, static_cast<sidenum_t>(idx));
 					draw_mine_sub(segnum.absolute_sibling(child_segnum), depth-1, visited);
 				}
 			}
@@ -552,11 +502,12 @@ static void draw_mine_edges(int automap_flag)
 
 	for (type=ET_NOTUSED;type>=ET_FACING;type--) {
 		const auto color = edge_colors[type];
+		g3_draw_line_context context{*grd_curcanv, color};
 		for (i=0;i<n_used;i++) {
 			e = &edge_list[used_list[i]];
 			if (e->type == type)
 				if ((!automap_flag) || (e->face_count == 1))
-					draw_line(*grd_curcanv, e->v.n.v0, e->v.n.v1, color);
+					draw_line(context, e->v0, e->v1);
 		}
 	}
 }
@@ -605,9 +556,9 @@ static void draw_mine_all(int automap_flag)
 	{
 		if (segp->segnum != segment_none)
 		{
-			range_for (auto &&e, enumerate(segp->shared_segment::sides))
-				if (e.value.wall_num != wall_none)
-					draw_special_wall(segp, e.idx);
+			for (auto &&[idx, value] : enumerate(segp->shared_segment::sides))
+				if (value.wall_num != wall_none)
+					draw_special_wall(segp, idx);
 			if (Search_mode)
 				check_segment(segp);
 			else {
@@ -621,36 +572,41 @@ static void draw_mine_all(int automap_flag)
 
 }
 
-static void draw_listed_segments(grs_canvas &canvas, count_segment_array_t &s, const uint8_t color)
+static void draw_listed_segments(g3_draw_line_context &context, count_segment_array_t &s)
 {
 	range_for (const auto &ss, s)
 	{
 		const auto &&segp = vcsegptr(ss);
 		if (segp->segnum != segment_none)
-			draw_segment(canvas, segp, color);
+			draw_segment(context, segp);
 	}
 }
 
 static void draw_selected_segments(void)
 {
-	draw_listed_segments(*grd_curcanv, Selected_segs, SELECT_COLOR);
+	g3_draw_line_context context{*grd_curcanv, SELECT_COLOR};
+	draw_listed_segments(context, Selected_segs);
 }
 
 static void draw_found_segments(void)
 {
-	draw_listed_segments(*grd_curcanv, Found_segs, FOUND_COLOR);
+	g3_draw_line_context context{*grd_curcanv, FOUND_COLOR};
+	draw_listed_segments(context, Found_segs);
 }
 
 static void draw_warning_segments(void)
 {
-	draw_listed_segments(*grd_curcanv, Warning_segs, WARNING_COLOR);
+	g3_draw_line_context context{*grd_curcanv, WARNING_COLOR};
+	draw_listed_segments(context, Warning_segs);
 }
 
 static void draw_group_segments(void)
 {
-	if (current_group > -1) {
-		draw_listed_segments(*grd_curcanv, GroupList[current_group].segments, GROUP_COLOR);
-		}
+	if (current_group > -1)
+	{
+		g3_draw_line_context context{*grd_curcanv, GROUP_COLOR};
+		draw_listed_segments(context, GroupList[current_group].segments);
+	}
 }
 
 
@@ -664,35 +620,39 @@ static void draw_special_segments(void)
 			unsigned r, g, b;
 			switch(segp->special)
 			{
-			case SEGMENT_IS_FUELCEN:
+				case segment_special::fuelcen:
 					r = 29 * 2, g = 27 * 2, b = 13 * 2;
 				break;
-			case SEGMENT_IS_CONTROLCEN:
+				case segment_special::controlcen:
 					r = 29 * 2, g = 0, b = 0;
 				break;
-			case SEGMENT_IS_ROBOTMAKER:
+				case segment_special::robotmaker:
 					r = 29 * 2, g = 0, b = 31 * 2;
 				break;
 				default:
 					continue;
 			}
 			const auto color = gr_find_closest_color(r, g, b);
-			draw_segment(*grd_curcanv, segp, color);
+			g3_draw_line_context context{*grd_curcanv, color};
+			draw_segment(context, segp);
 		}
 	}
 }
 		
 
 //find a free vertex. returns the vertex number
-static int alloc_vert()
+static vertnum_t alloc_vert()
 {
-	int vn;
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 
 	const auto Num_vertices = LevelSharedVertexState.Num_vertices;
 	assert(Num_vertices < MAX_SEGMENT_VERTICES);
 
 	auto &Vertex_active = LevelSharedVertexState.get_vertex_active();
-	for (vn=0; (vn < Num_vertices) && Vertex_active[vn]; vn++) ;
+	vertnum_t vn{};
+	for (; static_cast<unsigned>(vn) < Num_vertices && Vertex_active[vn]; ++vn)
+	{
+	}
 
 	Vertex_active[vn] = 1;
 
@@ -702,8 +662,9 @@ static int alloc_vert()
 }
 
 //frees a vertex
-static void free_vert(int vert_num)
+static void free_vert(vertnum_t vert_num)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Vertex_active = LevelSharedVertexState.get_vertex_active();
 	Vertex_active[vert_num] = 0;
 	--LevelSharedVertexState.Num_vertices;
@@ -712,7 +673,9 @@ static void free_vert(int vert_num)
 // -----------------------------------------------------------------------------
 static void draw_coordinate_axes(void)
 {
-	array<unsigned, 16> Axes_verts;
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
+	std::array<vertnum_t, 16> Axes_verts;
 	vms_vector	tvec;
 
 	range_for (auto &i, Axes_verts)
@@ -720,7 +683,6 @@ static void draw_coordinate_axes(void)
 
 	create_coordinate_axes_from_segment(Cursegp,Axes_verts);
 
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
 	auto &vmvertptr = Vertices.vmptr;
 	const auto &&av0 = vcvertptr(Axes_verts[0]);
@@ -773,28 +735,31 @@ static void draw_coordinate_axes(void)
 
 	rotate_list(vcvertptr, Axes_verts);
 
-	const uint8_t color = AXIS_COLOR;
+	const color_palette_index color = AXIS_COLOR;
+	g3_draw_line_context context{*grd_curcanv, color};
 
-	draw_line(*grd_curcanv, Axes_verts[0], Axes_verts[1], color);
-	draw_line(*grd_curcanv, Axes_verts[0], Axes_verts[2], color);
-	draw_line(*grd_curcanv, Axes_verts[0], Axes_verts[3], color);
+	draw_line(context, Axes_verts[0], Axes_verts[1]);
+	draw_line(context, Axes_verts[0], Axes_verts[2]);
+	draw_line(context, Axes_verts[0], Axes_verts[3]);
 
 	// draw the letter X
-	draw_line(*grd_curcanv, Axes_verts[4], Axes_verts[5], color);
-	draw_line(*grd_curcanv, Axes_verts[6], Axes_verts[7], color);
+	draw_line(context, Axes_verts[4], Axes_verts[5]);
+	draw_line(context, Axes_verts[6], Axes_verts[7]);
 
 	// draw the letter Y
-	draw_line(*grd_curcanv, Axes_verts[8], Axes_verts[9], color);
-	draw_line(*grd_curcanv, Axes_verts[8], Axes_verts[10], color);
-	draw_line(*grd_curcanv, Axes_verts[8], Axes_verts[11], color);
+	draw_line(context, Axes_verts[8], Axes_verts[9]);
+	draw_line(context, Axes_verts[8], Axes_verts[10]);
+	draw_line(context, Axes_verts[8], Axes_verts[11]);
 
 	// draw the letter Z
-	draw_line(*grd_curcanv, Axes_verts[12], Axes_verts[13], color);
-	draw_line(*grd_curcanv, Axes_verts[13], Axes_verts[14], color);
-	draw_line(*grd_curcanv, Axes_verts[14], Axes_verts[15], color);
+	draw_line(context, Axes_verts[12], Axes_verts[13]);
+	draw_line(context, Axes_verts[13], Axes_verts[14]);
+	draw_line(context, Axes_verts[14], Axes_verts[15]);
 
 	range_for (auto &i, Axes_verts)
 		free_vert(i);
+}
+
 }
 
 void draw_world(grs_canvas *screen_canvas,editor_view *v,const vmsegptridx_t mine_ptr,int depth)
@@ -832,18 +797,18 @@ void draw_world(grs_canvas *screen_canvas,editor_view *v,const vmsegptridx_t min
 		// Highlight group segment and side.
 		if (current_group > -1)
 		if (Groupsegp[current_group]) {
-			draw_segment(*grd_curcanv, vcsegptr(Groupsegp[current_group]), GROUPSEG_COLOR);
+			draw_segment(g3_draw_line_context{*grd_curcanv, GROUPSEG_COLOR}, vcsegptr(Groupsegp[current_group]));
 			draw_seg_side(vcsegptr(Groupsegp[current_group]), Groupside[current_group], GROUPSIDE_COLOR);
 		}
 
 		// Highlight marked segment and side.
 		if (Markedsegp) {
-			draw_segment(*grd_curcanv, Markedsegp, MARKEDSEG_COLOR);
+			draw_segment(g3_draw_line_context{*grd_curcanv, MARKEDSEG_COLOR}, Markedsegp);
 			draw_seg_side(Markedsegp,Markedside, MARKEDSIDE_COLOR);
 		}
 
 		// Highlight current segment and current side.
-		draw_segment(*grd_curcanv, Cursegp, CURSEG_COLOR);
+		draw_segment(g3_draw_line_context{*grd_curcanv, CURSEG_COLOR}, Cursegp);
 
 		draw_seg_side(Cursegp,Curside, CURSIDE_COLOR);
 		draw_side_edge(Cursegp,Curside,Curedge, CUREDGE_COLOR);
@@ -863,16 +828,7 @@ void draw_world(grs_canvas *screen_canvas,editor_view *v,const vmsegptridx_t min
 				case 2: gr_ustring(*grd_curcanv, *grd_curcanv->cv_font, 85, 5, "-- RIGHT");	break;
 			}			
 		} else
-#if ORTHO_VIEWS
-		 else if ( screen_canvas == TopViewBox->canvas )
-			gr_ustring(*grd_curcanv, *grd_curcanv->cv_font, 5, 5, "TOP");
-		else if ( screen_canvas == FrontViewBox->canvas )
-			gr_ustring(*grd_curcanv, *grd_curcanv->cv_font, 5, 5, "FRONT");
-		else if ( screen_canvas == RightViewBox->canvas )
-			gr_ustring(*grd_curcanv, *grd_curcanv->cv_font, 5, 5, "RIGHT");
-#else
 			Error("Ortho views have been removed, what gives?\n");
-#endif
 
 	}
 
@@ -934,10 +890,5 @@ void meddraw_init_views( grs_canvas * canvas)
 #endif
 
 	Views[0]->ev_canv = canvas;
-#if ORTHO_VIEWS
-	Views[1]->ev_canv = TopViewBox->canvas;
-	Views[2]->ev_canv = FrontViewBox->canvas;
-	Views[3]->ev_canv = RightViewBox->canvas;
-#endif
 }
 }

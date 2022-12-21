@@ -37,15 +37,12 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "key.h"
 #include "mouse.h"
 #include "palette.h"
-#include "game.h"
 #include "timer.h"
 #include "gamefont.h"
 #include "pcx.h"
 #include "credits.h"
 #include "u_mem.h"
 #include "screens.h"
-#include "digi.h"
-#include "rbaudio.h"
 #include "text.h"
 #include "songs.h"
 #include "menu.h"
@@ -57,15 +54,15 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "args.h"
 #endif
 #include "piggy.h"
-
-#include "compiler-make_unique.h"
+#include <memory>
 
 #define ROW_SPACING			(SHEIGHT / 17)
 #define NUM_LINES			20 //14
-#define MAKE_CREDITS_PAIR(F)	std::pair<const char *, int>(F ".tex", sizeof(F) + 1)
 #if defined(DXX_BUILD_DESCENT_I)
+#define MAKE_CREDITS_PAIR(F)	std::span<const char, sizeof(F) + 1>(F ".tex", sizeof(F) + 1)
 #define CREDITS_FILE 			MAKE_CREDITS_PAIR("credits")
 #elif defined(DXX_BUILD_DESCENT_II)
+#define MAKE_CREDITS_PAIR(F)	std::span<const char>(F ".tex", sizeof(F) + 1)
 #define CREDITS_FILE    		(	\
 	PHYSFSX_exists("mcredits.tex", 1)	\
 		? MAKE_CREDITS_PAIR("mcredits")	\
@@ -76,25 +73,42 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #define ALLOWED_CHAR			(!Current_mission ? 'R' : (is_SHAREWARE ? 'S' : 'R'))
 #endif
 
+namespace dcx {
+
 namespace {
 
-struct credits : ignore_window_pointer_t
+struct credits_window : window
 {
 	RAIIPHYSFS_File file;
-	int have_bin_file;
-	array<PHYSFSX_gets_line_t<80>, NUM_LINES> buffer;
-	int buffer_line;
-	int first_line_offset;
-	int extra_inc;
-	int done;
-	int row;
-	grs_main_bitmap backdrop;
+	const uint8_t have_bin_file;
+	std::array<PHYSFSX_gets_line_t<80>, NUM_LINES> buffer = {};
+	int buffer_line = 0;
+	int first_line_offset = 0;
+	int extra_inc = 0;
+	int done = 0;
+	int row = 0;
+	grs_main_bitmap backdrop = {};
+	credits_window(grs_canvas &src, int x, int y, int w, int h, RAIIPHYSFS_File f, const uint8_t bin_file) :
+		window(src, x, y, w, h), file(std::move(f)), have_bin_file(bin_file)
+	{
+	}
 };
 
 }
 
+}
+
 namespace dsx {
-static window_event_result credits_handler(window *, const d_event &event, credits *cr)
+
+namespace {
+
+struct credits_window : ::dcx::credits_window
+{
+	using ::dcx::credits_window::credits_window;
+	virtual window_event_result event_handler(const d_event &) override;
+};
+
+window_event_result credits_window::event_handler(const d_event &event)
 {
 	int l, y;
 	window_event_result result;
@@ -110,14 +124,19 @@ static window_event_result credits_handler(window *, const d_event &event, credi
 
 		case EVENT_MOUSE_BUTTON_DOWN:
 		case EVENT_MOUSE_BUTTON_UP:
-			if (event_mouse_get_button(event) == MBTN_LEFT || event_mouse_get_button(event) == MBTN_RIGHT)
+			if (event_mouse_get_button(event) == mbtn::left || event_mouse_get_button(event) == mbtn::right)
 			{
 				return window_event_result::close;
 			}
 			break;
 
+#if DXX_MAX_BUTTONS_PER_JOYSTICK
+		case EVENT_JOYSTICK_BUTTON_DOWN:
+			return window_event_result::close;
+#endif
+
 		case EVENT_IDLE:
-			if (cr->done>NUM_LINES)
+			if (done > NUM_LINES)
 			{
 				return window_event_result::close;
 			}
@@ -131,22 +150,23 @@ static window_event_result credits_handler(window *, const d_event &event, credi
 			timer_delay(F1_0/28);
 #endif
 			
-			if (cr->row == 0)
+			if (row == 0)
 			{
 				do {
-					cr->buffer_line = (cr->buffer_line+1) % NUM_LINES;
+					buffer_line = (buffer_line + 1) % NUM_LINES;
 #if defined(DXX_BUILD_DESCENT_II)
 				get_line:;
 #endif
-					if (PHYSFSX_fgets( cr->buffer[cr->buffer_line], cr->file ))	{
+					if (PHYSFSX_fgets(buffer[buffer_line], file))
+					{
 						char *p;
-						if (cr->have_bin_file) // is this a binary tbl file
-							decode_text_line (cr->buffer[cr->buffer_line]);
+						if (have_bin_file) // is this a binary tbl file
+							decode_text_line (buffer[buffer_line]);
 #if defined(DXX_BUILD_DESCENT_I)
-						p = strchr(&cr->buffer[cr->buffer_line][0],'\n');
+						p = strchr(&buffer[buffer_line][0],'\n');
 						if (p) *p = '\0';
 #elif defined(DXX_BUILD_DESCENT_II)
-						p = cr->buffer[cr->buffer_line];
+						p = buffer[buffer_line];
 						if (p[0] == ';')
 							goto get_line;
 						
@@ -163,33 +183,34 @@ static window_event_result credits_handler(window *, const d_event &event, credi
 #endif	
 					} else	{
 						//fseek( file, 0, SEEK_SET);
-						cr->buffer[cr->buffer_line][0] = 0;
-						cr->done++;
+						buffer[buffer_line][0] = 0;
+						done++;
 					}
-				} while (cr->extra_inc--);
-				cr->extra_inc = 0;
+				} while (extra_inc--);
+				extra_inc = 0;
 			}
 
 			// cheap but effective: towards end of credits sequence, fade out the music volume
-			if (cr->done >= NUM_LINES-16)
+			if (done >= NUM_LINES-16)
 			{
 				static int curvol = -10; 
 				if (curvol == -10) 
 					curvol = GameCfg.MusicVolume;
-				if (curvol > (NUM_LINES-cr->done)/2)
+				const auto limitvol = (NUM_LINES - done) / 2;
+				if (curvol > limitvol)
 				{
-					curvol = (NUM_LINES-cr->done)/2;
+					curvol = limitvol;
 					songs_set_volume(curvol);
 				}
 			}
 			
-			y = cr->first_line_offset - cr->row;
-			auto &canvas = *grd_curcanv;
-			show_fullscr(canvas, cr->backdrop);
+			y = first_line_offset - row;
+			auto &canvas = w_canv;
+			show_fullscr(canvas, backdrop);
 			for (uint_fast32_t j=0; j != NUM_LINES; ++j, y += ROW_SPACING)
 			{
-				l = (cr->buffer_line + j + 1 ) %  NUM_LINES;
-				const char *s = cr->buffer[l];
+				l = (buffer_line + j + 1 ) %  NUM_LINES;
+				const char *s = buffer[l];
 				if (!s)
 					continue;
 				
@@ -215,70 +236,49 @@ static window_event_result credits_handler(window *, const d_event &event, credi
 				}
 			}
 			
-			cr->row += SHEIGHT/200;
-			if (cr->row >= ROW_SPACING)
-				cr->row = 0;
+			row += SHEIGHT / 200;
+			if (row >= ROW_SPACING)
+				row = 0;
 			break;
 			}
 
 		case EVENT_WINDOW_CLOSE:
 			songs_set_volume(GameCfg.MusicVolume);
 			songs_play_song( SONG_TITLE, 1 );
-			std::default_delete<credits>()(cr);
 			break;
 		default:
 			break;
 	}
 	return window_event_result::ignored;
 }
-}
-
-namespace dsx {
 
 static void credits_show_common(RAIIPHYSFS_File file, const int have_bin_file)
 {
 	palette_array_t backdrop_palette;
-	auto cr = make_unique<credits>();
-	*cr = {};
-	cr->file = std::move(file);
-	cr->have_bin_file = have_bin_file;
+	auto cr = window_create<credits_window>(grd_curscreen->sc_canvas, 0, 0, SWIDTH, SHEIGHT, std::move(file), have_bin_file);
 
 	set_screen_mode(SCREEN_MENU);
 #if defined(DXX_BUILD_DESCENT_II)
 	gr_use_palette_table( "credits.256" );
 #endif
-	cr->backdrop.bm_data=NULL;
 
-	const auto pcx_error = pcx_read_bitmap(STARS_BACKGROUND, cr->backdrop,backdrop_palette);
-	if (pcx_error != PCX_ERROR_NONE)		{
-		return;
-	}
-
+	pcx_read_bitmap_or_default(STARS_BACKGROUND, cr->backdrop, backdrop_palette);
 	songs_play_song( SONG_CREDITS, 1 );
 
 	gr_remap_bitmap_good(cr->backdrop,backdrop_palette, -1, -1);
 
-	gr_set_default_canvas();
-	show_fullscr(*grd_curcanv, cr->backdrop);
+	show_fullscr(cr->w_canv, cr->backdrop);
 	gr_palette_load( gr_palette );
 
 	key_flush();
-
-	credits *pcr = cr.get();
-	const auto wind = window_create(grd_curscreen->sc_canvas, 0, 0, SWIDTH, SHEIGHT, credits_handler, cr.release());
-	if (!wind)
-	{
-		d_event event = { EVENT_WINDOW_CLOSE };
-		credits_handler(NULL, event, pcr);
-		return;
-	}
-
 	event_process_all();
+}
+
 }
 
 void credits_show(const char *const filename)
 {
-	if (auto &&file = PHYSFSX_openReadBuffered(filename))
+	if (auto &&file = PHYSFSX_openReadBuffered(filename).first)
 		credits_show_common(std::move(file), 1);
 }
 
@@ -286,14 +286,15 @@ void credits_show()
 {
 	const auto &&credits_file = CREDITS_FILE;
 	int have_bin_file = 0;
-	auto file = PHYSFSX_openReadBuffered(credits_file.first);
+	auto &&[file, physfserr] = PHYSFSX_openReadBuffered(credits_file.data());
 	if (!file)
 	{
 		char nfile[32];
-		snprintf(nfile, sizeof(nfile), "%.*sxb", credits_file.second, credits_file.first);
-		file = PHYSFSX_openReadBuffered(nfile);
-		if (!file)
-			Error("Missing CREDITS.TEX and CREDITS.TXB file\n");
+		snprintf(nfile, sizeof(nfile), "%.*sxb", static_cast<int>(credits_file.size()), credits_file.data());
+		auto &&[file2, physfserr2] = PHYSFSX_openReadBuffered(nfile);
+		if (!file2)
+			Error("Failed to open CREDITS.TEX and CREDITS.TXB file: \"%s\", \"%s\"\n", PHYSFS_getErrorByCode(physfserr), PHYSFS_getErrorByCode(physfserr2));
+		file = std::move(file2);
 		have_bin_file = 1;
 	}
 	credits_show_common(std::move(file), have_bin_file);

@@ -1,5 +1,7 @@
+DXX-Rebirth requires a compiler that implements the C++20 standard.  A fully conforming compiler is recommended, but some omissions can be handled by SConf tests that enable a fallback to emulate the feature.
+
 # Required C++11 features
-DXX-Rebirth code uses C++11 features present in >=clang-3.4 and >=gcc-4.9.  Some of these features are probed in the SConf tests so that an error can be reported if the feature is missing.  However, since these are considered the minimum supported compiler versions, and existing SConf tests reject gcc-4.8, some C++11 features that are new in gcc-4.9 may be used without a corresponding test in SConf.
+DXX-Rebirth code uses C++20 features present in >=clang-14.0 and >=gcc-10.4.  Some of these features are probed in the SConf tests so that an error can be reported if the feature is missing.  However, since these are considered the minimum supported compiler versions, and existing SConf tests reject older compilers, some C++20 features that are new in gcc-10.4 may be used without a corresponding test in SConf.
 
 These C++11 features are required to build DXX-Rebirth:
 
@@ -34,48 +36,38 @@ enum E { ... };`)
 * [Unique pointer template std::unique\_ptr<T\>][cppr:cpp/memory/unique_ptr]
 (`std::unique_ptr<int> i;
 std::unique_ptr<int[]> j;`)
-
-# Optional C++11/C++14 features
-DXX-Rebirth code uses C++11 or C++14 features not present in the minimum supported compiler if the feature can be emulated easily (C++11: [inheriting constructors][cppr:cpp/language/using_declaration], [Range-based for][cppr:cpp/language/range-for] ;C++14: [`std::exchange`][cppr:cpp/utility/exchange], [`std::index_sequence`][cppr:cpp/utility/integer_sequence], [`std::make_unique`][cppr:cpp/memory/unique_ptr/make_unique]) or if the feature can be removed by a macro and the removal does not change the correctness of the program (C++11: [rvalue-qualified member methods][scppr:rvalue method]).
-
-## Optional C++11 features
-### Emulated if absent
-
-* [Inheriting constructors][cppr:cpp/language/using_declaration] are wrapped by the macro `DXX_INHERIT_CONSTRUCTORS`.
-If inherited constructors are supported, then `DXX_INHERIT_CONSTRUCTORS` expands to a `using` declaration.
-If inherited constructors are not supported, then `DXX_INHERIT_CONSTRUCTORS` defines a [variadic template][cppr:cpp/language/parameter_pack] constructor to forward arguments to the base class.
-* [Range-based for][cppr:cpp/language/range-for] is wrapped by the macro `range_for`.
-This feature is present in the current minimum supported compiler versions.
-It was first used when >=gcc-4.5 was the minimum.
-Use of the `range_for` macro continues because it improves readability.
-
-### Preprocessed out if absent
-
-* [Static assertions][cppr:cpp/language/static_assert] check that a compile-time constant expressions evaluates to true.
-Static assertions are fully supported in >=gcc-4.7.
-Static assertions are partially supported in >=clang-3.4.
-Some complicated compile-time expressions are accepted by gcc, but are not considered as compile-time constant by clang.
-SConf checks whether the active compiler accepts such expressions and replaces `static_assert()` with a no-op macro if the compiler cannot handle them.
-    * As a consequence of the macro replacement, calls to `static_assert` must have two arguments as viewed by the C preprocessor.
-	When the truth argument has internal commas, the entire truth expression must be wrapped in parentheses to protect it from the preprocessor.
+* [Static assertions][cppr:cpp/language/static_assert]
+* `std::addressof`
+* [inheriting constructors][cppr:cpp/language/using_declaration]
+* [Range-based for][cppr:cpp/language/range-for]
 * [Reference-qualified methods][scppr:rvalue method] check that an rvalue which may or may not hold a valid pointer is not used in a context where the caller assumes the rvalue holds a valid pointer.
-When the rvalue may or may not hold a valid pointer, it must be saved to an lvalue, tested for a valid pointer, and used only if a valid pointer is found.
 
-## Optional C++14 features
-* [`std::exchange`][cppr:cpp/utility/exchange] is a convenience utility function.
-If `std::exchange` is available, then [`common/include/compiler-exchange.h`][src:compiler-exchange.h] uses `using std::exchange;` to bring `exchange` into the global namespace.
-If `std::exchange` is not available, then [`common/include/compiler-exchange.h`][src:compiler-exchange.h] provides a simple implementation of `exchange` in the global namespace.
+# Required C++14 features
 * [`std::index_sequence`][cppr:cpp/utility/integer_sequence] is a compile-time sequence of integers.
-If `std::index_sequence` is available, then [`common/include/compiler-integer_sequence.h`][src:compiler-integer_sequence.h] uses `using std::index_sequence;` to bring `index_sequence` into the global namespace.
-If `std::index_sequence` is not available, then [`common/include/compiler-integer_sequence.h`][src:compiler-integer_sequence.h] provides a simple implementation of `index_sequence` in the global namespace.  The simple implementation lacks standards-required features, but is sufficient for current Rebirth code.  The simple implementation may be extended to support standards-required features if a need exists.
+* [`std::exchange`][cppr:cpp/utility/exchange] is a utility to update a variable, and yield the value it had before the update
+* [`std::make_unique`][cppr:cpp/memory/unique_ptr/make_unique] is a convenience utility function for constructing `std::unique_ptr` with a managed value.
 
-	Regardless of whether `std::index_sequence` is available, [`common/include/compiler-integer_sequence.h`][src:compiler-integer_sequence.h] provides `::make_tree_index_sequence`, which is functionally equivalent to [`std::make_index_sequence`][scppr:make_integer_sequence], but generates sequences with shallower template recursion than gcc's `std::make_index_sequence`.  Sequences longer than the maximum template recursion depth cannot be generated using gcc's `std::make_index_sequence`, but can be generated by `::make_tree_index_sequence`.  `::make_tree_index_sequence` is still limited by the maximum template recursion depth, but can generate much deeper sequences before the recursion limit is triggered.  Given enough CPU time and swap space, `::make_tree_index_sequence` can instantiate a 10000000 element `index_sequence` when the maximum template depth is 900.  With enough patience and resources, higher values are likely possible.  However, even 10000000 produced very long compile times.
+# Required C++17 features
+* [Fold expressions][cppr:cpp/language/fold]
+* [Class template argument deduction][cppr:cpp/language/class_template_argument_deduction]
+* [`if constexpr`][cppr:cpp/language/if]
+* [inline variables][cppr:cpp/language/inline]
+* [structured bindings][cppr:cpp/language/structured_binding]
+* [initializers in `if`][cppr:cpp/language/if]
+* [attribute `[[fallthrough]]`][cppr:cpp/language/attributes/fallthrough]
+* [attribute `[[maybe_unused]]`][cppr:cpp/language/attributes/maybe_unused]
+* [attribute `[[nodiscard]]`][cppr:cpp/language/attributes/nodiscard]
+* [`std::optional`][cppr:cpp/utility/optional]
+* [non-member `std::size()`][cppr:cpp/iterator/size]
+* [non-member `std::data()`][cppr:cpp/iterator/data]
 
-    See [gcc bug #66059: make\_integer\_sequence should use a log(N) implementation][gccbug:66059] for the enhancement request to provide a library implementation with similar scaling ability.
-
-* [`std::make_unique`][cppr:cpp/memory/unique_ptr/make_unique] is a convenience utility function.
-If `std::make_unique` is available, then [`common/include/compiler-make_unique.h`][src:compiler-make_unique.h] uses `using std::make_unique;` to bring `make_unique` into the global namespace.
-If `std::make_unique` is not available, then [`common/include/compiler-make_unique.h`][src:compiler-make_unique.h] provides a simple implementation of `make_unique` in the global namespace.
+# Required C++20 features
+* [3-way comparison `operator<=>`][scppr:operator_comparison]
+* [explicitly defaulted `operator==()`][cppr:cpp/language/default_comparisons]
+* [designated initializers][cppr:cpp/language/aggregate_initialization#Designated_initializers]
+* [constraints and concepts][cppr:cpp/language/constraints]
+* [`std::span`][cppr:cpp/container/span]
+* [`std::endian`][cppr:cpp/types/endian]
 
 [cppr:cpp/language/reference]: https://en.cppreference.com/w/cpp/language/reference
 [cppr:cpp/language/parameter_pack]: https://en.cppreference.com/w/cpp/language/parameter_pack
@@ -97,8 +89,21 @@ If `std::make_unique` is not available, then [`common/include/compiler-make_uniq
 [cppr:cpp/language/using_declaration]: https://en.cppreference.com/w/cpp/language/using_declaration
 [cppr:cpp/language/range-for]: https://en.cppreference.com/w/cpp/language/range-for
 [cppr:cpp/language/static_assert]: https://en.cppreference.com/w/cpp/language/static_assert
-[src:compiler-exchange.h]: ../common/include/compiler-exchange.h
-[src:compiler-integer_sequence.h]: ../common/include/compiler-integer_sequence.h
-[scppr:make_integer_sequence]: https://en.cppreference.com/w/cpp/utility/integer_sequence#Helper_templates
-[gccbug:66059]: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=66059
-[src:compiler-make_unique.h]: ../common/include/compiler-make_unique.h
+[cppr:cpp/language/fold]: https://en.cppreference.com/w/cpp/language/fold
+[cppr:cpp/language/class_template_argument_deduction]: https://en.cppreference.com/w/cpp/language/class_template_argument_deduction
+[cppr:cpp/language/if]: https://en.cppreference.com/w/cpp/language/if
+[cppr:cpp/language/inline]: https://en.cppreference.com/w/cpp/language/inline
+[cppr:cpp/language/structured_binding]: https://en.cppreference.com/w/cpp/language/structured_binding
+[cppr:cpp/language/if]: https://en.cppreference.com/w/cpp/language/if
+[cppr:cpp/language/attributes/fallthrough]: https://en.cppreference.com/w/cpp/language/attributes/fallthrough
+[cppr:cpp/language/attributes/maybe_unused]: https://en.cppreference.com/w/cpp/language/attributes/maybe_unused
+[cppr:cpp/language/attributes/nodiscard]: https://en.cppreference.com/w/cpp/language/attributes/nodiscard
+[cppr:cpp/utility/optional]: https://en.cppreference.com/w/cpp/utility/optional
+[cppr:cpp/iterator/size]: https://en.cppreference.com/w/cpp/iterator/size
+[cppr:cpp/iterator/data]: https://en.cppreference.com/w/cpp/iterator/data
+[scppr:operator_comparison]: https://en.cppreference.com/w/cpp/language/operator_comparison#Three-way_comparison
+[cppr:cpp/language/default_comparisons]: https://en.cppreference.com/w/cpp/language/default_comparisons
+[cppr:cpp/language/aggregate_initialization#Designated_initializers]: https://en.cppreference.com/w/cpp/language/aggregate_initialization#Designated_initializers
+[cppr:cpp/language/constraints]: https://en.cppreference.com/w/cpp/language/constraints
+[cppr:cpp/container/span]: https://en.cppreference.com/w/cpp/container/span
+[cppr:cpp/types/endian]: https://en.cppreference.com/w/cpp/types/endian

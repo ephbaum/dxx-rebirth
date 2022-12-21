@@ -36,15 +36,13 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "songs.h"
 #include "kconfig.h"
 #include "palette.h"
-#include "args.h"
-#include "player.h"
 #include "digi.h"
 #include "mission.h"
 #include "u_mem.h"
 #include "physfsx.h"
 #include "nvparse.h"
-
-#include "compiler-make_unique.h"
+#include "ogl_init.h"
+#include <memory>
 
 namespace dcx {
 CCfg CGameCfg;
@@ -98,12 +96,12 @@ int ReadConfigFile()
 	GameCfg.MusicVolume = 8;
 	GameCfg.ReverseStereo = 0;
 	GameCfg.OrigTrackOrder = 0;
-#if SDL_MAJOR_VERSION == 1 && defined(__APPLE__) && defined(__MACH__)
+#if DXX_USE_SDL_REDBOOK_AUDIO && defined(__APPLE__) && defined(__MACH__)
 	GameCfg.MusicType = MUSIC_TYPE_REDBOOK;
 #else
 	GameCfg.MusicType = MUSIC_TYPE_BUILTIN;
 #endif
-	GameCfg.CMLevelMusicPlayOrder = MUSIC_CM_PLAYORDER_CONT;
+	CGameCfg.CMLevelMusicPlayOrder = LevelMusicPlayOrder::Continuous;
 	CGameCfg.CMLevelMusicTrack[0] = -1;
 	CGameCfg.CMLevelMusicTrack[1] = -1;
 	CGameCfg.CMLevelMusicPath = {};
@@ -112,7 +110,7 @@ int ReadConfigFile()
 	const auto userdir = PHYSFS_getUserDir();
 	GameCfg.OrigTrackOrder = 1;
 #if defined(DXX_BUILD_DESCENT_I)
-	GameCfg.CMLevelMusicPlayOrder = MUSIC_CM_PLAYORDER_LEVEL;
+	CGameCfg.CMLevelMusicPlayOrder = LevelMusicPlayOrder::Level;
 	CGameCfg.CMLevelMusicPath = "descent.m3u";
 	snprintf(CGameCfg.CMMiscMusic[SONG_TITLE].data(), CGameCfg.CMMiscMusic[SONG_TITLE].size(), "%s%s", userdir, "Music/iTunes/iTunes Music/Insanity/Descent/02 Primitive Rage.mp3");
 	snprintf(CGameCfg.CMMiscMusic[SONG_CREDITS].data(), CGameCfg.CMMiscMusic[SONG_CREDITS].size(), "%s%s", userdir, "Music/iTunes/iTunes Music/Insanity/Descent/05 The Darkness Of Space.mp3");
@@ -125,15 +123,15 @@ int ReadConfigFile()
 	snprintf(CGameCfg.CMMiscMusic[SONG_ENDLEVEL].data(), CGameCfg.CMMiscMusic[SONG_ENDLEVEL].size(), "%s%s", userdir, "Music/iTunes/iTunes Music/Insanity/Descent/04 Close Call.mp3");
 	snprintf(CGameCfg.CMMiscMusic[SONG_ENDGAME].data(), CGameCfg.CMMiscMusic[SONG_ENDGAME].size(), "%s%s", userdir, "Music/iTunes/iTunes Music/Insanity/Descent/14 Insanity.mp3");
 #endif
-	GameCfg.GammaLevel = 0;
+	CGameCfg.GammaLevel = 0;
 	GameCfg.LastPlayer = {};
 	CGameCfg.LastMission = "";
-	GameCfg.ResolutionX = 640;
-	GameCfg.ResolutionY = 480;
+	CGameCfg.ResolutionX = 1024;
+	CGameCfg.ResolutionY = 768;
 	GameCfg.AspectX = 3;
 	GameCfg.AspectY = 4;
 	CGameCfg.WindowMode = false;
-	CGameCfg.TexFilt = 0;
+	CGameCfg.TexFilt = opengl_texture_filter::classic;
 	CGameCfg.TexAnisotropy = 0;
 #if defined(DXX_BUILD_DESCENT_II)
 	GameCfg.MovieTexFilt = 0;
@@ -145,7 +143,7 @@ int ReadConfigFile()
 	CGameCfg.Grabinput = true;
 
 
-	auto infile = PHYSFSX_openReadBuffered("descent.cfg");
+	auto infile = PHYSFSX_openReadBuffered("descent.cfg").first;
 	if (!infile)
 	{
 		return 1;
@@ -172,7 +170,11 @@ int ReadConfigFile()
 		else if (cmp(lb, eq, MusicTypeStr))
 			convert_integer(GameCfg.MusicType, value);
 		else if (cmp(lb, eq, CMLevelMusicPlayOrderStr))
-			convert_integer(GameCfg.CMLevelMusicPlayOrder, value);
+		{
+			unsigned CMLevelMusicPlayOrder;
+			if (convert_integer(CMLevelMusicPlayOrder, value) && CMLevelMusicPlayOrder <= static_cast<unsigned>(LevelMusicPlayOrder::Random))
+				CGameCfg.CMLevelMusicPlayOrder = static_cast<LevelMusicPlayOrder>(CMLevelMusicPlayOrder);
+		}
 		else if (cmp(lb, eq, CMLevelMusicTrack0Str))
 			convert_integer(CGameCfg.CMLevelMusicTrack[0], value);
 		else if (cmp(lb, eq, CMLevelMusicTrack1Str))
@@ -191,17 +193,17 @@ int ReadConfigFile()
 			convert_string(CGameCfg.CMMiscMusic[SONG_CREDITS], value, eol);
 		else if (cmp(lb, eq, GammaLevelStr))
 		{
-			convert_integer(GameCfg.GammaLevel, value);
-			gr_palette_set_gamma( GameCfg.GammaLevel );
+			convert_integer(CGameCfg.GammaLevel, value);
+			gr_palette_set_gamma(CGameCfg.GammaLevel);
 		}
 		else if (cmp(lb, eq, LastPlayerStr))
-			GameCfg.LastPlayer.copy_lower(value, std::distance(value, eol));
+			GameCfg.LastPlayer.copy_lower(std::span(value, std::distance(value, eol)));
 		else if (cmp(lb, eq, LastMissionStr))
 			convert_string(CGameCfg.LastMission, value, eol);
 		else if (cmp(lb, eq, ResolutionXStr))
-			convert_integer(GameCfg.ResolutionX, value);
+			convert_integer(CGameCfg.ResolutionX, value);
 		else if (cmp(lb, eq, ResolutionYStr))
-			convert_integer(GameCfg.ResolutionY, value);
+			convert_integer(CGameCfg.ResolutionY, value);
 		else if (cmp(lb, eq, AspectXStr))
 			convert_integer(GameCfg.AspectX, value);
 		else if (cmp(lb, eq, AspectYStr))
@@ -209,7 +211,20 @@ int ReadConfigFile()
 		else if (cmp(lb, eq, WindowModeStr))
 			convert_integer(CGameCfg.WindowMode, value);
 		else if (cmp(lb, eq, TexFiltStr))
-			convert_integer(CGameCfg.TexFilt, value);
+		{
+			uint8_t TexFilt;
+			if (convert_integer(TexFilt, value))
+			{
+				switch (TexFilt)
+				{
+					case static_cast<unsigned>(opengl_texture_filter::classic):
+					case static_cast<unsigned>(opengl_texture_filter::upscale):
+					case static_cast<unsigned>(opengl_texture_filter::trilinear):
+						CGameCfg.TexFilt = opengl_texture_filter{TexFilt};
+						break;
+				}
+			}
+		}
 		else if (cmp(lb, eq, TexAnisStr))
 			convert_integer(CGameCfg.TexAnisotropy, value);
 #if defined(DXX_BUILD_DESCENT_II)
@@ -238,10 +253,10 @@ int ReadConfigFile()
 	if ( GameCfg.DigiVolume > 8 ) GameCfg.DigiVolume = 8;
 	if ( GameCfg.MusicVolume > 8 ) GameCfg.MusicVolume = 8;
 
-	if (GameCfg.ResolutionX >= 320 && GameCfg.ResolutionY >= 200)
+	if (CGameCfg.ResolutionX >= 320 && CGameCfg.ResolutionY >= 200)
 	{
-		Game_screen_mode.width = GameCfg.ResolutionX;
-		Game_screen_mode.height = GameCfg.ResolutionY;
+		Game_screen_mode.width = CGameCfg.ResolutionX;
+		Game_screen_mode.height = CGameCfg.ResolutionY;
 	}
 
 	return 0;
@@ -249,9 +264,9 @@ int ReadConfigFile()
 
 int WriteConfigFile()
 {
-	GameCfg.GammaLevel = gr_palette_get_gamma();
+	CGameCfg.GammaLevel = gr_palette_get_gamma();
 
-	auto infile = PHYSFSX_openWriteBuffered("descent.cfg");
+	auto infile = PHYSFSX_openWriteBuffered("descent.cfg").first;
 	if (!infile)
 	{
 		return 1;
@@ -261,7 +276,7 @@ int WriteConfigFile()
 	PHYSFSX_printf(infile, "%s=%d\n", ReverseStereoStr, GameCfg.ReverseStereo);
 	PHYSFSX_printf(infile, "%s=%d\n", OrigTrackOrderStr, GameCfg.OrigTrackOrder);
 	PHYSFSX_printf(infile, "%s=%d\n", MusicTypeStr, GameCfg.MusicType);
-	PHYSFSX_printf(infile, "%s=%d\n", CMLevelMusicPlayOrderStr, GameCfg.CMLevelMusicPlayOrder);
+	PHYSFSX_printf(infile, "%s=%d\n", CMLevelMusicPlayOrderStr, static_cast<int>(CGameCfg.CMLevelMusicPlayOrder));
 	PHYSFSX_printf(infile, "%s=%d\n", CMLevelMusicTrack0Str, CGameCfg.CMLevelMusicTrack[0]);
 	PHYSFSX_printf(infile, "%s=%d\n", CMLevelMusicTrack1Str, CGameCfg.CMLevelMusicTrack[1]);
 	PHYSFSX_printf(infile, "%s=%s\n", CMLevelMusicPathStr, CGameCfg.CMLevelMusicPath.data());
@@ -270,15 +285,15 @@ int WriteConfigFile()
 	PHYSFSX_printf(infile, "%s=%s\n", CMMiscMusic2Str, CGameCfg.CMMiscMusic[SONG_ENDLEVEL].data());
 	PHYSFSX_printf(infile, "%s=%s\n", CMMiscMusic3Str, CGameCfg.CMMiscMusic[SONG_ENDGAME].data());
 	PHYSFSX_printf(infile, "%s=%s\n", CMMiscMusic4Str, CGameCfg.CMMiscMusic[SONG_CREDITS].data());
-	PHYSFSX_printf(infile, "%s=%d\n", GammaLevelStr, GameCfg.GammaLevel);
-	PHYSFSX_printf(infile, "%s=%s\n", LastPlayerStr, static_cast<const char *>(get_local_player().callsign));
+	PHYSFSX_printf(infile, "%s=%d\n", GammaLevelStr, CGameCfg.GammaLevel);
+	PHYSFSX_printf(infile, "%s=%s\n", LastPlayerStr, static_cast<const char *>(InterfaceUniqueState.PilotName));
 	PHYSFSX_printf(infile, "%s=%s\n", LastMissionStr, static_cast<const char *>(CGameCfg.LastMission));
 	PHYSFSX_printf(infile, "%s=%i\n", ResolutionXStr, SM_W(Game_screen_mode));
 	PHYSFSX_printf(infile, "%s=%i\n", ResolutionYStr, SM_H(Game_screen_mode));
 	PHYSFSX_printf(infile, "%s=%i\n", AspectXStr, GameCfg.AspectX);
 	PHYSFSX_printf(infile, "%s=%i\n", AspectYStr, GameCfg.AspectY);
 	PHYSFSX_printf(infile, "%s=%i\n", WindowModeStr, CGameCfg.WindowMode);
-	PHYSFSX_printf(infile, "%s=%i\n", TexFiltStr, CGameCfg.TexFilt);
+	PHYSFSX_printf(infile, "%s=%i\n", TexFiltStr, static_cast<unsigned>(CGameCfg.TexFilt));
 	PHYSFSX_printf(infile, "%s=%i\n", TexAnisStr, CGameCfg.TexAnisotropy);
 #if defined(DXX_BUILD_DESCENT_II)
 	PHYSFSX_printf(infile, "%s=%i\n", MovieTexFiltStr, GameCfg.MovieTexFilt);

@@ -42,15 +42,13 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 // -----------------------------------------------------------------------------
 //	Return light intensity at an instance of a vertex on a side in a segment.
-static fix get_light_intensity(const unique_side &s, const uint_fast32_t vert)
+static fix get_light_intensity(const unique_side &s, const side_relative_vertnum vert)
 {
-	Assert(vert <= 3);
 	return s.uvls[vert].l;
 }
 
-static fix get_light_intensity(const unique_segment &segp, const uint_fast32_t sidenum, const uint_fast32_t vert)
+static fix get_light_intensity(const unique_segment &segp, const sidenum_t sidenum, const side_relative_vertnum vert)
 {
-	Assert(sidenum <= MAX_SIDES_PER_SEGMENT);
 	return get_light_intensity(segp.sides[sidenum], vert);
 }
 
@@ -65,16 +63,14 @@ static fix clamp_light_intensity(const fix intensity)
 
 // -----------------------------------------------------------------------------
 //	Set light intensity at a vertex, saturating in .5 to 15.5
-static void set_light_intensity(unique_side &s, const uint_fast32_t vert, const fix intensity)
+static void set_light_intensity(unique_side &s, const side_relative_vertnum vert, const fix intensity)
 {
-	Assert(vert <= 3);
 	s.uvls[vert].l = clamp_light_intensity(intensity);
 	Update_flags |= UF_WORLD_CHANGED;
 }
 
-static void set_light_intensity(unique_segment &segp, const uint_fast32_t sidenum, const uint_fast32_t vert, const fix intensity)
+static void set_light_intensity(unique_segment &segp, const sidenum_t sidenum, const side_relative_vertnum vert, const fix intensity)
 {
-	Assert(sidenum <= MAX_SIDES_PER_SEGMENT);
 	set_light_intensity(segp.sides[sidenum], vert, intensity);
 }
 
@@ -101,16 +97,16 @@ static void add_light_intensity_all_verts(unique_side &s, const fix intensity)
 //		Note that it is also possible to visit the original light-casting segment, for example
 //		going from segment 0 to 2, then from 2 to 0.  This is peculiar and probably not
 //		desired, but not entirely invalid.  2 reflects some light back to 0.
-static void apply_light_intensity(const vmsegptr_t segp, const unsigned sidenum, fix intensity, const unsigned depth)
+static void apply_light_intensity(const csmusegment segp, const sidenum_t sidenum, fix intensity, const unsigned depth)
 {
 	if (intensity == 0)
 		return;
 
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
 	auto &vcwallptr = Walls.vcptr;
-	const auto wid_result = WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, segp, segp, sidenum);
-	if (!(wid_result & WID_RENDPAST_FLAG)) {
-		add_light_intensity_all_verts(segp->unique_segment::sides[sidenum], intensity);
+	const auto wid_result = WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, segp, sidenum);
+	if (!(wid_result & WALL_IS_DOORWAY_FLAG::rendpast)) {
+		add_light_intensity_all_verts(segp.u.sides[sidenum], intensity);
 		return;										// we return because there is a wall here, and light does not shine through walls
 	}
 
@@ -119,8 +115,8 @@ static void apply_light_intensity(const vmsegptr_t segp, const unsigned sidenum,
 		intensity /= 3;
 		if (!intensity)
 			return;
-		const auto &&csegp = vmsegptr(segp->children[sidenum]);
-		for (int s=0; s<MAX_SIDES_PER_SEGMENT; s++)
+		const csmusegment &&csegp = vmsegptr(segp.s.children[sidenum]);
+		for (const auto s : MAX_SIDES_PER_SEGMENT)
 			apply_light_intensity(csegp, s, intensity, depth+1);
 	}
 
@@ -133,25 +129,23 @@ static void apply_light_intensity(const vmsegptr_t segp, const unsigned sidenum,
 //	the associated intensity to segp.  It calls apply_light_intensity to apply intensity/3
 //	to all neighbors.  apply_light_intensity recursively calls itself to apply light to
 //	subsequent neighbors (and forming loops, see above).
-static void propagate_light_intensity(const vmsegptr_t segp, int sidenum) 
+static void propagate_light_intensity(const csmusegment segp, const sidenum_t sidenum)
 {
 	fix		intensity;
-	short		texmap;
 
 	intensity = 0;
-	auto &us = segp->unique_segment::sides[sidenum];
+	auto &us = segp.u.sides[sidenum];
 	auto &TmapInfo = LevelUniqueTmapInfoState.TmapInfo;
-	texmap = us.tmap_num;
+	const auto texmap = get_texture_index(us.tmap_num);
 	intensity += TmapInfo[texmap].lighting;
-	texmap = us.tmap_num2 & 0x3fff;
-	intensity += TmapInfo[texmap].lighting;
+	intensity += TmapInfo[get_texture_index(us.tmap_num2)].lighting;
 
 	if (intensity > 0) {
 		add_light_intensity_all_verts(us, intensity);
 	
 		//	Now, for all sides which are not the same as sidenum (the side casting the light),
 		//	add a light value to them (if they have no children, ie, they have a wall there).
-		for (int s=0; s<MAX_SIDES_PER_SEGMENT; s++)
+		for (const auto s : MAX_SIDES_PER_SEGMENT)
 			if (s != sidenum)
 				apply_light_intensity(segp, s, intensity/2, 1);
 	}
@@ -166,7 +160,7 @@ int LightAmbientLighting()
 {
 	range_for (const auto &&segp, vmsegptr)
 	{
-		for (int side=0;side<MAX_SIDES_PER_SEGMENT;side++)
+		for (const auto side : MAX_SIDES_PER_SEGMENT)
 			propagate_light_intensity(segp, side);
 	}
 	return 0;
@@ -176,24 +170,16 @@ int LightAmbientLighting()
 // -----------------------------------------------------------------------------
 int LightSelectNextVertex(void)
 {
-	Curvert++;
-	if (Curvert >= 4)
-		Curvert = 0;
-
+	Curvert = next_side_vertex(Curvert);
 	Update_flags |= UF_WORLD_CHANGED;
-
 	return	1;
 }
 
 // -----------------------------------------------------------------------------
 int LightSelectNextEdge(void)
 {
-	Curedge++;
-	if (Curedge >= 4)
-		Curedge = 0;
-
+	Curedge = next_side_vertex(Curedge);
 	Update_flags |= UF_WORLD_CHANGED;
-
 	return	1;
 }
 
@@ -203,10 +189,10 @@ int LightCopyIntensity(void)
 {
 	int	intensity;
 
-	const vmsegptr_t segp = Cursegp;
+	unique_segment &segp = Cursegp;
 	intensity = get_light_intensity(segp, Curside, Curvert);
 
-	range_for (const int v, xrange(4u))
+	for (const auto v : MAX_VERTICES_PER_SIDE)
 		if (v != Curvert)
 			set_light_intensity(segp, Curside, v, intensity);
 
@@ -219,11 +205,11 @@ int LightCopyIntensitySegment(void)
 {
 	int	intensity;
 
-	const vmsegptr_t segp = Cursegp;
+	unique_segment &segp = Cursegp;
 	intensity = get_light_intensity(segp, Curside, Curvert);
 
-	for (int s=0; s<MAX_SIDES_PER_SEGMENT; s++)
-		range_for (const int v, xrange(4u))
+	for (const auto s : MAX_SIDES_PER_SEGMENT)
+		for (const auto v : MAX_VERTICES_PER_SIDE)
 			if ((s != Curside) || (v != Curvert))
 				set_light_intensity(segp, s, v, intensity);
 
@@ -233,7 +219,7 @@ int LightCopyIntensitySegment(void)
 // -----------------------------------------------------------------------------
 int LightDecreaseLightVertex(void)
 {
-	const vmsegptr_t segp = Cursegp;
+	unique_segment &segp = Cursegp;
 	set_light_intensity(segp, Curside, Curvert, get_light_intensity(segp, Curside, Curvert) - F1_0 / NUM_LIGHTING_LEVELS);
 
 	return	1;
@@ -242,7 +228,7 @@ int LightDecreaseLightVertex(void)
 // -----------------------------------------------------------------------------
 int LightIncreaseLightVertex(void)
 {
-	const vmsegptr_t segp = Cursegp;
+	unique_segment &segp = Cursegp;
 	set_light_intensity(segp, Curside, Curvert, get_light_intensity(segp, Curside, Curvert) + F1_0 / NUM_LIGHTING_LEVELS);
 
 	return	1;
@@ -251,8 +237,8 @@ int LightIncreaseLightVertex(void)
 // -----------------------------------------------------------------------------
 int LightDecreaseLightSide(void)
 {
-	const vmsegptr_t segp = Cursegp;
-	range_for (const int v, xrange(4u))
+	unique_segment &segp = Cursegp;
+	for (const auto v : MAX_VERTICES_PER_SIDE)
 		set_light_intensity(segp, Curside, v, get_light_intensity(segp, Curside, v) - F1_0 / NUM_LIGHTING_LEVELS);
 
 	return	1;
@@ -261,8 +247,8 @@ int LightDecreaseLightSide(void)
 // -----------------------------------------------------------------------------
 int LightIncreaseLightSide(void)
 {
-	const vmsegptr_t segp = Cursegp;
-	range_for (const int v, xrange(4u))
+	unique_segment &segp = Cursegp;
+	for (const auto v : MAX_VERTICES_PER_SIDE)
 		set_light_intensity(segp, Curside, v, get_light_intensity(segp, Curside, v) + F1_0 / NUM_LIGHTING_LEVELS);
 
 	return	1;
@@ -271,9 +257,9 @@ int LightIncreaseLightSide(void)
 // -----------------------------------------------------------------------------
 int LightDecreaseLightSegment(void)
 {
-	const vmsegptr_t segp = Cursegp;
-	for (int s=0; s<MAX_SIDES_PER_SEGMENT; s++)
-		range_for (const int v, xrange(4u))
+	unique_segment &segp = Cursegp;
+	for (const auto s : MAX_SIDES_PER_SEGMENT)
+		for (const auto v : MAX_VERTICES_PER_SIDE)
 			set_light_intensity(segp, s, v, get_light_intensity(segp, s, v) - F1_0 / NUM_LIGHTING_LEVELS);
 
 	return	1;
@@ -282,9 +268,9 @@ int LightDecreaseLightSegment(void)
 // -----------------------------------------------------------------------------
 int LightIncreaseLightSegment(void)
 {
-	const vmsegptr_t segp = Cursegp;
-	for (int s=0; s<MAX_SIDES_PER_SEGMENT; s++)
-		range_for (const int v, xrange(4u))
+	unique_segment &segp = Cursegp;
+	for (const auto s : MAX_SIDES_PER_SEGMENT)
+		for (const auto v : MAX_VERTICES_PER_SIDE)
 			set_light_intensity(segp, s, v, get_light_intensity(segp, s, v) + F1_0 / NUM_LIGHTING_LEVELS);
 
 	return	1;
@@ -293,8 +279,8 @@ int LightIncreaseLightSegment(void)
 // -----------------------------------------------------------------------------
 int LightSetDefault(void)
 {
-	const vmsegptr_t segp = Cursegp;
-	range_for (const int v, xrange(4u))
+	unique_segment &segp = Cursegp;
+	for (const auto v : MAX_VERTICES_PER_SIDE)
 		set_light_intensity(segp, Curside, v, DEFAULT_LIGHTING);
 
 	return	1;
@@ -304,8 +290,8 @@ int LightSetDefault(void)
 // -----------------------------------------------------------------------------
 int LightSetMaximum(void)
 {
-	const vmsegptr_t segp = Cursegp;
-	range_for (const int v, xrange(4u))
+	unique_segment &segp = Cursegp;
+	for (const auto v : MAX_VERTICES_PER_SIDE)
 		set_light_intensity(segp, Curside, v, (NUM_LIGHTING_LEVELS - 1) * F1_0 / NUM_LIGHTING_LEVELS);
 
 	return	1;

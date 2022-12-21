@@ -36,7 +36,6 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "inferno.h"
 #include "segment.h"
 #include "dxxerror.h"
-#include "render.h"
 #include "game.h"
 #include "vclip.h"
 #include "lighting.h"
@@ -55,22 +54,24 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "multi.h"
 #include "palette.h"
 #include "bm.h"
-#include "rle.h"
 #include "wall.h"
 
 #include "compiler-range_for.h"
+#include "d_bitset.h"
+#include "d_levelstate.h"
 #include "partial_range.h"
 #include "d_range.h"
 
 using std::min;
 
-static int Do_dynamic_light=1;
-static int use_fcd_lighting;
-
 #define	HEADLIGHT_CONE_DOT	(F1_0*9/10)
 #define	HEADLIGHT_SCALE		(F1_0*10)
 
 namespace dcx {
+namespace {
+
+static int Do_dynamic_light=1;
+static int use_fcd_lighting;
 
 static void add_light_div(g3s_lrgb &d, const g3s_lrgb &light, const fix &scale)
 {
@@ -110,12 +111,16 @@ static fix compute_fireball_light_emission_intensity(const d_vclip_array &Vclip,
 }
 
 }
+}
 
 // ----------------------------------------------------------------------------------------------
 namespace dsx {
+namespace {
 
-static void apply_light(fvmsegptridx &vmsegptridx, const g3s_lrgb obj_light_emission, const vcsegptridx_t obj_seg, const vms_vector &obj_pos, const unsigned n_render_vertices, array<unsigned, MAX_VERTICES> &render_vertices, const array<segnum_t, MAX_VERTICES> &vert_segnum_list, const icobjptridx_t objnum)
+static void apply_light(fvmsegptridx &vmsegptridx, const g3s_lrgb obj_light_emission, const vcsegptridx_t obj_seg, const vms_vector &obj_pos, const unsigned n_render_vertices, std::array<vertnum_t, MAX_VERTICES> &render_vertices, const std::array<segnum_t, MAX_VERTICES> &vert_segnum_list, const icobjptridx_t objnum)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	if (((obj_light_emission.r+obj_light_emission.g+obj_light_emission.b)/3) > 0)
 	{
 		fix obji_64 = ((obj_light_emission.r+obj_light_emission.g+obj_light_emission.b)/3)*64;
@@ -126,7 +131,6 @@ static void apply_light(fvmsegptridx &vmsegptridx, const g3s_lrgb obj_light_emis
 #endif
 
 		auto &Dynamic_light = LevelUniqueLightState.Dynamic_light;
-		auto &Vertices = LevelSharedVertexState.get_vertices();
 		auto &vcvertptr = Vertices.vcptr;
 		// for pretty dim sources, only process vertices in object's own segment.
 		//	12/04/95, MK, markers only cast light in own segment.
@@ -159,22 +163,19 @@ static void apply_light(fvmsegptridx &vmsegptridx, const g3s_lrgb obj_light_emis
 						headlight_shift = 3;
 						if (get_player_id(obj) != Player_num)
 						{
-							fvi_query	fq;
 							fvi_info		hit_data;
-							int			fate;
 
 							const auto tvec = vm_vec_scale_add(obj.pos, obj.orient.fvec, F1_0*200);
-
-							fq.startseg				= obj_seg;
-							fq.p0						= &obj.pos;
-							fq.p1						= &tvec;
-							fq.rad					= 0;
-							fq.thisobjnum			= objnum;
-							fq.ignore_obj_list.first = nullptr;
-							fq.flags					= FQ_TRANSWALL;
-
-							fate = find_vector_intersection(fq, hit_data);
-							if (fate != HIT_NONE)
+							const auto fate = find_vector_intersection(fvi_query{
+								obj.pos,
+								tvec,
+								fvi_query::unused_ignore_obj_list,
+								fvi_query::unused_LevelUniqueObjectState,
+								fvi_query::unused_Robot_info,
+								FQ_TRANSWALL,
+								objnum,
+							}, obj_seg, 0, hit_data);
+							if (fate != fvi_hit_type::None)
 								max_headlight_dist = vm_vec_mag_quick(vm_vec_sub(hit_data.hit_pnt, obj.pos)) + F1_0*4;
 						}
 					}
@@ -191,7 +192,7 @@ static void apply_light(fvmsegptridx &vmsegptridx, const g3s_lrgb obj_light_emis
 
 				if (use_fcd_lighting && abs(obji_64) > F1_0*32)
 				{
-					dist = find_connected_distance(obj_pos, obj_seg, vertpos, vmsegptridx(vsegnum), n_render_vertices, WID_RENDPAST_FLAG|WID_FLY_FLAG);
+					dist = find_connected_distance(obj_pos, obj_seg, vertpos, vmsegptridx(vsegnum), n_render_vertices, WALL_IS_DOORWAY_FLAG::rendpast | WALL_IS_DOORWAY_FLAG::fly);
 					if (dist >= 0)
 						apply_light = 1;
 				}
@@ -235,12 +236,14 @@ static void apply_light(fvmsegptridx &vmsegptridx, const g3s_lrgb obj_light_emis
 	}
 }
 }
+}
 
 #define FLASH_LEN_FIXED_SECONDS (F1_0/3)
 #define FLASH_SCALE             (3*F1_0/FLASH_LEN_FIXED_SECONDS)
+namespace {
 
 // ----------------------------------------------------------------------------------------------
-static void cast_muzzle_flash_light(fvmsegptridx &vmsegptridx, int n_render_vertices, array<unsigned, MAX_VERTICES> &render_vertices, const array<segnum_t, MAX_VERTICES> &vert_segnum_list)
+static void cast_muzzle_flash_light(fvmsegptridx &vmsegptridx, int n_render_vertices, std::array<vertnum_t, MAX_VERTICES> &render_vertices, const std::array<segnum_t, MAX_VERTICES> &vert_segnum_list)
 {
 	fix64 current_time;
 	short time_since_flash;
@@ -267,21 +270,23 @@ static void cast_muzzle_flash_light(fvmsegptridx &vmsegptridx, int n_render_vert
 }
 
 // Translation table to make flares flicker at different rates
-const array<fix, 16> Obj_light_xlate{{0x1234, 0x3321, 0x2468, 0x1735,
+const std::array<fix, 16> Obj_light_xlate{{0x1234, 0x3321, 0x2468, 0x1735,
 			    0x0123, 0x19af, 0x3f03, 0x232a,
 			    0x2123, 0x39af, 0x0f03, 0x132a,
 			    0x3123, 0x29af, 0x1f03, 0x032a
 }};
 #if defined(DXX_BUILD_DESCENT_I)
 #define compute_player_light_emission_intensity(LevelUniqueHeadlightState, obj)	compute_player_light_emission_intensity(obj)
-#define compute_light_emission(LevelSharedRobotInfoState, LevelUniqueHeadlightState, Vclip, obj)	compute_light_emission(Vclip, obj)
+#define compute_light_emission(Robot_info, LevelUniqueHeadlightState, Vclip, obj)	compute_light_emission(Vclip, obj)
 #elif defined(DXX_BUILD_DESCENT_II)
 #undef compute_player_light_emission_intensity
 #undef compute_light_emission
 #endif
+}
 
 // ---------------------------------------------------------
 namespace dsx {
+namespace {
 
 #if defined(DXX_BUILD_DESCENT_II)
 static fix compute_player_light_emission_intensity(d_level_unique_headlight_state &LevelUniqueHeadlightState, const object &objp)
@@ -302,17 +307,14 @@ static fix compute_player_light_emission_intensity(d_level_unique_headlight_stat
 		const auto s = fix_sin(static_cast<fix>(GameTime64 >> 1) & 0xFFFF); // probably a bad way to do it
 		return fixmul((s + F1_0) >> 1, hoardlight);
 	}
-	return compute_player_light_emission_intensity(objp);
+	return ::dcx::compute_player_light_emission_intensity(objp);
 }
 #endif
 
-static g3s_lrgb compute_light_emission(const d_level_shared_robot_info_state &LevelSharedRobotInfoState, d_level_unique_headlight_state &LevelUniqueHeadlightState, const d_vclip_array &Vclip, const vcobjptridx_t obj)
+static g3s_lrgb compute_light_emission(const d_robot_info_array &Robot_info, d_level_unique_headlight_state &LevelUniqueHeadlightState, const d_vclip_array &Vclip, const vcobjptridx_t obj)
 {
 	int compute_color = 0;
 	fix light_intensity = 0;
-#if defined(DXX_BUILD_DESCENT_II)
-	auto &Robot_info = LevelSharedRobotInfoState.Robot_info;
-#endif
 	const object &objp = obj;
 	switch (objp.type)
 	{
@@ -473,12 +475,11 @@ static g3s_lrgb compute_light_emission(const d_level_shared_robot_info_state &Le
 
 		if (t_idx_s != -1 && t_idx_e != -1)
 		{
-			obj_color.r = obj_color.g = obj_color.b = 0;
-			range_for (const int i, xrange(t_idx_s, t_idx_e + 1))
+			obj_color = {};
+			for (const uint16_t i : xrange(t_idx_s, t_idx_e + 1))
 			{
 				grs_bitmap *bm = &GameBitmaps[i];
-				bitmap_index bi;
-				bi.index = i;
+				const bitmap_index bi{i};
 				PIGGY_PAGE_IN(bi);
 				obj_color.r += bm->avg_color_rgb[0];
 				obj_color.g += bm->avg_color_rgb[1];
@@ -502,13 +503,15 @@ static g3s_lrgb compute_light_emission(const d_level_shared_robot_info_state &Le
 	return white_light();
 }
 
+}
+
 // ----------------------------------------------------------------------------------------------
-void set_dynamic_light(render_state_t &rstate)
+void set_dynamic_light(const d_robot_info_array &Robot_info, render_state_t &rstate)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vcobjptridx = Objects.vcptridx;
-	array<unsigned, MAX_VERTICES> render_vertices;
-	array<segnum_t, MAX_VERTICES> vert_segnum_list;
+	std::array<vertnum_t, MAX_VERTICES> render_vertices;
+	std::array<segnum_t, MAX_VERTICES> vert_segnum_list;
 	static fix light_time; 
 
 #if defined(DXX_BUILD_DESCENT_II)
@@ -523,23 +526,17 @@ void set_dynamic_light(render_state_t &rstate)
 		return;
 	light_time = light_time - (F1_0/60);
 
-	std::bitset<MAX_VERTICES> render_vertex_flags;
+	enumerated_bitset<MAX_VERTICES, vertnum_t> render_vertex_flags;
 
 	//	Create list of vertices that need to be looked at for setting of ambient light.
 	auto &Dynamic_light = LevelUniqueLightState.Dynamic_light;
 	uint_fast32_t n_render_vertices = 0;
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	range_for (const auto segnum, partial_const_range(rstate.Render_list, rstate.N_render_segs))
 	{
 		if (segnum != segment_none) {
 			auto &vp = Segments[segnum].verts;
 			range_for (const auto vnum, vp)
 			{
-				if (vnum > Vertices.get_count() - 1)
-				{
-					Int3();		//invalid vertex number
-					continue;	//ignore it, and go on to next one
-				}
 				auto &&b = render_vertex_flags[vnum];
 				if (!b)
 				{
@@ -560,7 +557,7 @@ void set_dynamic_light(render_state_t &rstate)
 		const object &objp = obj;
 		if (objp.type == OBJ_NONE)
 			continue;
-		const auto &&obj_light_emission = compute_light_emission(LevelSharedRobotInfoState, LevelUniqueLightState, Vclip, obj);
+		const auto &&obj_light_emission = compute_light_emission(Robot_info, LevelUniqueLightState, Vclip, obj);
 
 		if (((obj_light_emission.r+obj_light_emission.g+obj_light_emission.b)/3) > 0)
 			apply_light(vmsegptridx, obj_light_emission, vcsegptridx(objp.segnum), objp.pos, n_render_vertices, render_vertices, vert_segnum_list, obj);
@@ -581,6 +578,8 @@ void toggle_headlight_active(object &player)
 	}
 }
 
+namespace {
+
 static fix compute_headlight_light_on_object(const d_level_unique_headlight_state &LevelUniqueHeadlightState, const object_base &objp)
 {
 	fix	light;
@@ -593,8 +592,7 @@ static fix compute_headlight_light_on_object(const d_level_unique_headlight_stat
 
 	range_for (const object_base *const light_objp, partial_const_range(LevelUniqueHeadlightState.Headlights, LevelUniqueHeadlightState.Num_headlights))
 	{
-		auto vec_to_obj = vm_vec_sub(objp.pos, light_objp->pos);
-		const fix dist = vm_vec_normalize_quick(vec_to_obj);
+		const auto &&[dist, vec_to_obj] = vm_vec_normalize_quick_with_magnitude(vm_vec_sub(objp.pos, light_objp->pos));
 		if (dist > 0) {
 			const fix dot = vm_vec_dot(light_objp->orient.fvec, vec_to_obj);
 
@@ -606,14 +604,18 @@ static fix compute_headlight_light_on_object(const d_level_unique_headlight_stat
 	}
 	return light;
 }
+
+}
 #endif
 
 }
 
+namespace {
+
 //compute the average dynamic light in a segment.  Takes the segment number
-static g3s_lrgb compute_seg_dynamic_light(const array<g3s_lrgb, MAX_VERTICES> &Dynamic_light, const shared_segment &seg)
+static g3s_lrgb compute_seg_dynamic_light(const enumerated_array<g3s_lrgb, MAX_VERTICES, vertnum_t> &Dynamic_light, const shared_segment &seg)
 {
-	const auto &&op = [&Dynamic_light](g3s_lrgb r, const unsigned v) {
+	const auto &&op = [&Dynamic_light](g3s_lrgb r, const vertnum_t v) {
 		r.r += Dynamic_light[v].r;
 		r.g += Dynamic_light[v].g;
 		r.b += Dynamic_light[v].b;
@@ -626,10 +628,11 @@ static g3s_lrgb compute_seg_dynamic_light(const array<g3s_lrgb, MAX_VERTICES> &D
 	return sum;
 }
 
-static array<g3s_lrgb, MAX_OBJECTS> object_light;
-static array<object_signature_t, MAX_OBJECTS> object_sig;
-const object *old_viewer;
+static std::array<g3s_lrgb, MAX_OBJECTS> object_light;
+static std::array<object_signature_t, MAX_OBJECTS> object_sig;
 static int reset_lighting_hack;
+}
+const object *old_viewer;
 #define LIGHT_RATE i2f(4) //how fast the light ramps up
 
 void start_lighting_frame(const object &viewer)
@@ -649,8 +652,8 @@ g3s_lrgb compute_object_light(const d_level_unique_light_state &LevelUniqueLight
 	const vcobjidx_t objnum = obj;
 
 	//First, get static (mono) light for this segment
-	const auto &&objsegp = vcsegptr(obj->segnum);
-	light.r = light.g = light.b = objsegp->static_light;
+	const cscusegment objsegp = vcsegptr(obj->segnum);
+	light.r = light.g = light.b = objsegp.u.static_light;
 
 	auto &os = object_sig[objnum];
 	auto &ol = object_light[objnum];

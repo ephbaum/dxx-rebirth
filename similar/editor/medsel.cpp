@@ -29,8 +29,6 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include <string.h>
 #include "gr.h"
 #include "ui.h"
-#include "key.h"
-#include "dxxerror.h"
 #include "u_mem.h"
 #include "inferno.h"
 #include "gameseg.h"
@@ -46,20 +44,19 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "compiler-range_for.h"
 
 //find the distance between a segment and a point
-static fix compute_dist(const vcsegptr_t seg,const vms_vector &pos)
+static vm_magnitude compute_dist(const shared_segment &seg, const vms_vector &pos)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
 	auto delta = compute_segment_center(vcvertptr, seg);
 	vm_vec_sub2(delta,pos);
-
 	return vm_vec_mag(delta);
-
 }
 
 void sort_seg_list(count_segment_array_t &segnumlist,const vms_vector &pos)
 {
-	array<fix, MAX_SEGMENTS> dist;
+	std::array<fix, MAX_SEGMENTS> dist;
 	range_for (const auto &ss, segnumlist)
 		dist[ss] = compute_dist(vcsegptr(ss), pos);
 	auto predicate = [&dist](count_segment_array_t::const_reference a, count_segment_array_t::const_reference b) {
@@ -78,6 +75,8 @@ int SortSelectedList(void)
 
 int SelectNextFoundSeg(void)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	if (++Found_seg_index >= Found_segs.size())
 		Found_seg_index = 0;
 
@@ -88,7 +87,6 @@ int SelectNextFoundSeg(void)
 
 	if (Lock_view_to_cursegp)
 	{
-		auto &Vertices = LevelSharedVertexState.get_vertices();
 		auto &vcvertptr = Vertices.vcptr;
 		set_view_target_from_segment(vcvertptr, Cursegp);
 	}
@@ -100,6 +98,8 @@ int SelectNextFoundSeg(void)
 
 int SelectPreviousFoundSeg(void)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	if (Found_seg_index > 0)
 		Found_seg_index--;
 	else
@@ -112,7 +112,6 @@ int SelectPreviousFoundSeg(void)
 
 	if (Lock_view_to_cursegp)
 	{
-		auto &Vertices = LevelSharedVertexState.get_vertices();
 		auto &vcvertptr = Vertices.vcptr;
 		set_view_target_from_segment(vcvertptr, Cursegp);
 	}

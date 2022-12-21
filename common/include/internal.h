@@ -11,16 +11,13 @@
 #include "dxxsconf.h"
 #if DXX_USE_OGL
 #include "ogl_init.h" // interface to OpenGL module
+#include "ogl_extensions.h"
 #include "gr.h"
 
-#ifdef __cplusplus
-
-
+namespace dcx {
 void ogl_init_texture_list_internal(void);
 void ogl_smash_texture_list_internal(void);
-void ogl_vivify_texture_list_internal(void);
 
-namespace dcx {
 extern int linedotscale;
 
 extern int GL_TEXTURE_2D_enabled;
@@ -47,27 +44,11 @@ static inline void OGL_VIEWPORT(const unsigned x, const unsigned y, const unsign
 		glViewport(x,grd_curscreen->sc_canvas.cv_bitmap.bm_h-y-h,w,h);
 	}
 }
-}
 
 #ifdef dsx
-namespace dsx {
-
 //platform specific funcs
-extern void ogl_swap_buffers_internal(void);
-
+void ogl_swap_buffers_internal();
+#endif
 }
-#endif
 
-//whee
-#define CPAL2Tr(c) ((gr_current_pal[c].r)/63.0)
-#define CPAL2Tg(c) ((gr_current_pal[c].g)/63.0)
-#define CPAL2Tb(c) ((gr_current_pal[c].b)/63.0)
-#define PAL2Tr(c) ((gr_palette[c].r)/63.0)
-#define PAL2Tg(c) ((gr_palette[c].g)/63.0)
-#define PAL2Tb(c) ((gr_palette[c].b)/63.0)
-//inline GLfloat PAL2Tr(int c);
-//inline GLfloat PAL2Tg(int c);
-//inline GLfloat PAL2Tb(int c);
-
-#endif
 #endif

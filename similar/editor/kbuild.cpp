@@ -24,10 +24,8 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
  */
 
 #include <string.h>
-#include "inferno.h"
 #include "editor/editor.h"
 #include "editor/esegment.h"
-#include "gameseg.h"
 #include "gamesave.h"
 #include "kdefs.h"
 #include "compiler-range_for.h"
@@ -76,10 +74,9 @@ int FormJoint()
 //  ---------- Create a bridge segment between current segment:side adjacent segment:side ----------
 int CreateAdjacentJoint()
 {
-	int		adj_side;
-	imsegptridx_t adj_sp = segment_none;
-
-	if (med_find_adjacent_segment_side(Cursegp, Curside, adj_sp, &adj_side)) {
+	if (const auto o = med_find_adjacent_segment_side(Cursegp, Curside))
+	{
+		const auto [adj_sp, adj_side] = *o;
 		if (Cursegp->children[Curside] != adj_sp) {
 			med_form_joint(Cursegp,Curside,adj_sp,adj_side);
 			Update_flags |= UF_WORLD_CHANGED;
@@ -99,16 +96,15 @@ int CreateAdjacentJoint()
 //  ---------- Create a bridge segment between current segment:side adjacent segment:side ----------
 int CreateSloppyAdjacentJoint()
 {
-	int		adj_side;
-	imsegptridx_t adj_sp = segment_none;
-
 	save_level(
 #if defined(DXX_BUILD_DESCENT_II)
 		LevelSharedSegmentState.DestructibleLights,
 #endif
 		"SLOPPY.LVL");
 
-	if (med_find_closest_threshold_segment_side(Cursegp, Curside, adj_sp, &adj_side, 20*F1_0)) {
+	if (const auto o = med_find_closest_threshold_segment_side(Cursegp, Curside, 20*F1_0))
+	{
+		const auto [adj_sp, adj_side] = *o;
 		if (Cursegp->children[Curside] != adj_sp) {
 			if (!med_form_joint(Cursegp,Curside,adj_sp,adj_side))
 				{
@@ -121,7 +117,7 @@ int CreateSloppyAdjacentJoint()
 				}
 			else editor_status("Could not form sloppy joint.\n");
 		} else
-			editor_status("Attempted to form sloppy joint through connected side -- joint segment not formed (you bozo).");
+			editor_status("Attempted to form sloppy joint through connected side -- joint segment not formed.");
 	} else
 		editor_status("Could not find close threshold segment -- joint segment not formed.");
 
@@ -132,17 +128,17 @@ int CreateSloppyAdjacentJoint()
 //  -------------- Create all sloppy joints within CurrentGroup ------------------
 int CreateSloppyAdjacentJointsGroup()
 {
-	int		adj_side;
 	int		done_been_a_change = 0;
 	range_for(const auto &gs, GroupList[current_group].segments)
 	{
 		auto segp = vmsegptridx(gs);
 
-		for (int sidenum=0; sidenum < MAX_SIDES_PER_SEGMENT; sidenum++)
+		for (const auto sidenum : MAX_SIDES_PER_SEGMENT)
 			if (!IS_CHILD(segp->children[sidenum]))
 			{
-				imsegptridx_t adj_sp = segment_none;
-				if (med_find_closest_threshold_segment_side(segp, sidenum, adj_sp, &adj_side, 5*F1_0)) {
+				if (const auto o = med_find_closest_threshold_segment_side(segp, sidenum, 5*F1_0))
+				{
+					const auto [adj_sp, adj_side] = *o;
 					if (adj_sp->group == segp->group) {
 						if (segp->children[sidenum] != adj_sp)
 							if (!med_form_joint(segp, sidenum, adj_sp,adj_side))
@@ -168,14 +164,16 @@ int CreateSloppyAdjacentJointsGroup()
 //  ---------- Create a bridge segment between current segment and all adjacent segment:side ----------
 int CreateAdjacentJointsSegment()
 {
-	int		adj_side;
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 
 	auto &Vertex_active = LevelSharedVertexState.get_vertex_active();
 	med_combine_duplicate_vertices(Vertex_active);
 
-	for (int s=0; s<MAX_SIDES_PER_SEGMENT; s++) {
-		imsegptridx_t adj_sp = segment_none;
-		if (med_find_adjacent_segment_side(Cursegp, s, adj_sp, &adj_side))
+	for (const auto s : MAX_SIDES_PER_SEGMENT)
+	{
+		if (const auto o = med_find_adjacent_segment_side(Cursegp, s))
+		{
+			const auto [adj_sp, adj_side] = *o;
 			if (Cursegp->children[s] != adj_sp)
 					{
 					med_form_joint(Cursegp,s,adj_sp,adj_side);
@@ -186,6 +184,7 @@ int CreateAdjacentJointsSegment()
 				undo_status[Autosave_count] = "Adjacent Joint segment UNDONE.";
 	    			warn_if_concave_segments();
 					}
+		}
 	}
 
 	return 1;
@@ -194,19 +193,21 @@ int CreateAdjacentJointsSegment()
 //  ---------- Create a bridge segment between all segment:side and all adjacent segment:side ----------
 int CreateAdjacentJointsAll()
 {
-	int		adj_side;
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 
 	auto &Vertex_active = LevelSharedVertexState.get_vertex_active();
 	med_combine_duplicate_vertices(Vertex_active);
 
 	range_for (const auto &&segp, vmsegptridx)
 	{
-		for (int s=0; s<MAX_SIDES_PER_SEGMENT; s++)
+		for (const auto s : MAX_SIDES_PER_SEGMENT)
 		{
-			imsegptridx_t adj_sp = segment_none;
-			if (med_find_adjacent_segment_side(segp, s, adj_sp, &adj_side))
+			if (const auto o = med_find_adjacent_segment_side(segp, s))
+			{
+				const auto [adj_sp, adj_side] = *o;
 				if (segp->children[s] != adj_sp)
 						med_form_joint(segp,s,adj_sp,adj_side);
+			}
 		}
 	}
 

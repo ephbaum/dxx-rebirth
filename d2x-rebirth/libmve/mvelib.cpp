@@ -13,19 +13,14 @@
 #endif
 
 #include "mvelib.h"
+#include <memory>
 
-#include "compiler-make_unique.h"
+namespace {
 
 static const char  MVE_HEADER[]  = "Interplay MVE File\x1A";
 constexpr short MVE_HDRCONST1 = 0x001A;
 constexpr short MVE_HDRCONST2 = 0x0100;
 constexpr short MVE_HDRCONST3 = 0x1133;
-
-mve_cb_Read mve_read;
-mve_cb_Alloc mve_alloc;
-mve_cb_Free mve_free;
-mve_cb_ShowFrame mve_showframe;
-mve_cb_SetPalette mve_setpalette;
 
 /*
  * private utility functions
@@ -36,7 +31,6 @@ static uint16_t _mve_get_ushort(const unsigned char *data);
 /*
  * private functions for mvefile
  */
-static int _mvefile_open(MVEFILE *movie, void *stream);
 static int  _mvefile_read_header(const MVEFILE *movie);
 static void _mvefile_set_buffer_size(MVEFILE *movie, std::size_t buf_size);
 static int _mvefile_fetch_next_chunk(MVEFILE *movie);
@@ -44,24 +38,25 @@ static int _mvefile_fetch_next_chunk(MVEFILE *movie);
 /*
  * private functions for mvestream
  */
-static int _mvestream_open(MVESTREAM *movie, void *stream);
 static void _mvestream_reset(MVESTREAM *movie);
+
+}
 
 /************************************************************
  * public MVEFILE functions
  ************************************************************/
 
+namespace {
+
 /*
  * open an MVE file
  */
-std::unique_ptr<MVEFILE> mvefile_open(void *stream)
+std::unique_ptr<MVEFILE> mvefile_open(MVEFILE::stream_type *const stream)
 {
-    /* create the file */
-	auto file = make_unique<MVEFILE>();
-	if (! _mvefile_open(file.get(), stream))
-    {
+	if (!stream)
 		return nullptr;
-    }
+    /* create the file */
+	auto file = std::make_unique<MVEFILE>(stream);
 
     /* initialize the file */
 	_mvefile_set_buffer_size(file.get(), 1024);
@@ -75,6 +70,15 @@ std::unique_ptr<MVEFILE> mvefile_open(void *stream)
     /* now, prefetch the next chunk */
 	_mvefile_fetch_next_chunk(file.get());
     return file;
+}
+
+/*
+ * open an MVESTREAM object
+ */
+static const MVEFILE *_mvestream_open(MVESTREAM *movie, MVEFILE::stream_type *const stream)
+{
+    movie->movie = mvefile_open(stream);
+    return movie->movie.get();
 }
 
 /*
@@ -104,6 +108,8 @@ static bool have_segment_header(const MVEFILE *movie)
 	if (movie->cur_chunk.size() - movie->next_segment <= 4)
 		return false;
 	return true;
+}
+
 }
 
 /*
@@ -179,10 +185,10 @@ int mvefile_fetch_next_chunk(MVEFILE *movie)
 /*
  * open an MVE stream
  */
-MVESTREAM_ptr_t mve_open(void *stream)
+MVESTREAM_ptr_t mve_open(MVEFILE::stream_type *const stream)
 {
     /* allocate */
-	auto movie = make_unique<MVESTREAM>();
+	auto movie = std::make_unique<MVESTREAM>();
 
     /* open */
     if (! _mvestream_open(movie.get(), stream))
@@ -258,7 +264,8 @@ int mve_play_next_chunk(MVESTREAM &movie)
 /*
  * allocate an MVEFILE
  */
-MVEFILE::MVEFILE()
+MVEFILE::MVEFILE(MVEFILE::stream_type *const stream) :
+	stream(stream)
 {
 }
 
@@ -269,17 +276,7 @@ MVEFILE::~MVEFILE()
 {
 }
 
-/*
- * open the file stream in thie object
- */
-static int _mvefile_open(MVEFILE *file, void *stream)
-{
-    file->stream = stream;
-    if (! file->stream)
-        return 0;
-
-    return 1;
-}
+namespace {
 
 /*
  * read and verify the header of the recently opened file
@@ -293,7 +290,7 @@ static int _mvefile_read_header(const MVEFILE *movie)
         return 0;
 
     /* check the file is long enough */
-    if (! mve_read(movie->stream, buffer, 26))
+	if (!MovieFileRead(movie->stream, buffer, 26))
         return 0;
 
     /* check the signature */
@@ -334,7 +331,7 @@ static int _mvefile_fetch_next_chunk(MVEFILE *movie)
         return 0;
 
     /* fail if we can't read the next segment descriptor */
-    if (! mve_read(movie->stream, buffer, 4))
+	if (!MovieFileRead(movie->stream, buffer, 4))
         return 0;
 
     /* pull out the next length */
@@ -344,7 +341,7 @@ static int _mvefile_fetch_next_chunk(MVEFILE *movie)
     _mvefile_set_buffer_size(movie, length);
 
     /* read the chunk */
-    if (! mve_read(movie->stream, &movie->cur_chunk[0], length))
+	if (!MovieFileRead(movie->stream, &movie->cur_chunk[0], length))
         return 0;
     movie->cur_chunk.resize(length);
     movie->next_segment = 0;
@@ -366,6 +363,8 @@ static uint16_t _mve_get_ushort(const unsigned char *data)
     return value;
 }
 
+}
+
 /*
  * allocate an MVESTREAM
  */
@@ -378,15 +377,7 @@ MVESTREAM::~MVESTREAM()
 {
 }
 
-/*
- * open an MVESTREAM object
- */
-static int _mvestream_open(MVESTREAM *movie, void *stream)
-{
-    movie->movie = mvefile_open(stream);
-
-    return (movie->movie == NULL) ? 0 : 1;
-}
+namespace {
 
 /*
  * reset an MVESTREAM
@@ -394,4 +385,6 @@ static int _mvestream_open(MVESTREAM *movie, void *stream)
 static void _mvestream_reset(MVESTREAM *movie)
 {
 	mvefile_reset(movie->movie.get());
+}
+
 }

@@ -30,17 +30,21 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 namespace dcx {
 
-static void gr_linear_darken(uint8_t *const dest, unsigned darkening_level, unsigned count, const gft_array1 &fade_table)
+namespace {
+
+static void gr_linear_darken(uint8_t *const dest, const gr_fade_level darkening_level, const unsigned count, const gft_array1 &fade_table)
 {
 	auto &t = fade_table[darkening_level];
 	const auto predicate = [&](const uint8_t c) { return t[c]; };
 	std::transform(dest, dest + count, dest, predicate);
 }
 
+}
+
 #define gr_linear_stosd(D,C,N)	memset(D,C,N)
 
 #if DXX_USE_OGL
-static
+namespace {
 #endif
 void gr_uscanline(grs_canvas &canvas, const unsigned x1, const unsigned x2, const unsigned y, const uint8_t color)
 {
@@ -54,14 +58,20 @@ void gr_uscanline(grs_canvas &canvas, const unsigned x1, const unsigned x2, cons
 				const auto data = &canvas.cv_bitmap.get_bitmap_data()[canvas.cv_bitmap.bm_rowsize * y + x1];
 				const auto cv_fade_level = canvas.cv_fade_level;
 				const auto count = x2 - x1 + 1;
-				if (cv_fade_level >= gr_fade_table.size())
+				if (!gr_fade_table.valid_index(cv_fade_level))
 					gr_linear_stosd(data, static_cast<uint8_t>(color), count);
 				else
 					gr_linear_darken(data, cv_fade_level, count, gr_fade_table);
 			}
 			break;
+		case bm_mode::ilbm:
+		case bm_mode::rgb15:
+			break;
 		}
 }
+#if DXX_USE_OGL
+}
+#endif
 
 void gr_scanline(grs_canvas &canvas, int x1, int x2, const unsigned y, const uint8_t color)
 {

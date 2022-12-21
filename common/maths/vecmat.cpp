@@ -24,6 +24,7 @@ namespace dcx {
 //#define USE_ISQRT 1
 
 constexpr vms_matrix vmd_identity_matrix = IDENTITY_MATRIX;
+constexpr vms_vector vmd_zero_vector{};
 
 //adds two vectors, fills in dest, returns ptr to dest
 //ok for dest to equal either source, but should use vm_vec_add2() if so
@@ -128,7 +129,7 @@ void vm_vec_scale2(vms_vector &dest,fix n,fix d)
 #endif
 }
 
-static fix vm_vec_dot3(fix x,fix y,fix z,const vms_vector &v) __attribute_warn_unused_result;
+[[nodiscard]]
 static fix vm_vec_dot3(fix x,fix y,fix z,const vms_vector &v)
 {
 #if 0
@@ -159,7 +160,6 @@ fix vm_vec_dot(const vms_vector &v0,const vms_vector &v1)
 	return vm_vec_dot3(v0.x, v0.y, v0.z, v1);
 }
 
-//returns magnitude of a vector
 vm_magnitude_squared vm_vec_mag2(const vms_vector &v)
 {
 	const int64_t x = v.x;
@@ -171,7 +171,7 @@ vm_magnitude_squared vm_vec_mag2(const vms_vector &v)
 vm_magnitude vm_vec_mag(const vms_vector &v)
 {
 	quadint q;
-	q.q = vm_vec_mag2(v).d2;
+	q.q = static_cast<uint64_t>(vm_vec_mag2(v));
 	return vm_magnitude{quad_sqrt(q)};
 }
 

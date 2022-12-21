@@ -24,7 +24,7 @@ void display_cocoa_alert(const char *message, int error)
 {
 	NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
 	NSAlert *alert = [[NSAlert alloc] init];
-	alert.alertStyle = error == 1 ? NSCriticalAlertStyle : NSWarningAlertStyle;
+	alert.alertStyle = error == 1 ? NSAlertStyleCritical : NSAlertStyleWarning;
 	alert.messageText = error ? @"Sorry, a critical error has occurred." : @"Attention!";
 	alert.informativeText = [NSString stringWithUTF8String:message];
 	
@@ -33,9 +33,9 @@ void display_cocoa_alert(const char *message, int error)
 	[pool drain];
 }
 
-void msgbox_warning(const char *message)
+void msgbox_warning(const std::span<const char> message)
 {
-	display_cocoa_alert(message, 0);
+	display_cocoa_alert(message.data(), 0);
 }
 
 void msgbox_error(const char *message)

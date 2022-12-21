@@ -30,14 +30,14 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 void assign_light_to_side(unique_side &);
 #ifdef dsx
-static inline void assign_light_to_side(unique_segment &sp, const uint_fast32_t sidenum)
+static inline void assign_light_to_side(unique_segment &sp, const sidenum_t sidenum)
 {
 	assign_light_to_side(sp.sides[sidenum]);
 }
 
 extern void assign_default_lighting_all(void);
 namespace dsx {
-void stretch_uvs_from_curedge(vmsegptridx_t segp, int side);
+void stretch_uvs_from_curedge(vmsegptridx_t segp, sidenum_t side);
 }
 #endif
 

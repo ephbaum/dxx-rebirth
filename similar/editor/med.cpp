@@ -55,7 +55,6 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "mouse.h"
 #include "dxxerror.h"
 #include "kfuncs.h"
-#include "macro.h"
 #ifdef INCLUDE_XLISP
 #include "medlisp.h"
 #endif
@@ -69,12 +68,12 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "kdefs.h"
 #include "func.h"
 #include "textures.h"
+#include "text.h"
 #include "screens.h"
 #include "texmap.h"
 #include "object.h"
 #include "effects.h"
 #include "info.h"
-#include "ai.h"
 #include "console.h"
 #include "texpage.h"		// Textue selection paging stuff
 #include "objpage.h"		// Object selection paging stuff
@@ -83,11 +82,7 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "medmisc.h"
 #include "meddraw.h"
 #include "medsel.h"
-#include "medrobot.h"
 #include "medwall.h"
-#include "eswitch.h"
-#include "ehostage.h"
-#include "centers.h"
 
 #include "fuelcen.h"
 #include "gameseq.h"
@@ -98,26 +93,28 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "gamepal.h"
 #endif
 
-#include "dxxsconf.h"
 #include "compiler-range_for.h"
+#include "d_levelstate.h"
+#include "d_zip.h"
 
 //#define _MARK_ON 1
 //#include <wsample.h>		//should come after inferno.h to get mark setting //Not included here.
 
 #define COMPRESS_INTERVAL	5			// seconds
 
-static void med_show_warning(const char *s);
+static void med_show_warning(std::span<const char> s);
 
 //char *undo_status[128];
 
 int initializing;
 
 //these are instances of canvases, pointed to by variables below
-grs_canvas _canv_editor_game, _canv_editor; //the game on the editor screen, the canvas that the editor writes to
+grs_subcanvas _canv_editor_game; // the game on the editor screen
+static grs_subcanvas _canv_editor; // the canvas that the editor writes to
 
 //these are pointers to our canvases
 grs_canvas *Canv_editor;			//the editor screen
-grs_canvas *const Canv_editor_game = &_canv_editor_game; //the game on the editor screen
+grs_subcanvas *const Canv_editor_game = &_canv_editor_game; //the game on the editor screen
 
 window *Pad_info;		// Keypad text
 
@@ -128,17 +125,11 @@ vms_vector Ed_view_target;
 
 editor_gamestate gamestate = editor_gamestate::none;
 
-UI_DIALOG * EditorWindow = NULL;
+editor_dialog *EditorWindow;
 
 int	Large_view_index = -1;
 
 std::unique_ptr<UI_GADGET_USERBOX> GameViewBox, LargeViewBox, GroupViewBox;
-
-#if ORTHO_VIEWS
-UI_GADGET_USERBOX * TopViewBox;
-UI_GADGET_USERBOX * FrontViewBox;
-UI_GADGET_USERBOX * RightViewBox;
-#endif
 
 static std::unique_ptr<UI_GADGET_ICON>
 	ViewIcon,
@@ -154,36 +145,19 @@ static std::unique_ptr<UI_GADGET_ICON>
 
 int	Found_seg_index=0;				// Index in Found_segs corresponding to Cursegp
 
-namespace {
-	
-class editor_dialog
-{
-public:
-	array<std::unique_ptr<UI_GADGET_BUTTON>, 9> pad_goto;
-	std::unique_ptr<UI_GADGET_BUTTON>
-		pad_prev,
-		pad_next;
-};
-
-}
-
-static editor_dialog editor_window;
-
-
-static void print_status_bar(char (&message)[DIAGNOSTIC_MESSAGE_MAX])
+static void print_status_bar(const std::array<char, DIAGNOSTIC_MESSAGE_MAX> &message)
 {
 	gr_set_default_canvas();
 	auto &canvas = *grd_curcanv;
 	const auto &editor_font = *::editor_font;
 	gr_set_fontcolor(canvas, CBLACK, CGREY);
-	int w,h;
-	gr_get_string_size(editor_font, message, &w, &h, nullptr);
-	gr_string(canvas, editor_font, 4, 583, message, w, h);
+	const auto &&[w, h] = gr_get_string_size(editor_font, message.data());
+	gr_string(canvas, editor_font, 4, 583, message.data(), w, h);
 	gr_set_fontcolor(canvas, CBLACK, CWHITE);
 	gr_rect(canvas, 4+w, 583, 799, 599, CGREY);
 }
 
-static char status_line[DIAGNOSTIC_MESSAGE_MAX] = "";
+static std::array<char, DIAGNOSTIC_MESSAGE_MAX> status_line;
 
 struct tm	Editor_status_last_time;
 
@@ -192,7 +166,7 @@ void (editor_status_fmt)( const char *format, ... )
 	va_list ap;
 
 	va_start(ap, format);
-	vsnprintf(status_line, sizeof(status_line), format, ap);
+	vsnprintf(status_line.data(), status_line.size(), format, ap);
 	va_end(ap);
 
 	Editor_status_last_time = Editor_time_of_day;
@@ -200,8 +174,8 @@ void (editor_status_fmt)( const char *format, ... )
 
 void editor_status( const char *text)
 {
-	strcpy(status_line, text);
 	Editor_status_last_time = Editor_time_of_day;
+	strcpy(status_line.data(), text);
 }
 
 // 	int  tm_sec;	/* seconds after the minute -- [0,61] */
@@ -220,12 +194,8 @@ static void clear_editor_status(void)
 	int erase_time = Editor_status_last_time.tm_hour * 3600 + Editor_status_last_time.tm_min*60 + Editor_status_last_time.tm_sec + EDITOR_STATUS_MESSAGE_DURATION;
 
 	if (cur_time > erase_time) {
-		int	i;
-
-		for (i=0; i<DIAGNOSTIC_MESSAGE_MAX-1; i++)
-			status_line[i] = ' ';
-
-		status_line[i] = 0;
+		std::fill(status_line.begin(), std::prev(status_line.end()), ' ');
+		status_line.back() = 0;
 		Editor_status_last_time.tm_hour = 99;
 	}
 }
@@ -236,7 +206,7 @@ static inline void editor_slew_init()
 	auto &vmobjptr = Objects.vmptr;
 	Viewer = ConsoleObject;
 	slew_init(vmobjptr(ConsoleObject));
-	init_player_object();
+	init_player_object(LevelSharedPolygonModelState, *ConsoleObject);
 }
 
 int DropIntoDebugger()
@@ -325,7 +295,7 @@ int GotoMainMenu()
 	return 1;
 }
 
-static array<int (*)(), 2048> KeyFunction;
+static std::array<int (*)(), 2048> KeyFunction;
 
 static void medkey_init()
 {
@@ -336,7 +306,7 @@ static void medkey_init()
 
 	KeyFunction = {};
 
-	if (auto keyfile = PHYSFSX_openReadBuffered("GLOBAL.KEY"))
+	if (auto keyfile = PHYSFSX_openReadBuffered("GLOBAL.KEY").first)
 	{
 		PHYSFSX_gets_line_t<200> line_buffer;
 		while (PHYSFSX_fgets(line_buffer, keyfile))
@@ -360,7 +330,6 @@ static int padnum=0;
 
 static void init_editor_screen(grs_canvas &canvas);
 static void gamestate_restore_check();
-static window_event_result editor_handler(UI_DIALOG *dlg,const d_event &event, unused_ui_userdata_t *data);
 static void close_editor();
 
 namespace dsx {
@@ -380,10 +349,11 @@ void init_editor()
 	ModeFlag = Game_wind ? 3 : 2;	// go back to where we were unless we loaded everything properly
 
 	// first, make sure we can find the files we need
-	PHYSFSX_addRelToSearchPath("editor/data", 1);	// look in source directory first (for work in progress)
-	PHYSFSX_addRelToSearchPath("editor", 1);		// then in editor directory
-	PHYSFSX_addRelToSearchPath("editor.zip", 1);	// then in a zip file
-	PHYSFSX_addRelToSearchPath("editor.dxa", 1);	// or addon pack
+	std::array<char, PATH_MAX> pathname;
+	PHYSFSX_addRelToSearchPath("editor/data", pathname, physfs_search_path::append);	// look in source directory first (for work in progress)
+	PHYSFSX_addRelToSearchPath("editor", pathname, physfs_search_path::append);		// then in editor directory
+	PHYSFSX_addRelToSearchPath("editor.zip", pathname, physfs_search_path::append);	// then in a zip file
+	PHYSFSX_addRelToSearchPath("editor.dxa", pathname, physfs_search_path::append);	// or addon pack
 
 	if (!ui_init())
 	{
@@ -393,8 +363,8 @@ void init_editor()
 
 	init_med_functions();	// Must be called before medlisp_init
 
-	range_for (auto &&e, enumerate(pads))
-		if (!ui_pad_read(e.idx, e.value))
+	for (auto &&[idx, value] : enumerate(pads))
+		if (!ui_pad_read(idx, value))
 		{
 			close_editor();
 			return;
@@ -402,7 +372,7 @@ void init_editor()
 
 	medkey_init();
 
-	game_flush_inputs();
+	game_flush_inputs(Controls);
 	
 	editor_font = gr_init_font(*grd_curcanv, "pc8x16.fnt");
 	if (!editor_font)
@@ -445,7 +415,7 @@ void init_editor()
 	
 	//Editor renders into full (320x200) game screen 
 	
-	game_init_render_buffers(320, 200);
+	game_init_render_sub_buffers(*grd_curcanv, 0, 0, 320, 200);
 	gr_init_sub_canvas(_canv_editor, grd_curscreen->sc_canvas, 0, 0, SWIDTH, SHEIGHT);
 	Canv_editor = &_canv_editor;
 	gr_set_current_canvas(*Canv_editor);
@@ -468,7 +438,7 @@ void init_editor()
 	current_view = &LargeView;
 	
 	gr_set_current_canvas( GameViewBox->canvas );
-	gr_set_curfont(*grd_curcanv, editor_font);
+	gr_set_curfont(*grd_curcanv, *editor_font);
 	// No font scaling!
 	FNTScaleX.reset(1);
 	FNTScaleY.reset(1);
@@ -497,29 +467,28 @@ int SetPlayerFromCurseg()
 
 int fuelcen_create_from_curseg()
 {
-	Cursegp->special = SEGMENT_IS_FUELCEN;
+	Cursegp->special = segment_special::fuelcen;
 	fuelcen_activate(Cursegp);
 	return 1;
 }
 
 int repaircen_create_from_curseg()
 {
-	Int3();	//	-- no longer supported!
-//	Cursegp->special = SEGMENT_IS_REPAIRCEN;
-//	fuelcen_activate(Cursegp, Cursegp->special);
+	Cursegp->special = segment_special::repaircen;
+	fuelcen_activate(Cursegp);
 	return 1;
 }
 
 int controlcen_create_from_curseg()
 {
-	Cursegp->special = SEGMENT_IS_CONTROLCEN;
+	Cursegp->special = segment_special::controlcen;
 	fuelcen_activate(Cursegp);
 	return 1;
 }
 
 int robotmaker_create_from_curseg()
 {
-	Cursegp->special = SEGMENT_IS_ROBOTMAKER;
+	Cursegp->special = segment_special::robotmaker;
 	fuelcen_activate(Cursegp);
 	return 1;
 }
@@ -561,13 +530,12 @@ int fuelcen_delete_from_curseg() {
 //determine how from from the center of the window the farthest point will be
 #define SIDE_VIEW_FRAC (f1_0*8/10)	//80%
 
-
-static void move_player_2_segment_and_rotate(const vmsegptridx_t seg, const unsigned side)
+static void move_player_2_segment_and_rotate(const vmsegptridx_t seg, const sidenum_t side)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vmobjptr = Objects.vmptr;
 	auto &vmobjptridx = Objects.vmptridx;
-        static int edgenum=0;
+	static side_relative_vertnum edgenum;
 
 	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Vertices = LevelSharedVertexState.get_vertices();
@@ -578,8 +546,8 @@ static void move_player_2_segment_and_rotate(const vmsegptridx_t seg, const unsi
 
 	auto &sv = Side_to_verts[Curside];
 	auto &verts = Cursegp->verts;
-	const auto upvec = vm_vec_sub(vcvertptr(verts[sv[edgenum % 4]]), vcvertptr(verts[sv[(edgenum + 3) % 4]]));
-	edgenum++;
+	const auto en = std::exchange(edgenum, next_side_vertex(edgenum));
+	const auto upvec = vm_vec_sub(vcvertptr(verts[sv[en]]), vcvertptr(verts[sv[next_side_vertex(en, 3)]]));
 
 	vm_vector_2_matrix(ConsoleObject->orient,vp,&upvec,nullptr);
 //	vm_vector_2_matrix(&ConsoleObject->orient,&vp,NULL,NULL);
@@ -594,7 +562,6 @@ int SetPlayerFromCursegAndRotate()
 	return 1;
 }
 
-
 //sets the player facing curseg/curside, normal to face0 of curside, and
 //far enough away to see all of curside
 int SetPlayerFromCursegMinusOne()
@@ -602,9 +569,9 @@ int SetPlayerFromCursegMinusOne()
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vmobjptr = Objects.vmptr;
 	auto &vmobjptridx = Objects.vmptridx;
-	array<g3s_point, 4> corner_p;
+	std::array<g3s_point, 4> corner_p;
 	fix max,view_dist=f1_0*10;
-        static int edgenum=0;
+	static side_relative_vertnum edgenum;
 	const auto view_vec = vm_vec_negated(Cursegp->shared_segment::sides[Curside].normals[0]);
 
 	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
@@ -616,8 +583,8 @@ int SetPlayerFromCursegMinusOne()
 
 	auto &sv = Side_to_verts[Curside];
 	auto &verts = Cursegp->verts;
-	const auto upvec = vm_vec_sub(vcvertptr(verts[sv[edgenum % 4]]), vcvertptr(verts[sv[(edgenum + 3) % 4]]));
-	edgenum++;
+	const auto en = std::exchange(edgenum, next_side_vertex(edgenum));
+	const auto upvec = vm_vec_sub(vcvertptr(verts[sv[en]]), vcvertptr(verts[sv[next_side_vertex(en, 3)]]));
 
 	vm_vector_2_matrix(ConsoleObject->orient,view_vec,&upvec,nullptr);
 
@@ -625,11 +592,12 @@ int SetPlayerFromCursegMinusOne()
 	g3_start_frame(*grd_curcanv);
 	g3_set_view_matrix(ConsoleObject->pos,ConsoleObject->orient,Render_zoom);
 
-	for (unsigned i = max = 0; i < 4; ++i)
+	max = 0;
+	for (auto &&[corner, vert] : zip(corner_p, sv))
 	{
-		g3_rotate_point(corner_p[i], vcvertptr(verts[sv[i]]));
-		if (labs(corner_p[i].p3_x) > max) max = labs(corner_p[i].p3_x);
-		if (labs(corner_p[i].p3_y) > max) max = labs(corner_p[i].p3_y);
+		g3_rotate_point(corner, vcvertptr(verts[vert]));
+		if (labs(corner.p3_x) > max) max = labs(corner.p3_x);
+		if (labs(corner.p3_y) > max) max = labs(corner.p3_y);
 	}
 
 	view_dist = fixmul(view_dist,fixdiv(fixdiv(max,SIDE_VIEW_FRAC),corner_p[0].p3_z));
@@ -782,74 +750,53 @@ static void init_editor_screen(grs_canvas &canvas)
 	CBRIGHT = gr_find_closest_color( 60, 60, 60 );
 	CRED = gr_find_closest_color( 63, 0, 0 );
 
-	gr_set_curfont(canvas, editor_font);
+	gr_set_curfont(canvas, *editor_font);
 	gr_set_fontcolor(canvas, CBLACK, CWHITE);
 
-	EditorWindow = ui_create_dialog( 0 , 0, ED_SCREEN_W, ED_SCREEN_H, DF_FILLED, editor_handler, unused_ui_userdata );
+	EditorWindow = window_create<editor_dialog>(0, 0, ED_SCREEN_W, ED_SCREEN_H, DF_FILLED);
+	auto e = EditorWindow;
 
-	LargeViewBox	= ui_add_gadget_userbox( EditorWindow,LVIEW_X,LVIEW_Y,LVIEW_W,LVIEW_H);
-#if ORTHO_VIEWS
-	TopViewBox		= ui_add_gadget_userbox( EditorWindow,TVIEW_X,TVIEW_Y,TVIEW_W,TVIEW_H);
- 	FrontViewBox	= ui_add_gadget_userbox( EditorWindow,FVIEW_X,FVIEW_Y,FVIEW_W,FVIEW_H);
-	RightViewBox	= ui_add_gadget_userbox( EditorWindow,RVIEW_X,RVIEW_Y,RVIEW_W,RVIEW_H);
-#endif
-	ui_gadget_calc_keys(EditorWindow);	//make tab work for all windows
+	LargeViewBox = ui_add_gadget_userbox(*e, LVIEW_X, LVIEW_Y, LVIEW_W, LVIEW_H);
+	ui_gadget_calc_keys(*e);	//make tab work for all windows
 
-	GameViewBox	= ui_add_gadget_userbox( EditorWindow, GAMEVIEW_X, GAMEVIEW_Y, GAMEVIEW_W, GAMEVIEW_H );
-//	GroupViewBox	= ui_add_gadget_userbox( EditorWindow,GVIEW_X,GVIEW_Y,GVIEW_W,GVIEW_H);
+	GameViewBox	= ui_add_gadget_userbox(*e, GAMEVIEW_X, GAMEVIEW_Y, GAMEVIEW_W, GAMEVIEW_H);
 
 //	GameViewBox->when_tab = GameViewBox->when_btab =  LargeViewBox;
 //	LargeViewBox->when_tab = LargeViewBox->when_btab =  GameViewBox;
 
-//	ui_gadget_calc_keys(EditorWindow);	//make tab work for all windows
-
-	ViewIcon	= ui_add_gadget_icon( EditorWindow, "Lock\nview",	455,25+530, 	40, 22,	KEY_V+KEY_CTRLED, ToggleLockViewToCursegp );
-	AllIcon	= ui_add_gadget_icon( EditorWindow, "Draw\nall",	500,25+530,  	40, 22,	-1, ToggleDrawAllSegments );
-	AxesIcon	= ui_add_gadget_icon( EditorWindow, "Coord\naxes",545,25+530,		40, 22,	KEY_D+KEY_CTRLED, ToggleCoordAxes );
-	ChaseIcon	= ui_add_gadget_icon( EditorWindow, "Chase\nmode",635,25+530,		40, 22,	-1,				ToggleChaseMode );
-	OutlineIcon = ui_add_gadget_icon( EditorWindow, "Out\nline", 	680,25+530,  	40, 22,	KEY_O+KEY_CTRLED,			ToggleOutlineMode );
-	LockIcon	= ui_add_gadget_icon( EditorWindow, "Lock\nstep", 725,25+530, 	40, 22,	KEY_L+KEY_CTRLED,			ToggleLockstep );
+	ViewIcon	= ui_add_gadget_icon(*e, "Lock\nview", 455, 25 + 530, 40, 22,	KEY_V+KEY_CTRLED, ToggleLockViewToCursegp);
+	AllIcon	= ui_add_gadget_icon(*e, "Draw\nall", 500, 25 + 530, 40, 22,	-1, ToggleDrawAllSegments);
+	AxesIcon	= ui_add_gadget_icon(*e, "Coord\naxes", 545, 25 + 530, 40, 22,	KEY_D+KEY_CTRLED, ToggleCoordAxes);
+	ChaseIcon	= ui_add_gadget_icon(*e, "Chase\nmode", 635, 25 + 530, 40, 22,	-1,				ToggleChaseMode);
+	OutlineIcon = ui_add_gadget_icon(*e, "Out\nline", 680, 25 + 530, 40, 22,	KEY_O+KEY_CTRLED,			ToggleOutlineMode);
+	LockIcon	= ui_add_gadget_icon(*e, "Lock\nstep", 725, 25 + 530, 40, 22,	KEY_L+KEY_CTRLED,			ToggleLockstep);
 
 	meddraw_init_views(LargeViewBox->canvas.get());
 
-	//ui_add_gadget_button( EditorWindow, 460, 510, 50, 25, "Quit", ExitEditor );
-	//ui_add_gadget_button( EditorWindow, 520, 510, 50, 25, "Lisp", CallLisp );
-	//ui_add_gadget_button( EditorWindow, 580, 510, 50, 25, "Mine", MineMenu );
-	//ui_add_gadget_button( EditorWindow, 640, 510, 50, 25, "Help", DoHelp );
-	//ui_add_gadget_button( EditorWindow, 460, 540, 50, 25, "Macro", MacroMenu );
-	//ui_add_gadget_button( EditorWindow, 520, 540, 50, 25, "About", ShowAbout );
-	//ui_add_gadget_button( EditorWindow, 640, 540, 50, 25, "Shell", DosShell );
-
-	auto &e = editor_window;
-
-	ui_pad_activate(*EditorWindow, PAD_X, PAD_Y);
+	ui_pad_activate(*e, PAD_X, PAD_Y);
 	Pad_info = info_window_create();
-	e.pad_prev = ui_add_gadget_button( EditorWindow, PAD_X+6, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "<<",  med_keypad_goto_prev );
-	e.pad_next = ui_add_gadget_button( EditorWindow, PAD_X+PAD_WIDTH1+6, PAD_Y+(30*5)+22, PAD_WIDTH, 20, ">>",  med_keypad_goto_next );
+	e->pad_prev = ui_add_gadget_button(*e, PAD_X + 6, PAD_Y + (30 * 5) + 22, PAD_WIDTH, 20, "<<", med_keypad_goto_prev);
+	e->pad_next = ui_add_gadget_button(*e, PAD_X + PAD_WIDTH1 + 6, PAD_Y + (30 * 5) + 22, PAD_WIDTH, 20, ">>", med_keypad_goto_next);
 
 	{	int	i;
-		i = 0;	e.pad_goto[i] = ui_add_gadget_button( EditorWindow, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "SR",  med_keypad_goto_0 );
-		i++;		e.pad_goto[i] = ui_add_gadget_button( EditorWindow, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "SS",  med_keypad_goto_1 );
-		i++;		e.pad_goto[i] = ui_add_gadget_button( EditorWindow, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "CF",  med_keypad_goto_2 );
-		i++;		e.pad_goto[i] = ui_add_gadget_button( EditorWindow, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "TM",  med_keypad_goto_3 );
-		i++;		e.pad_goto[i] = ui_add_gadget_button( EditorWindow, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "OP",  med_keypad_goto_4 );
-		i++;		e.pad_goto[i] = ui_add_gadget_button( EditorWindow, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "OR",  med_keypad_goto_5 );
-		i++;		e.pad_goto[i] = ui_add_gadget_button( EditorWindow, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "GE",  med_keypad_goto_6 );
-		i++;		e.pad_goto[i] = ui_add_gadget_button( EditorWindow, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "LI",  med_keypad_goto_7 );
-		i++;		e.pad_goto[i] = ui_add_gadget_button( EditorWindow, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "TT",  med_keypad_goto_8 );
+		i = 0;	e->pad_goto[i] = ui_add_gadget_button(*e, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "SR", med_keypad_goto_0);
+		i++;		e->pad_goto[i] = ui_add_gadget_button(*e, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "SS", med_keypad_goto_1);
+		i++;		e->pad_goto[i] = ui_add_gadget_button(*e, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "CF", med_keypad_goto_2);
+		i++;		e->pad_goto[i] = ui_add_gadget_button(*e, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "TM", med_keypad_goto_3);
+		i++;		e->pad_goto[i] = ui_add_gadget_button(*e, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "OP", med_keypad_goto_4);
+		i++;		e->pad_goto[i] = ui_add_gadget_button(*e, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "OR", med_keypad_goto_5);
+		i++;		e->pad_goto[i] = ui_add_gadget_button(*e, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "GE", med_keypad_goto_6);
+		i++;		e->pad_goto[i] = ui_add_gadget_button(*e, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "LI", med_keypad_goto_7);
+		i++;		e->pad_goto[i] = ui_add_gadget_button(*e, PAD_X+16+(i+2)*PAD_WIDTH1, PAD_Y+(30*5)+22, PAD_WIDTH, 20, "TT", med_keypad_goto_8);
 	}
 
 	menubar_show();
 
 	// INIT TEXTURE STUFF
-	texpage_init( EditorWindow );
-	objpage_init( EditorWindow );
+	texpage_init(e);
+	objpage_init(e);
 
-	EditorWindow->keyboard_focus_gadget = LargeViewBox.get();
-
-//	BigCanvas[0]->cv_font = grd_curscreen->sc_canvas.cv_font; 
-//	BigCanvas[1]->cv_font = grd_curscreen->sc_canvas.cv_font; 
-//	BigCanvasFirstTime = 1;
+	e->keyboard_focus_gadget = LargeViewBox.get();
 
 	Update_flags = UF_ALL;
 	initializing = 0;
@@ -866,9 +813,6 @@ void close_editor_screen()
 	if (Pad_info)
 		window_close(Pad_info);
 
-	//ui_close_dialog(EditorWindow);	// moved into handler, so we can handle the quit request
-	//EditorWindow = NULL;
-
 	close_all_windows();
 
 	// CLOSE TEXTURE STUFF
@@ -879,24 +823,21 @@ void close_editor_screen()
 
 }
 
-static void med_show_warning(const char *s)
+static void med_show_warning(std::span<const char> s)
 {
 	grs_canvas &save_canv = *grd_curcanv;
 
 	//gr_pal_fade_in(grd_curscreen->pal);	//in case palette is blacked
 
-	ui_messagebox(-2,-2,1,s,"OK");
-
+	ui_messagebox(-2, -2, 1, s.data(), "OK");
 	gr_set_current_canvas(save_canv);
 }
 
 // Returns 1 if OK to trash current mine.
 int SafetyCheck()
 {
-	int x;
-			
 	if (mine_changed) {
-		x = nm_messagebox( "Warning!", 2, "Cancel", "OK", "You are about to lose work." );
+		const auto x = nm_messagebox_str(menu_title{"Warning!"}, nm_messagebox_tie("Cancel", TXT_OK), menu_subtitle{"You are about to lose work."});
 		if (x<1) {
 			return 0;
 		}
@@ -1070,8 +1011,10 @@ int RestoreGameState()
 }
 
 // Handler for the main editor dialog
-window_event_result editor_handler(UI_DIALOG *, const d_event &event, unused_ui_userdata_t *)
+window_event_result editor_dialog::callback_handler(const d_event &event)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	editor_view *new_cv;
 	int keypress = 0;
 	window_event_result rval = window_event_result::ignored;
@@ -1118,14 +1061,18 @@ window_event_result editor_handler(UI_DIALOG *, const d_event &event, unused_ui_
 			case EVENT_MOUSE_MOVED:
 				if (!keyd_pressed[ KEY_LCTRL ] && !keyd_pressed[ KEY_RCTRL ])
 					break;
-				DXX_BOOST_FALLTHROUGH;
+				[[fallthrough]];
+#if DXX_MAX_BUTTONS_PER_JOYSTICK
 			case EVENT_JOYSTICK_BUTTON_UP:
 			case EVENT_JOYSTICK_BUTTON_DOWN:
+#endif
+#if DXX_MAX_AXES_PER_JOYSTICK
 			case EVENT_JOYSTICK_MOVED:
+#endif
 			case EVENT_KEY_COMMAND:
 			case EVENT_KEY_RELEASE:
 			case EVENT_IDLE:
-				kconfig_read_controls(event, 1);
+				kconfig_read_controls(Controls, event, 1);
 
 				if (slew_frame(0))
 				{		//do movement and check keys
@@ -1140,7 +1087,13 @@ window_event_result editor_handler(UI_DIALOG *, const d_event &event, unused_ui_
 					rval = window_event_result::handled;
 				}
 				break;
-				
+			case EVENT_LOOP_BEGIN_LOOP:
+				kconfig_begin_loop(Controls);
+				break;
+			case EVENT_LOOP_END_LOOP:
+				kconfig_end_loop(Controls, FrameTime);
+				break;
+
 			default:
 				break;
 		}
@@ -1152,7 +1105,7 @@ window_event_result editor_handler(UI_DIALOG *, const d_event &event, unused_ui_
 
 		if (Gameview_lockstep) {
 			static segment *old_cursegp=NULL;
-			static int old_curside=-1;
+			static sidenum_t old_curside = side_none;
 
 			if (old_cursegp!=Cursegp || old_curside!=Curside) {
 				SetPlayerFromCursegMinusOne();
@@ -1250,17 +1203,8 @@ window_event_result editor_handler(UI_DIALOG *, const d_event &event, unused_ui_
 		return window_event_result::close;
 	}
 
-//		if (EditorWindow->keyboard_focus_gadget == GameViewBox) current_view=NULL;
-//		if (EditorWindow->keyboard_focus_gadget == GroupViewBox) current_view=NULL;
-
 	new_cv = current_view;
 
-#if ORTHO_VIEWS
-	if (EditorWindow->keyboard_focus_gadget == LargeViewBox) new_cv=&LargeView;
-	if (EditorWindow->keyboard_focus_gadget == TopViewBox)	new_cv=&TopView;
-	if (EditorWindow->keyboard_focus_gadget == FrontViewBox) new_cv=&FrontView;
-	if (EditorWindow->keyboard_focus_gadget == RightViewBox) new_cv=&RightView;
-#endif
 	if (new_cv != current_view ) {
 		current_view->ev_changed = 1;
 		new_cv->ev_changed = 1;
@@ -1299,7 +1243,6 @@ window_event_result editor_handler(UI_DIALOG *, const d_event &event, unused_ui_
 			med_create_new_segment_from_cursegp();
 			if (Lock_view_to_cursegp)
 			{
-				auto &Vertices = LevelSharedVertexState.get_vertices();
 				auto &vcvertptr = Vertices.vcptr;
 				set_view_target_from_segment(vcvertptr, Cursegp);
 			}
@@ -1308,7 +1251,7 @@ window_event_result editor_handler(UI_DIALOG *, const d_event &event, unused_ui_
 		Update_flags |= UF_ED_STATE_CHANGED | UF_VIEWPOINT_MOVED;
 	}
 
-	if ((event.type == EVENT_UI_USERBOX_DRAGGED) && (ui_event_get_gadget(event) == GameViewBox.get()))
+	if (event.type == EVENT_UI_USERBOX_DRAGGED && &ui_event_get_gadget(event) == GameViewBox.get())
 	{
 		int	x, y;
 		x = GameViewBox->b1_drag_x2;
@@ -1325,7 +1268,7 @@ window_event_result editor_handler(UI_DIALOG *, const d_event &event, unused_ui_
 		(GADGET_PRESSED(LargeViewBox.get()) && render_3d_in_big_window))
 	{
 		int	xcrd,ycrd;
-		int side,face,tmap;
+		int face;
 
 		if (render_3d_in_big_window) {
 			xcrd = LargeViewBox->b1_drag_x1;
@@ -1340,6 +1283,7 @@ window_event_result editor_handler(UI_DIALOG *, const d_event &event, unused_ui_
 
 		segnum_t seg;
 		objnum_t obj;
+		sidenum_t side;
 		if (find_seg_side_face(xcrd,ycrd,seg,obj,side,face))
 		{
 
@@ -1360,7 +1304,8 @@ window_event_result editor_handler(UI_DIALOG *, const d_event &event, unused_ui_
 					med_create_new_segment_from_cursegp();
 					editor_status("Texture assigned");
 				} else if (keyd_pressed[KEY_G])	{
-					tmap = Segments[seg].unique_segment::sides[side].tmap_num;
+					const unique_segment &us = vcsegptr(seg);
+					const auto tmap = us.sides[side].tmap_num;
 					texpage_grab_current(tmap);
 					editor_status( "Texture grabbed." );
 				} else if (keyd_pressed[ KEY_LAPOSTRO] ) {

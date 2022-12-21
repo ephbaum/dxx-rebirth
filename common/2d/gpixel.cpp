@@ -19,32 +19,33 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #include "u_mem.h"
 #include "gr.h"
-#include "grdef.h"
 #if DXX_USE_OGL
 #include "ogl_init.h"
 #endif
 
 namespace dcx {
 
-unsigned char gr_ugpixel(const grs_bitmap &bitmap, int x, int y)
+color_palette_index gr_ugpixel(const grs_bitmap &bitmap, int x, int y)
 {
 	switch (bitmap.get_type())
 	{
 		case bm_mode::linear:
 			return bitmap.bm_data[ bitmap.bm_rowsize*y + x ];
+		case bm_mode::ilbm:
+		case bm_mode::rgb15:
+			break;
 #if DXX_USE_OGL
 		case bm_mode::ogl:
 			return ogl_ugpixel(bitmap, x, y);
 #endif
 	}
-	
-	return 0;
+	return color_palette_index{0};
 }
 
-unsigned char gr_gpixel(const grs_bitmap &bitmap, const unsigned x, const unsigned y)
+color_palette_index gr_gpixel(const grs_bitmap &bitmap, const unsigned x, const unsigned y)
 {
 	if (x >= bitmap.bm_w || y >= bitmap.bm_h)
-		return 0;
+		return color_palette_index{0};
 	return gr_ugpixel(bitmap, x, y);
 }
 

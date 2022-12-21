@@ -22,10 +22,11 @@
 #include "custom.h"
 #include "physfsx.h"
 
-#include "compiler-begin.h"
-#include "compiler-make_unique.h"
 #include "compiler-range_for.h"
+#include "d_zip.h"
 #include "partial_range.h"
+#include <iterator>
+#include <memory>
 
 //#define D2TMAP_CONV // used for testing
 
@@ -33,8 +34,8 @@ namespace {
 
 struct snd_info
 {
-	unsigned int length;
-	uint8_t *data;
+	std::size_t length;
+	digi_sound::allocated_data data;
 };
 
 }
@@ -80,10 +81,21 @@ struct custom_info
 	int width, height;
 };
 
+struct bitmap_original
+{
+	/* Reuse the type grs_bitmap since it covers most of what is needed.
+	 * However, instances of bitmap_original are not suitable for direct
+	 * use in places where a grs_bitmap is expected.
+	 */
+	grs_bitmap b;
+};
+
+constexpr std::integral_constant<uint8_t, 0x80> BM_FLAG_CUSTOMIZED{};
+
 }
 
-static array<grs_bitmap, MAX_BITMAP_FILES> BitmapOriginal;
-static array<snd_info, MAX_SOUND_FILES> SoundOriginal;
+static std::array<bitmap_original, MAX_BITMAP_FILES> BitmapOriginal;
+static std::array<snd_info, MAX_SOUND_FILES> SoundOriginal;
 
 static int load_pig1(PHYSFS_File *f, unsigned num_bitmaps, unsigned num_sounds, unsigned &num_custom, std::unique_ptr<custom_info[]> &ci)
 {
@@ -97,12 +109,12 @@ static int load_pig1(PHYSFS_File *f, unsigned num_bitmaps, unsigned num_sounds, 
 
 	if (num_bitmaps <= MAX_BITMAP_FILES) // <v1.4 pig?
 	{
-		PHYSFSX_fseek(f, 8, SEEK_SET);
+		PHYSFS_seek(f, 8);
 		data_ofs = 8;
 	}
 	else if (num_bitmaps > 0 && num_bitmaps < PHYSFS_fileLength(f)) // >=v1.4 pig?
 	{
-		PHYSFSX_fseek(f, num_bitmaps, SEEK_SET);
+		PHYSFS_seek(f, num_bitmaps);
 		data_ofs = num_bitmaps + 8;
 		num_bitmaps = PHYSFSX_readInt(f);
 		num_sounds = PHYSFSX_readInt(f);
@@ -113,7 +125,7 @@ static int load_pig1(PHYSFS_File *f, unsigned num_bitmaps, unsigned num_sounds, 
 	if (num_bitmaps >= MAX_BITMAP_FILES ||
 		num_sounds >= MAX_SOUND_FILES)
 		return -1; // invalid pig file
-	ci = make_unique<custom_info[]>(num_bitmaps + num_sounds);
+	ci = std::make_unique<custom_info[]>(num_bitmaps + num_sounds);
 	custom_info *cip = ci.get();
 	data_ofs += num_bitmaps * sizeof(DiskBitmapHeader) + num_sounds * sizeof(DiskSoundHeader);
 	i = num_bitmaps;
@@ -162,7 +174,6 @@ static int load_pog(PHYSFS_File *f, int pog_sig, int pog_ver, unsigned &num_cust
 	int data_ofs;
 	int num_bitmaps;
 	int no_repl = 0;
-	int i;
 	DiskBitmapHeader2 bmh;
 
 #ifdef D2TMAP_CONV
@@ -187,15 +198,13 @@ static int load_pog(PHYSFS_File *f, int pog_sig, int pog_ver, unsigned &num_cust
 		return -1; // no pig2/pog file/unknown version
 
 	num_bitmaps = PHYSFSX_readInt(f);
-	ci = make_unique<custom_info[]>(num_bitmaps);
+	ci = std::make_unique<custom_info[]>(num_bitmaps);
 	custom_info *cip = ci.get();
 	data_ofs = 12 + num_bitmaps * sizeof(DiskBitmapHeader2);
 
 	if (!no_repl)
 	{
-		i = num_bitmaps;
-
-		while (i--)
+		for (int i = num_bitmaps; i--;)
 			(cip++)->repl_idx = PHYSFSX_readShort(f);
 
 		cip = ci.get();
@@ -217,10 +226,7 @@ static int load_pog(PHYSFS_File *f, int pog_sig, int pog_ver, unsigned &num_cust
 				}
 		}
 #endif
-
-	i = num_bitmaps;
-
-	while (i--)
+	for (int i = num_bitmaps; i--;)
 	{
 		if (PHYSFS_read(f, &bmh, sizeof(DiskBitmapHeader2), 1) < 1)
 		{
@@ -245,9 +251,7 @@ static int load_pigpog(const d_fname &pogname)
 {
 	unsigned num_custom;
 	grs_bitmap *bmp;
-	digi_sound *snd;
-	uint8_t *p;
-	auto f = PHYSFSX_openReadBuffered(pogname);
+	auto f = PHYSFSX_openReadBuffered(pogname).first;
 	int i, j, rc = -1;
 	unsigned int x = 0;
 
@@ -271,13 +275,14 @@ static int load_pigpog(const d_fname &pogname)
 		x = cip->repl_idx;
 		if (cip->repl_idx >= 0)
 		{
-			PHYSFSX_fseek( f, cip->offset, SEEK_SET );
+			PHYSFS_seek(f, cip->offset);
 
 			if ( cip->flags & BM_FLAG_RLE )
 				j = PHYSFSX_readInt(f);
 			else
 				j = cip->width * cip->height;
 
+			uint8_t *p;
 			if (!MALLOC(p, ubyte, j))
 			{
 				return rc;
@@ -285,25 +290,42 @@ static int load_pigpog(const d_fname &pogname)
 
 			bmp = &GameBitmaps[x];
 
-			if (BitmapOriginal[x].get_flag_mask(0x80)) // already customized?
+			auto &bmo = BitmapOriginal[x].b;
+			if (bmo.get_flag_mask(BM_FLAG_CUSTOMIZED)) // already customized?
+				/* If the bitmap was previously customized, and another
+				 * customization is loaded on top of it, discard the
+				 * first customization.  Retain the stock bitmap in the
+				 * backup data structure.
+				 */
 				gr_free_bitmap_data(*bmp);
 			else
 			{
+				/* If the bitmap was not previously customized, then
+				 * copy it to a backup data structure before replacing
+				 * it with the custom version.
+				 */
 				// save original bitmap info
-				BitmapOriginal[x] = *bmp;
-				BitmapOriginal[x].add_flags(0x80);
-				if (GameBitmapOffset[x]) // from pig?
+				bmo = *bmp;
+				bmo.add_flags(BM_FLAG_CUSTOMIZED);
+				if (GameBitmapOffset[x] != pig_bitmap_offset::None) // from pig?
 				{
-					BitmapOriginal[x].add_flags(BM_FLAG_PAGED_OUT);
-					BitmapOriginal[x].bm_data = reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(GameBitmapOffset[x]));
+					/* Borrow the data field to store the offset within
+					 * the pig file, which is not a pointer.  Attempts
+					 * to dereference bm_data will almost certainly
+					 * crash.
+					 */
+					bmo.add_flags(BM_FLAG_PAGED_OUT);
+					bmo.bm_data = reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(GameBitmapOffset[x]));
 				}
 			}
 
-			GameBitmapOffset[x] = 0; // not in pig
+			GameBitmapOffset[x] = pig_bitmap_offset::None; // not in pig
 			*bmp = {};
 			gr_init_bitmap(*bmp, bm_mode::linear, 0, 0, cip->width, cip->height, cip->width, p);
 			gr_set_bitmap_flags(*bmp, cip->flags & 255);
+#if !DXX_USE_OGL
 			bmp->avg_color = cip->flags >> 8;
+#endif
 
 			if ( cip->flags & BM_FLAG_RLE )
 			{
@@ -321,35 +343,24 @@ static int load_pigpog(const d_fname &pogname)
 		}
 		else if ((cip->repl_idx + 1) < 0)
 		{
-			PHYSFSX_fseek( f, cip->offset, SEEK_SET );
-			snd = &GameSounds[x & 0x7fffffff];
+			PHYSFS_seek(f, cip->offset);
+			auto snd = &GameSounds[x & 0x7fffffff];
 
 			j = cip->width;
-			if (!MALLOC(p, ubyte, j))
-			{
-				return rc;
-			}
-
+			auto p = std::make_unique<uint8_t[]>(j);
 			if (SoundOriginal[x & 0x7fffffff].length & 0x80000000)  // already customized?
-				d_free(snd->data);
+			{
+			}
 			else
 			{
-#ifdef ALLEGRO
-				SoundOriginal[x & 0x7fffffff].length = snd->len | 0x80000000;
-#else
 				SoundOriginal[x & 0x7fffffff].length = snd->length | 0x80000000;
-#endif
-				SoundOriginal[x & 0x7fffffff].data = snd->data;
+				SoundOriginal[x & 0x7fffffff].data = std::move(snd->data);
 			}
 
-#ifdef ALLEGRO
-				snd->loop_end = snd->len = j;
-#else
 				snd->length = j;
-#endif
-			snd->data = p;
+			snd->data = digi_sound::allocated_data{std::move(p), game_sound_offset{}};
 
-			if (PHYSFS_read(f, p, j, 1) < 1)
+			if (PHYSFS_read(f, p.get(), j, 1) < 1)
 			{
 				return rc;
 			}
@@ -362,14 +373,14 @@ static int load_pigpog(const d_fname &pogname)
 
 static int read_d2_robot_info(PHYSFS_File *fp, robot_info &ri)
 {
-	int j, k;
+	int j;
 
-	ri.model_num = PHYSFSX_readInt(fp);
+	ri.model_num = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(fp));
 
-	for (j = 0; j < MAX_GUNS; j++)
-		PHYSFSX_readVector(fp, ri.gun_points[j]);
-	for (j = 0; j < MAX_GUNS; j++)
-		ri.gun_submodels[j] = PHYSFSX_readByte(fp);
+	for (auto &j : ri.gun_points)
+		PHYSFSX_readVector(fp, j);
+	for (auto &j : ri.gun_submodels)
+		j = PHYSFSX_readByte(fp);
 	ri.exp1_vclip_num = PHYSFSX_readShort(fp);
 	ri.exp1_sound_num = PHYSFSX_readShort(fp);
 	ri.exp2_vclip_num = PHYSFSX_readShort(fp);
@@ -390,28 +401,28 @@ static int read_d2_robot_info(PHYSFS_File *fp, robot_info &ri)
 	ri.strength = PHYSFSX_readFix(fp);
 	ri.mass = PHYSFSX_readFix(fp);
 	ri.drag = PHYSFSX_readFix(fp);
-	for (j = 0; j < NDL; j++)
-		ri.field_of_view[j] = PHYSFSX_readFix(fp);
-	for (j = 0; j < NDL; j++)
-		ri.firing_wait[j] = PHYSFSX_readFix(fp);
+	for (auto &j : ri.field_of_view)
+		j = PHYSFSX_readFix(fp);
+	for (auto &j : ri.firing_wait)
+		j = PHYSFSX_readFix(fp);
 	for (j = 0; j < NDL; j++)
 		/*ri.firing_wait2[j] =*/ PHYSFSX_readFix(fp);
-	for (j = 0; j < NDL; j++)
-		ri.turn_time[j] = PHYSFSX_readFix(fp);
+	for (auto &j : ri.turn_time)
+		j = PHYSFSX_readFix(fp);
 #if 0 // not used in d1, removed in d2
 	for (j = 0; j < NDL; j++)
 		ri.fire_power[j] = PHYSFSX_readFix(fp);
 	for (j = 0; j < NDL; j++)
 		ri.shield[j] = PHYSFSX_readFix(fp);
 #endif
-	for (j = 0; j < NDL; j++)
-		ri.max_speed[j] = PHYSFSX_readFix(fp);
-	for (j = 0; j < NDL; j++)
-		ri.circle_distance[j] = PHYSFSX_readFix(fp);
-	for (j = 0; j < NDL; j++)
-		ri.rapidfire_count[j] = PHYSFSX_readByte(fp);
-	for (j = 0; j < NDL; j++)
-		ri.evade_speed[j] = PHYSFSX_readByte(fp);
+	for (auto &j : ri.max_speed)
+		j = PHYSFSX_readFix(fp);
+	for (auto &j : ri.circle_distance)
+		j = PHYSFSX_readFix(fp);
+	for (auto &j : ri.rapidfire_count)
+		j = PHYSFSX_readByte(fp);
+	for (auto &j : ri.evade_speed)
+		j = PHYSFSX_readByte(fp);
 	ri.cloak_type = PHYSFSX_readByte(fp);
 	ri.attack_type = PHYSFSX_readByte(fp);
 	ri.see_sound = PHYSFSX_readByte(fp);
@@ -435,12 +446,12 @@ static int read_d2_robot_info(PHYSFS_File *fp, robot_info &ri)
 	/*ri.behavior =*/ PHYSFSX_readByte(fp);
 	/*ri.aim =*/ PHYSFSX_readByte(fp);
 
-	for (j = 0; j < MAX_GUNS + 1; j++)
+	for (auto &j : ri.anim_states)
 	{
-		for (k = 0; k < N_ANIM_STATES; k++)
+		for (auto &k : j)
 		{
-			ri.anim_states[j][k].n_joints = PHYSFSX_readShort(fp);
-			ri.anim_states[j][k].offset = PHYSFSX_readShort(fp);
+			k.n_joints = PHYSFSX_readShort(fp);
+			k.offset = PHYSFSX_readShort(fp);
 		}
 	}
 	ri.always_0xabcd = PHYSFSX_readInt(fp);
@@ -453,9 +464,8 @@ namespace dsx {
 static void load_hxm(const d_fname &hxmname)
 {
 	auto &Robot_joints = LevelSharedRobotJointState.Robot_joints;
-	unsigned int repl_num;
 	int i;
-	auto f = PHYSFSX_openReadBuffered(hxmname);
+	auto f = PHYSFSX_openReadBuffered(hxmname).first;
 	int n_items;
 
 	if (!f)
@@ -479,8 +489,7 @@ static void load_hxm(const d_fname &hxmname)
 		auto &Robot_info = LevelSharedRobotInfoState.Robot_info;
 		for (i = 0; i < n_items; i++)
 		{
-			repl_num = PHYSFSX_readInt(f);
-
+			const unsigned repl_num = PHYSFSX_readInt(f);
 			if (repl_num >= MAX_ROBOT_TYPES)
 			{
 				PHYSFSX_fseek(f, 480, SEEK_CUR); /* sizeof d2_robot_info */
@@ -500,8 +509,7 @@ static void load_hxm(const d_fname &hxmname)
 	{
 		for (i = 0; i < n_items; i++)
 		{
-			repl_num = PHYSFSX_readInt(f);
-
+			const unsigned repl_num = PHYSFSX_readInt(f);
 			if (repl_num >= MAX_ROBOT_JOINTS)
 				PHYSFSX_fseek(f, sizeof(jointpos), SEEK_CUR);
 			else
@@ -517,9 +525,7 @@ static void load_hxm(const d_fname &hxmname)
 		for (i = 0; i < n_items; i++)
 		{
 			polymodel *pm;
-
-			repl_num = PHYSFSX_readInt(f);
-			if (repl_num >= MAX_POLYGON_MODELS)
+			if (const auto repl_num = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(f)); repl_num == polygon_model_index::None)
 			{
 				PHYSFSX_readInt(f); // skip n_models
 				PHYSFSX_fseek(f, 734 - 8 + PHYSFSX_readInt(f) + 8, SEEK_CUR);
@@ -528,17 +534,17 @@ static void load_hxm(const d_fname &hxmname)
 			{
 				auto &Polygon_models = LevelSharedPolygonModelState.Polygon_models;
 				pm = &Polygon_models[repl_num];
-				polymodel_read(pm, f);
+				polymodel_read(*pm, f);
 				const auto model_data_size = pm->model_data_size;
-				pm->model_data = make_unique<uint8_t[]>(model_data_size);
+				pm->model_data = std::make_unique<uint8_t[]>(model_data_size);
 				if (PHYSFS_read(f, pm->model_data, model_data_size, 1) < 1)
 				{
 					pm->model_data.reset();
 					return;
 				}
 
-				Dying_modelnums[repl_num] = PHYSFSX_readInt(f);
-				Dead_modelnums[repl_num] = PHYSFSX_readInt(f);
+				Dying_modelnums[repl_num] = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(f));
+				Dead_modelnums[repl_num] = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(f));
 			}
 		}
 	}
@@ -548,10 +554,10 @@ static void load_hxm(const d_fname &hxmname)
 	{
 		for (i = 0; i < n_items; i++)
 		{
-			repl_num = PHYSFSX_readInt(f);
+			const auto oi = static_cast<object_bitmap_index>(PHYSFSX_readInt(f));
 			auto v = PHYSFSX_readShort(f);
-			if (repl_num < ObjBitmaps.size())
-				ObjBitmaps[repl_num].index = v;
+			if (ObjBitmaps.valid_index(oi))
+				ObjBitmaps[oi].index = v;
 		}
 	}
 }
@@ -562,37 +568,42 @@ static void load_hxm(const d_fname &hxmname)
 static void custom_remove()
 {
 	int i;
-	auto bmo = begin(BitmapOriginal);
-	auto bmp = begin(GameBitmaps);
 
-	for (i = 0; i < MAX_BITMAP_FILES; bmo++, bmp++, i++)
-		if (bmo->get_flag_mask(0x80))
+	for (auto &&[gbo, bmo, bmp] : zip(GameBitmapOffset, BitmapOriginal, GameBitmaps))
+		if (bmo.b.get_flag_mask(BM_FLAG_CUSTOMIZED))
 		{
-			gr_free_bitmap_data(*bmp);
-			*bmp = *bmo;
+			gr_free_bitmap_data(bmp);
+			bmp = bmo.b;
+			bmo.b.clear_flags();
 
-			if (bmo->get_flag_mask(BM_FLAG_PAGED_OUT))
+			if (bmp.get_flag_mask(BM_FLAG_PAGED_OUT))
 			{
-				GameBitmapOffset[i] = static_cast<int>(reinterpret_cast<uintptr_t>(bmo->bm_data));
-				gr_set_bitmap_flags(*bmp, BM_FLAG_PAGED_OUT);
-				gr_set_bitmap_data(*bmp, nullptr);
+				/* If the bitmap was unloaded before it was customized,
+				 * then restore GameBitmapOffset so that the stock data
+				 * can be reloaded when it is next needed.
+				 */
+				/* Casting this pointer into a smaller integer is legal
+				 * because the value in bm_data is not a pointer.  It is
+				 * a copy of the value that GameBitmapOffset had when
+				 * the bitmap_original was initialized.
+				 */
+				gbo = static_cast<pig_bitmap_offset>(reinterpret_cast<uintptr_t>(bmo.b.bm_data));
+				gr_set_bitmap_data(bmp, nullptr);
 			}
 			else
 			{
-				gr_set_bitmap_flags(*bmp, bmo->get_flag_mask(0x7f));
+				/* Otherwise, the bitmap was loaded before it was
+				 * overwritten, so the copy restored from the backup is
+				 * ready for use.
+				 */
+				bmp.set_flags(bmp.get_flags() & ~BM_FLAG_CUSTOMIZED);
 			}
-			bmo->clear_flags();
 		}
 	for (i = 0; i < MAX_SOUND_FILES; i++)
 		if (SoundOriginal[i].length & 0x80000000)
 		{
-			d_free(GameSounds[i].data);
-			GameSounds[i].data = SoundOriginal[i].data;
-#ifdef ALLEGRO
-			GameSounds[i].len = SoundOriginal[i].length & 0x7fffffff;
-#else
+			GameSounds[i].data = std::move(SoundOriginal[i].data);
 			GameSounds[i].length = SoundOriginal[i].length & 0x7fffffff;
-#endif
 			SoundOriginal[i].length = 0;
 		}
 }
@@ -601,6 +612,8 @@ void load_custom_data(const d_fname &level_name)
 {
 	custom_remove();
 	d_fname custom_file;
+	using std::begin;
+	using std::end;
 	using std::copy;
 	using std::next;
 	auto bl = begin(level_name);

@@ -29,20 +29,17 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include <string.h>
 #include <stdarg.h>
 
-#include "pstypes.h"
 #include "window.h"
 #include "console.h"
+#include "collide.h"
 #include "strutil.h"
 #include "game.h"
 #include "player.h"
 #include "key.h"
 #include "object.h"
 #include "menu.h"
-#include "physics.h"
 #include "dxxerror.h"
 #include "joy.h"
-#include "iff.h"
-#include "pcx.h"
 #include "timer.h"
 #include "render.h"
 #include "laser.h"
@@ -52,7 +49,6 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "gauges.h"
 #include "texmap.h"
 #include "3d.h"
-#include "effects.h"
 #include "gameseg.h"
 #include "wall.h"
 #include "ai.h"
@@ -78,19 +74,15 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "config.h"
 #include "hudmsg.h"
 #include "kconfig.h"
-#include "mouse.h"
 #include "titles.h"
 #include "gr.h"
 #include "playsave.h"
-#include "scores.h"
 
 #include "multi.h"
 #include "cntrlcen.h"
 #include "fuelcen.h"
-#include "pcx.h"
 #include "state.h"
 #include "piggy.h"
-#include "multibot.h"
 #include "ai.h"
 #include "rbaudio.h"
 #include "switch.h"
@@ -105,11 +97,12 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "editor/esegment.h"
 #endif
 
-#include "compiler-array.h"
-#include "compiler-exchange.h"
 #include "compiler-range_for.h"
+#include "d_levelstate.h"
 #include "d_range.h"
 #include "partial_range.h"
+#include <array>
+#include <utility>
 
 #include <SDL.h>
 
@@ -125,13 +118,49 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 using std::min;
 
-// Global Variables -----------------------------------------------------------
+namespace dcx {
 
-//	Function prototypes --------------------------------------------------------
+namespace {
+
+struct pause_window : window
+{
+	using window::window;
+	std::array<char, 128> msg;
+};
+
+}
+
+}
+
+namespace dsx {
+
+namespace {
+
+struct pause_window : ::dcx::pause_window
+{
+	using ::dcx::pause_window::pause_window;
+	virtual window_event_result event_handler(const d_event &) override;
+};
+
 #ifndef RELEASE
-static void do_cheat_menu();
+static void do_cheat_menu(object &plrobj, grs_canvas &cv_canvas);
 static void play_test_sound();
 #endif
+
+int allowed_to_fire_flare(player_info &player_info)
+{
+	auto &Next_flare_fire_time = player_info.Next_flare_fire_time;
+	if (Next_flare_fire_time > GameTime64)
+		return 0;
+#if defined(DXX_BUILD_DESCENT_II)
+	if (player_info.energy < Weapon_info[weapon_id_type::FLARE_ID].energy_usage)
+#define	FLARE_BIG_DELAY	(F1_0*2)
+		Next_flare_fire_time = GameTime64 + FLARE_BIG_DELAY;
+	else
+#endif
+		Next_flare_fire_time = GameTime64 + F1_0/4;
+	return 1;
+}
 
 #define key_isfunc(k) (((k&0xff)>=KEY_F1 && (k&0xff)<=KEY_F10) || (k&0xff)==KEY_F11 || (k&0xff)==KEY_F12)
 
@@ -178,6 +207,11 @@ static void transfer_energy_to_shield(object &plrobj)
 }
 #endif
 
+}
+
+}
+
+namespace {
 
 // Control Functions
 
@@ -197,76 +231,101 @@ static void update_vcr_state(void)
 		Newdemo_vcr_state = ND_STATE_PLAYBACK;
 }
 
+}
+
 namespace dsx {
 #if defined(DXX_BUILD_DESCENT_II)
+
+namespace {
+
 //returns which bomb will be dropped next time the bomb key is pressed
-int which_bomb()
+template <typename T>
+secondary_weapon_index_t read_update_which_proximity_mine_to_use(T &player_info)
 {
-	auto &Objects = LevelUniqueObjectState.Objects;
-	auto &vmobjptr = Objects.vmptr;
 	//use the last one selected, unless there aren't any, in which case use
 	//the other if there are any
-	auto &player_info = get_local_plrobj().ctype.player_info;
 	auto &Secondary_last_was_super = player_info.Secondary_last_was_super;
 	const auto mask = 1 << PROXIMITY_INDEX;
 	const auto bomb = (Secondary_last_was_super & mask) ? SMART_MINE_INDEX : PROXIMITY_INDEX;
-
 	auto &secondary_ammo = player_info.secondary_ammo;
-	if (secondary_ammo[bomb] == 0 &&
-		secondary_ammo[SMART_MINE_INDEX + PROXIMITY_INDEX - bomb] != 0)
+	if (secondary_ammo[bomb])
+		/* Player has the requested bomb type available.  Use it. */
+		return bomb;
+	const auto alt_bomb = static_cast<secondary_weapon_index_t>(SMART_MINE_INDEX + PROXIMITY_INDEX - bomb);
+	if (secondary_ammo[alt_bomb])
 	{
-		Secondary_last_was_super ^= mask;
+		/* Player has the alternate bomb type, but not the requested
+		 * bomb type.  Switch.
+		 */
+		if constexpr (!std::is_const<T>::value)
+			Secondary_last_was_super ^= mask;
+		return alt_bomb;
 	}
+	/* Player has no bombs of either type. */
 	return bomb;
+}
+
+}
+
+secondary_weapon_index_t which_bomb(const player_info &player_info)
+{
+	return read_update_which_proximity_mine_to_use(player_info);
+}
+
+secondary_weapon_index_t which_bomb(player_info &player_info)
+{
+	return read_update_which_proximity_mine_to_use(player_info);
 }
 #endif
 
-static void do_weapon_n_item_stuff(object_array &Objects)
+namespace {
+
+static void do_weapon_n_item_stuff(object_array &Objects, control_info &Controls)
 {
 	auto &vmobjptridx = Objects.vmptridx;
-	auto &vmobjptr = Objects.vmptr;
-	auto &plrobj = get_local_plrobj();
+	const auto &&plrobjidx = vmobjptridx(get_local_player().objnum);
+	auto &plrobj = *plrobjidx;
 	auto &player_info = plrobj.ctype.player_info;
 	if (Controls.state.fire_flare > 0)
 	{
 		Controls.state.fire_flare = 0;
 		if (allowed_to_fire_flare(player_info))
-			Flare_create(vmobjptridx(ConsoleObject));
+			Flare_create(plrobjidx);
 	}
 
-	if (allowed_to_fire_missile(player_info) && Controls.state.fire_secondary)
+	if (Controls.state.fire_secondary && allowed_to_fire_missile(player_info))
 	{
 		Global_missile_firing_count += Weapon_info[Secondary_weapon_to_weapon_info[player_info.Secondary_weapon]].fire_count;
 	}
 
 	if (Global_missile_firing_count) {
-		do_missile_firing(0);
-		Global_missile_firing_count--;
+		--Global_missile_firing_count;
+		do_missile_firing(player_info.Secondary_weapon, plrobjidx);
 	}
 
 	if (Controls.state.cycle_primary > 0)
 	{
-		for (uint_fast32_t i = exchange(Controls.state.cycle_primary, 0); i--;)
+		for (uint_fast32_t i = std::exchange(Controls.state.cycle_primary, 0); i--;)
 			CyclePrimary(player_info);
 	}
 	if (Controls.state.cycle_secondary > 0)
 	{
-		for (uint_fast32_t i = exchange(Controls.state.cycle_secondary, 0); i--;)
+		for (uint_fast32_t i = std::exchange(Controls.state.cycle_secondary, 0); i--;)
 			CycleSecondary(player_info);
 	}
 	if (Controls.state.select_weapon > 0)
 	{
-		const auto select_weapon = exchange(Controls.state.select_weapon, 0) - 1;
+		const auto select_weapon = std::exchange(Controls.state.select_weapon, 0) - 1;
 		const auto weapon_num = select_weapon > 4 ? select_weapon - 5 : select_weapon;
 		if (select_weapon > 4)
 			do_secondary_weapon_select(player_info, static_cast<secondary_weapon_index_t>(select_weapon - 5));
 		else
-			do_primary_weapon_select(player_info, weapon_num);
+			do_primary_weapon_select(player_info, static_cast<primary_weapon_index_t>(weapon_num));
 	}
 #if defined(DXX_BUILD_DESCENT_II)
 	if (auto &headlight = Controls.state.headlight)
 	{
-		if (exchange(headlight, 0) & 1)
+		if (std::exchange(headlight, 0) & 1)
 			toggle_headlight_active(plrobj);
 	}
 #endif
@@ -277,8 +336,9 @@ static void do_weapon_n_item_stuff(object_array &Objects)
 	//	Drop proximity bombs.
 	if (Controls.state.drop_bomb > 0)
 	{
-		for (uint_fast32_t i = exchange(Controls.state.drop_bomb, 0); i--;)
-		do_missile_firing(1);
+		const auto bomb = which_bomb(player_info);
+		for (uint_fast32_t i = std::exchange(Controls.state.drop_bomb, 0); i--;)
+			do_missile_firing(bomb, plrobjidx);
 	}
 #if defined(DXX_BUILD_DESCENT_II)
 	if (Controls.state.toggle_bomb > 0)
@@ -315,39 +375,82 @@ static void do_weapon_n_item_stuff(object_array &Objects)
 		transfer_energy_to_shield(plrobj);
 #endif
 }
+
+}
 }
 
-static void format_time(char (&str)[9], unsigned secs_int, unsigned hours_extra)
-{
-	auto d1 = std::div(secs_int, 60);
-	const unsigned s = d1.rem;
-	const unsigned m1 = d1.quot;
-	auto d2 = std::div(m1, 60);
-	const unsigned m = d2.rem;
-	const unsigned h = d2.quot + hours_extra;
-	snprintf(str, sizeof(str), "%1u:%02u:%02u", h, m, s);
-}
+namespace dcx {
 
-struct pause_window : ignore_window_pointer_t
+namespace {
+
+#ifndef RELEASE
+#if DXX_USE_EDITOR
+struct choose_curseg_menu_items
 {
-	array<char, 1024> msg;
+	std::array<char, 40> caption;
+	std::array<char, sizeof("65535")> text;
+	std::array<newmenu_item, 2> m;
+	choose_curseg_menu_items(const d_level_shared_segment_state &LevelSharedSegmentState) :
+		m{{
+			newmenu_item::nm_item_text{(snprintf(caption.data(), caption.size(), "Enter target segment number (max=%u)", LevelSharedSegmentState.get_segments().get_count()), caption.data())},
+			newmenu_item::nm_item_input{(text.front() = 0, text)},
+		}}
+	{
+	}
 };
 
-//Process selected keys until game unpaused
-static window_event_result pause_handler(window *, const d_event &event, pause_window *p)
+struct choose_curseg_menu : choose_curseg_menu_items, passive_newmenu
 {
-	int key;
+	choose_curseg_menu(const d_level_shared_segment_state &LevelSharedSegmentState, grs_canvas &src) :
+		choose_curseg_menu_items(LevelSharedSegmentState),
+		passive_newmenu(menu_title{nullptr}, menu_subtitle{nullptr}, menu_filename{nullptr}, tiny_mode_flag::normal, tab_processing_flag::ignore, adjusted_citem::create(m, 0), src)
+		{
+		}
+	virtual window_event_result event_handler(const d_event &) override;
+};
 
+window_event_result choose_curseg_menu::event_handler(const d_event &event)
+{
+	switch (event.type)
+	{
+		case EVENT_WINDOW_CLOSE:
+			{
+				char *p;
+				const auto s = strtoul(text.data(), &p, 0);
+				if (*p)
+					break;
+				if (s >= Segments.get_count())
+					break;
+				Cursegp = Segments.vmptridx(static_cast<segnum_t>(s));
+				break;
+			}
+		default:
+			break;
+	}
+	return newmenu::event_handler(event);
+}
+#endif
+#endif
+
+}
+
+}
+
+namespace dsx {
+
+namespace {
+
+//Process selected keys until game unpaused
+window_event_result pause_window::event_handler(const d_event &event)
+{
 	switch (event.type)
 	{
 		case EVENT_WINDOW_ACTIVATED:
-			game_flush_inputs();
+			game_flush_inputs(Controls);
 			break;
 
 		case EVENT_KEY_COMMAND:
-			key = event_key_get(event);
-
-			switch (key)
+			switch (event_key_get(event))
 			{
 				case 0:
 					break;
@@ -368,12 +471,12 @@ static window_event_result pause_handler(window *, const d_event &event, pause_w
 			break;
 
 		case EVENT_WINDOW_DRAW:
-			show_boxed_message(&p->msg[0], 1);
+			gr_set_default_canvas();
+			show_boxed_message(*grd_curcanv, msg.data());
 			break;
 
 		case EVENT_WINDOW_CLOSE:
 			songs_resume();
-			delete p;
 			break;
 
 		default:
@@ -382,35 +485,53 @@ static window_event_result pause_handler(window *, const d_event &event, pause_w
 	return window_event_result::ignored;
 }
 
-static int do_game_pause()
+static void do_game_pause()
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vcobjptr = Objects.vcptr;
-	char total_time[9],level_time[9];
 
 	if (Game_mode & GM_MULTI)
 	{
 		netplayerinfo_on= !netplayerinfo_on;
-		return(KEY_PAUSE);
+		return;
 	}
 
-	pause_window *p = new pause_window;
+	auto p = window_create<pause_window>(grd_curscreen->sc_canvas, 0, 0, SWIDTH, SHEIGHT);
 	songs_pause();
 
 	auto &plr = get_local_player();
-	format_time(total_time, f2i(plr.time_total), plr.hours_total);
-	format_time(level_time, f2i(plr.time_level), plr.hours_level);
+	struct hms_time
+	{
+		unsigned h, m, s;
+		hms_time(const unsigned hours_extra, const int d1_rem, const std::div_t d2) :
+			h(d2.quot + hours_extra), m(d2.rem), s(d1_rem)
+		{
+		}
+		hms_time(const unsigned hours_extra, const std::div_t d1) :
+			hms_time(hours_extra, d1.rem, std::div(d1.quot, 60))
+		{
+		}
+		hms_time(const unsigned hours_extra, const fix seconds) :
+			hms_time(hours_extra, std::div(f2i(seconds), 60))
+		{
+		}
+	};
 	auto &player_info = vcobjptr(plr.objnum)->ctype.player_info;
 	if (Newdemo_state!=ND_STATE_PLAYBACK)
-		snprintf(&p->msg[0], p->msg.size(), "PAUSE\n\nSkill level:  %s\nHostages on board:  %d\nTime on level: %s\nTotal time in game: %s", MENU_DIFFICULTY_TEXT(Difficulty_level), player_info.mission.hostages_on_board, level_time, total_time);
+	{
+		const hms_time human_time_total{plr.hours_total, plr.time_total}, human_time_level{plr.hours_level, plr.time_level};
+		snprintf(&p->msg[0], p->msg.size(), "PAUSE\n\n"
+				 "Skill level:  %s\n"
+				 "Hostages on board:  %d\n"
+				 "Time on level: %1u:%02u:%02u\n"
+				 "Total time in game: %1u:%02u:%02u",
+				 MENU_DIFFICULTY_TEXT(GameUniqueState.Difficulty_level), player_info.mission.hostages_on_board, human_time_level.h, human_time_level.m, human_time_level.s, human_time_total.h, human_time_total.m, human_time_total.s);
+	}
 	else
 		snprintf(&p->msg[0], p->msg.size(), "PAUSE\n\n\n\n");
 	set_screen_mode(SCREEN_MENU);
 
-	if (!window_create(grd_curscreen->sc_canvas, 0, 0, SWIDTH, SHEIGHT, pause_handler, p))
-		delete p;
-
-	return 0 /*key*/;	// Keycode returning ripped out (kreatordxx)
+	// Keycode returning ripped out (kreatordxx)
 }
 
 static window_event_result HandleEndlevelKey(int key)
@@ -423,35 +544,43 @@ static window_event_result HandleEndlevelKey(int key)
 			return window_event_result::handled;
 
 		case KEY_ESC:
-			last_drawn_cockpit=-1;
+			last_drawn_cockpit = cockpit_mode_t{UINT8_MAX};
 			return stop_endlevel_sequence();
 	}
 
 	return window_event_result::ignored;
 }
 
-static int HandleDeathInput(const d_event &event)
+static int HandleDeathInput(const d_event &event, control_info &Controls)
 {
-	if (event.type == EVENT_KEY_COMMAND)
-	{
-		int key = event_key_get(event);
+	const auto input_aborts_death_sequence = [&]() {
+		const auto RespawnMode = PlayerCfg.RespawnMode;
+		if (event.type == EVENT_KEY_COMMAND)
+		{
+			const auto key = event_key_get(event);
+			if ((RespawnMode == RespawnPress::Any && !key_isfunc(key) && key != KEY_PAUSE && key) ||
+				(key == KEY_ESC && ConsoleObject->flags & OF_EXPLODING))
+				return 1;
+		}
 
-		if ((PlayerCfg.RespawnMode == RespawnPress::Any && Player_dead_state == player_dead_state::exploded && !key_isfunc(key) && key != KEY_PAUSE && key) ||
-			(key == KEY_ESC && ConsoleObject->flags & OF_EXPLODING))
-				Death_sequence_aborted = 1;
-	}
-
-	if (Player_dead_state == player_dead_state::exploded)
-	{
-		if (PlayerCfg.RespawnMode == RespawnPress::Any
-			? (event.type == EVENT_JOYSTICK_BUTTON_UP || event.type == EVENT_MOUSE_BUTTON_UP)
+		if (RespawnMode == RespawnPress::Any
+			? (
+#if DXX_MAX_BUTTONS_PER_JOYSTICK
+				event.type == EVENT_JOYSTICK_BUTTON_UP ||
+#endif
+				event.type == EVENT_MOUSE_BUTTON_UP)
 			: (Controls.state.fire_primary || Controls.state.fire_secondary || Controls.state.fire_flare))
-			Death_sequence_aborted = 1;
+			return 1;
+		return 0;
+	};
+	if (Player_dead_state == player_dead_state::exploded && input_aborts_death_sequence())
+	{
+		GameViewUniqueState.Death_sequence_aborted = 1;
 	}
 
-	if (Death_sequence_aborted)
+	if (GameViewUniqueState.Death_sequence_aborted)
 	{
-		game_flush_respawn_inputs();
+		game_flush_respawn_inputs(Controls);
 		return 1;
 	}
 
@@ -463,16 +592,26 @@ static void save_pr_screenshot()
 {
 	gr_set_default_canvas();
 	auto &canvas = *grd_curcanv;
-	render_frame(canvas, 0);
+	{
+		window_rendered_data window;
+		render_frame(canvas, 0, window);
+	}
 	auto &medium2_font = *MEDIUM2_FONT;
 	gr_string(canvas, medium2_font, SWIDTH - FSPACX(92), SHEIGHT - LINE_SPACING(medium2_font, *GAME_FONT), "DXX-Rebirth\n");
 	gr_flip();
 	save_screen_shot(0);
 }
 
+static inline void game_render_frame_mono(const d_robot_info_array &Robot_info, int skip_flip, const control_info &Controls)
+{
+	game_render_frame_mono(Robot_info, Controls);
+	if (!skip_flip)
+		gr_flip();
+}
+
 static void save_clean_screenshot()
 {
-	game_render_frame_mono(CGameArg.DbgNoDoubleBuffer);
+	game_render_frame_mono(LevelSharedRobotInfoState.Robot_info, CGameArg.DbgNoDoubleBuffer, Controls);
 	save_screen_shot(0);
 }
 #endif
@@ -493,13 +632,13 @@ static window_event_result HandleDemoKey(int key)
 		case KEY_F4:	Newdemo_show_percentage = !Newdemo_show_percentage; break;
 		KEY_MAC(case KEY_COMMAND+KEY_7:)
 		case KEY_F7:
-			Show_kill_list = (Show_kill_list+1) % ((Newdemo_game_mode & GM_TEAM) ? 4 : 3);
+			Show_kill_list = static_cast<show_kill_list_mode>((underlying_value(Show_kill_list) + 1) % ((Newdemo_game_mode & GM_TEAM) ? 4 : 3));
 			break;
 		case KEY_ESC:
 			if (CGameArg.SysAutoDemo)
 			{
 				int choice;
-				choice = nm_messagebox( NULL, 2, TXT_YES, TXT_NO, TXT_ABORT_AUTODEMO );
+				choice = nm_messagebox_str(menu_title{nullptr}, nm_messagebox_tie(TXT_YES, TXT_NO), menu_subtitle{TXT_ABORT_AUTODEMO});
 				if (choice == 0)
 					CGameArg.SysAutoDemo = false;
 				else
@@ -560,33 +699,6 @@ static window_event_result HandleDemoKey(int key)
 			Newdemo_do_interpolate = !Newdemo_do_interpolate;
 			HUD_init_message(HM_DEFAULT, "Demo playback interpolation %s", Newdemo_do_interpolate?"ON":"OFF");
 			break;
-		case KEY_DEBUGGED + KEY_K: {
-			int how_many, c;
-			char filename[FILENAME_LEN], num[16];
-			array<newmenu_item, 2> m{{
-				nm_item_text("output file name"),
-				nm_item_input(filename),
-			}};
-			filename[0] = '\0';
-			c = newmenu_do( NULL, NULL, m, unused_newmenu_subfunction, unused_newmenu_userdata);
-			if (c == -2)
-				break;
-			strcat(filename, DEMO_EXT);
-			num[0] = '\0';
-			m = {{
-				nm_item_text("strip how many bytes"),
-				nm_item_input(num),
-			}};
-			c = newmenu_do( NULL, NULL, m, unused_newmenu_subfunction, unused_newmenu_userdata);
-			if (c == -2)
-				break;
-			how_many = atoi(num);
-			if (how_many <= 0)
-				break;
-			newdemo_strip_frames(filename, how_many);
-
-			break;
-		}
 #endif
 
 		default:
@@ -598,43 +710,42 @@ static window_event_result HandleDemoKey(int key)
 
 #if defined(DXX_BUILD_DESCENT_II)
 //switch a cockpit window to the next function
-static int select_next_window_function(int w)
+static int select_next_window_function(const gauge_inset_window_view w)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vmobjptridx = Objects.vmptridx;
-	Assert(w==0 || w==1);
 
 	auto &Robot_info = LevelSharedRobotInfoState.Robot_info;
 	switch (PlayerCfg.Cockpit3DView[w]) {
-		case CV_NONE:
-			PlayerCfg.Cockpit3DView[w] = CV_REAR;
+		case cockpit_3d_view::None:
+			PlayerCfg.Cockpit3DView[w] = cockpit_3d_view::Rear;
 			break;
-		case CV_REAR:
+		case cockpit_3d_view::Rear:
 			if (find_escort(vmobjptridx, Robot_info) != object_none)
 			{
-				PlayerCfg.Cockpit3DView[w] = CV_ESCORT;
+				PlayerCfg.Cockpit3DView[w] = cockpit_3d_view::Escort;
 				break;
 			}
 			//if no ecort, fall through
-			DXX_BOOST_FALLTHROUGH;
-		case CV_ESCORT:
+			[[fallthrough]];
+		case cockpit_3d_view::Escort:
 			Coop_view_player[w] = UINT_MAX;		//force first player
-			DXX_BOOST_FALLTHROUGH;
-		case CV_COOP:
-			Marker_viewer_num[w] = ~0u;
+			[[fallthrough]];
+		case cockpit_3d_view::Coop:
+			Marker_viewer_num[w] = game_marker_index::None;
 			if ((Game_mode & GM_MULTI_COOP) || (Game_mode & GM_TEAM)) {
-				PlayerCfg.Cockpit3DView[w] = CV_COOP;
+				PlayerCfg.Cockpit3DView[w] = cockpit_3d_view::Coop;
 				for (;;)
 				{
 					const auto cvp = ++ Coop_view_player[w];
 					if (cvp == MAX_PLAYERS - 1)
 					{
-						PlayerCfg.Cockpit3DView[w] = CV_MARKER;
+						PlayerCfg.Cockpit3DView[w] = cockpit_3d_view::Marker;
 						goto case_marker;
 					}
 					if (cvp == Player_num)
 						continue;
-					if (vcplayerptr(cvp)->connected != CONNECT_PLAYING)
+					if (vcplayerptr(cvp)->connected != player_connection_status::playing)
 						continue;
 
 					if (Game_mode & GM_MULTI_COOP)
@@ -645,20 +756,24 @@ static int select_next_window_function(int w)
 				break;
 			}
 			//if not multi,
-			DXX_BOOST_FALLTHROUGH;
-		case CV_MARKER:
+			[[fallthrough]];
+		case cockpit_3d_view::Marker:
 		case_marker:;
 			if ((Game_mode & GM_MULTI) && !(Game_mode & GM_MULTI_COOP) && Netgame.Allow_marker_view) {	//anarchy only
-				PlayerCfg.Cockpit3DView[w] = CV_MARKER;
-				if (Marker_viewer_num[w] >= MarkerState.imobjidx.size())
-					Marker_viewer_num[w] = Player_num * 2;
-				else if (Marker_viewer_num[w] == Player_num * 2)
-					Marker_viewer_num[w]++;
+				PlayerCfg.Cockpit3DView[w] = cockpit_3d_view::Marker;
+				auto &mvn = Marker_viewer_num[w];
+				const auto gmi0 = convert_player_marker_index_to_game_marker_index(Game_mode, Netgame.max_numplayers, Player_num, player_marker_index::_0);
+				if (!MarkerState.imobjidx.valid_index(mvn))
+					mvn = gmi0;
 				else
-					PlayerCfg.Cockpit3DView[w] = CV_NONE;
+				{
+					++ mvn;
+					if (!MarkerState.imobjidx.valid_index(mvn))
+						PlayerCfg.Cockpit3DView[w] = cockpit_3d_view::None;
+				}
 			}
 			else
-				PlayerCfg.Cockpit3DView[w] = CV_NONE;
+				PlayerCfg.Cockpit3DView[w] = cockpit_3d_view::None;
 			break;
 	}
 	write_player_file();
@@ -669,7 +784,6 @@ static int select_next_window_function(int w)
 
 //this is for system-level keys, such as help, etc.
 //returns 1 if screen changed
-namespace dsx {
 static window_event_result HandleSystemKey(int key)
 {
 	if (Player_dead_state == player_dead_state::no)
@@ -678,7 +792,7 @@ static window_event_result HandleSystemKey(int key)
 			case KEY_ESC:
 			{
 				const bool allow_saveload = !(Game_mode & GM_MULTI) || ((Game_mode & GM_MULTI_COOP) && Player_num == 0);
-				const auto choice = nm_messagebox_str(nullptr, allow_saveload ? nm_messagebox_tie("Abort Game", TXT_OPTIONS_, "Save Game...", TXT_LOAD_GAME) : nm_messagebox_tie("Abort Game", TXT_OPTIONS_), "Game Menu");
+				const auto choice = nm_messagebox_str(menu_title{nullptr}, allow_saveload ? nm_messagebox_tie("Abort Game", TXT_OPTIONS_, "Save Game...", TXT_LOAD_GAME) : nm_messagebox_tie("Abort Game", TXT_OPTIONS_), menu_subtitle{"Game Menu"});
 				switch(choice)
 				{
 					case 0:
@@ -697,11 +811,11 @@ static window_event_result HandleSystemKey(int key)
 
 			KEY_MAC(case KEY_COMMAND+KEY_SHIFTED+KEY_1:)
 			case KEY_SHIFTED+KEY_F1:
-				select_next_window_function(0);
+				select_next_window_function(gauge_inset_window_view::primary);
 				return window_event_result::handled;
 			KEY_MAC(case KEY_COMMAND+KEY_SHIFTED+KEY_2:)
 			case KEY_SHIFTED+KEY_F2:
-				select_next_window_function(1);
+				select_next_window_function(gauge_inset_window_view::secondary);
 				return window_event_result::handled;
 #endif
 		}
@@ -715,7 +829,8 @@ static window_event_result HandleSystemKey(int key)
                         break;
 		KEY_MAC( case KEY_COMMAND+KEY_P: )
 		case KEY_PAUSE:
-			do_game_pause();	break;
+			do_game_pause();
+			break;
 
 
 #if DXX_USE_SCREENSHOT
@@ -770,7 +885,7 @@ static window_event_result HandleSystemKey(int key)
 
 		KEY_MAC(case KEY_COMMAND+KEY_7:)
 		case KEY_F7:
-			Show_kill_list = (Show_kill_list+1) % ((Game_mode & GM_TEAM) ? 4 : 3);
+			Show_kill_list = static_cast<show_kill_list_mode>((underlying_value(Show_kill_list) + 1) % ((Game_mode & GM_TEAM) ? 4 : 3));
 			if (Game_mode & GM_MULTI)
 				multi_sort_kill_list();
 			break;
@@ -862,6 +977,43 @@ static window_event_result HandleSystemKey(int key)
 			break;
 #endif
 
+#if DXX_USE_STEREOSCOPIC_RENDER
+#if 0
+			/* These conflict with the drop-primary and drop-secondary
+			 * keybindings.  Dropping items is more common than using VR, so
+			 * disable these.
+			 */
+		case KEY_SHIFTED + KEY_F5:
+			VR_eye_offset -= 1;
+			reset_cockpit();
+			break;
+		case KEY_SHIFTED + KEY_F6:
+			VR_eye_offset += 1;
+			reset_cockpit();
+			break;
+#endif
+		case KEY_SHIFTED + KEY_ALTED + KEY_F5:
+			VR_eye_width -= (F1_0/10); //*= 10/11;
+			reset_cockpit();
+			break;
+		case KEY_SHIFTED + KEY_ALTED + KEY_F6:
+			VR_eye_width += (F1_0/10); //*= 11/10;
+			reset_cockpit();
+			break;
+		case KEY_SHIFTED + KEY_F7:
+		case KEY_SHIFTED + KEY_ALTED + KEY_F7:
+			VR_eye_width = F1_0;
+			VR_eye_offset = 0;
+			reset_cockpit();
+			break;
+		case KEY_SHIFTED + KEY_F8:
+		case KEY_SHIFTED + KEY_ALTED + KEY_F8:
+			VR_stereo = static_cast<StereoFormat>((static_cast<unsigned>(VR_stereo) + 1) % (static_cast<unsigned>(StereoFormat::HighestFormat) + 1));
+			init_stereo();
+			reset_cockpit();
+			break;
+#endif
+
 			/*
 			 * Jukebox hotkeys -- MD2211, 2007
 			 * Now for all music
@@ -900,10 +1052,8 @@ static window_event_result HandleSystemKey(int key)
 	}
 	return window_event_result::handled;
 }
-}
 
-namespace dsx {
-static window_event_result HandleGameKey(int key)
+static window_event_result HandleGameKey(int key, control_info &Controls)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vmobjptr = Objects.vmptr;
@@ -921,11 +1071,14 @@ static window_event_result HandleGameKey(int key)
 		case KEY_0 + KEY_SHIFTED:
 			if (PlayerCfg.EscortHotKeys)
 			{
-				if (!(Game_mode & GM_MULTI))
-					set_escort_special_goal(key);
-				else
-					HUD_init_message_literal(HM_DEFAULT, "No Guide-Bot in Multiplayer!");
-				game_flush_inputs();
+				auto &BuddyState = LevelUniqueObjectState.BuddyState;
+				if (Game_mode & GM_MULTI)
+				{
+					if (!check_warn_local_player_can_control_guidebot(Objects.vcptr, BuddyState, Netgame))
+						return window_event_result::handled;
+				}
+				set_escort_special_goal(BuddyState, key);
+				game_flush_inputs(Controls);
 				return window_event_result::handled;
 			}
 			else
@@ -967,7 +1120,7 @@ static window_event_result HandleGameKey(int key)
 					RefuseThisPlayer=1;
 					HUD_init_message_literal(HM_MULTI, "Player accepted!");
 					RefuseTeam=1;
-					game_flush_inputs();
+					game_flush_inputs(Controls);
 				}
 			return window_event_result::handled;
 		case KEY_ALTED + KEY_2:
@@ -976,7 +1129,7 @@ static window_event_result HandleGameKey(int key)
 					RefuseThisPlayer=1;
 					HUD_init_message_literal(HM_MULTI, "Player accepted!");
 					RefuseTeam=2;
-					game_flush_inputs();
+					game_flush_inputs(Controls);
 				}
 			return window_event_result::handled;
 
@@ -1001,7 +1154,7 @@ static window_event_result HandleGameKey(int key)
 #if defined(DXX_BUILD_DESCENT_II)
 			case KEY_0 + KEY_ALTED:
 				DropFlag ();
-				game_flush_inputs();
+				game_flush_inputs(Controls);
 				break;
 
 			KEY_MAC(case KEY_COMMAND+KEY_4:)
@@ -1018,7 +1171,6 @@ static window_event_result HandleGameKey(int key)
 		return window_event_result::ignored;
 
 	return window_event_result::handled;
-}
 }
 
 #if defined(DXX_BUILD_DESCENT_II)
@@ -1071,9 +1223,11 @@ static void kill_all_robots(void)
 //	Place player just outside exit.
 //	Kill all bots in mine.
 //	Yippee!!
-static void kill_and_so_forth(fvmobjptridx &vmobjptridx, fvmsegptridx &vmsegptridx)
+static void kill_and_so_forth(const d_robot_info_array &Robot_info, fvmobjptridx &vmobjptridx, fvmsegptridx &vmsegptridx)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vmobjptr = Objects.vmptr;
 	HUD_init_message_literal(HM_DEFAULT, "Killing, awarding, etc.!");
 
@@ -1081,7 +1235,7 @@ static void kill_and_so_forth(fvmobjptridx &vmobjptridx, fvmsegptridx &vmsegptri
 	{
 		switch (o->type) {
 			case OBJ_ROBOT:
-				o->flags |= OF_EXPLODING|OF_SHOULD_BE_DEAD;
+				apply_damage_to_robot(Robot_info, o, o->shields + 1, get_local_player().objnum);
 				break;
 			case OBJ_POWERUP:
 				do_powerup(o);
@@ -1094,21 +1248,18 @@ static void kill_and_so_forth(fvmobjptridx &vmobjptridx, fvmsegptridx &vmsegptri
 	do_controlcen_destroyed_stuff(object_none);
 
 	auto &Triggers = LevelUniqueWallSubsystemState.Triggers;
-	auto &vctrgptr = Triggers.vcptr;
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
 	auto &vcwallptr = Walls.vcptr;
-	for (trgnum_t i = 0; i < Triggers.get_count(); i++)
+	for (const auto &&t : Triggers.vcptridx)
 	{
-		const auto &&t = vctrgptr(i);
 		if (trigger_is_exit(t))
 		{
 			range_for (const auto &&wp, vcwallptr)
 			{
 				auto &w = *wp;
-				if (w.trigger == i)
+				if (w.trigger == t)
 				{
 					const auto &&segp = vmsegptridx(w.segnum);
-					auto &Vertices = LevelSharedVertexState.get_vertices();
 					auto &vcvertptr = Vertices.vcptr;
 					compute_segment_center(vcvertptr, ConsoleObject->pos, segp);
 					obj_relink(vmobjptr, vmsegptr, vmobjptridx(ConsoleObject), segp);
@@ -1179,10 +1330,12 @@ static void kill_buddy(void)
 }
 #endif
 
-namespace dsx {
-static window_event_result HandleTestKey(fvmsegptridx &vmsegptridx, int key)
+static window_event_result HandleTestKey(const d_level_shared_robot_info_state &LevelSharedRobotInfoState, fvmsegptridx &vmsegptridx, int key, control_info &Controls)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &LevelUniqueMorphObjectState = LevelUniqueObjectState.MorphObjectState;
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vmobjptr = Objects.vmptr;
 	auto &vmobjptridx = Objects.vmptridx;
 	switch (key)
@@ -1218,8 +1371,6 @@ static window_event_result HandleTestKey(fvmsegptridx &vmsegptridx, int key)
 
 			Int3(); break;
 
-		case KEY_DEBUGGED+KEY_S:				digi_reset(); break;
-
 		case KEY_DEBUGGED+KEY_P:
 			if (Game_suspended & SUSP_ROBOTS)
 				Game_suspended &= ~SUSP_ROBOTS;		//robots move
@@ -1230,11 +1381,10 @@ static window_event_result HandleTestKey(fvmsegptridx &vmsegptridx, int key)
 		{
 			static int i = 0;
 			const auto &&segp = vmsegptridx(ConsoleObject->segnum);
-			auto &Vertices = LevelSharedVertexState.get_vertices();
 			auto &vcvertptr = Vertices.vcptr;
-			const auto &&new_obj = create_morph_robot(segp, compute_segment_center(vcvertptr, segp), i);
+			const auto &&new_obj = create_morph_robot(LevelSharedRobotInfoState.Robot_info, segp, compute_segment_center(vcvertptr, segp), i);
 			if (new_obj != object_none)
-				morph_start( new_obj );
+				morph_start(LevelUniqueMorphObjectState, LevelSharedPolygonModelState, new_obj);
 			i++;
 			if (i >= LevelSharedRobotInfoState.N_robot_types)
 				i = 0;
@@ -1272,7 +1422,8 @@ static window_event_result HandleTestKey(fvmsegptridx &vmsegptridx, int key)
 
 		case KEY_E + KEY_DEBUGGED:
 		{
-			window_set_visible(Game_wind, 0);	// don't let the game do anything while we set the editor up
+			const auto g = Game_wind;
+			g->set_visible(0);	// don't let the game do anything while we set the editor up
 			auto old_gamestate = gamestate;
 			gamestate = editor_gamestate::unsaved;	// saved game editing mode
 
@@ -1280,7 +1431,7 @@ static window_event_result HandleTestKey(fvmsegptridx &vmsegptridx, int key)
 			// If editor failed to load, carry on playing
 			if (!EditorWindow)
 			{
-				window_set_visible(Game_wind, 1);
+				g->set_visible(1);
 				gamestate = old_gamestate;
 				return window_event_result::handled;
 			}
@@ -1292,7 +1443,7 @@ static window_event_result HandleTestKey(fvmsegptridx &vmsegptridx, int key)
 		{
 			palette_array_t save_pal;
 			save_pal = gr_palette;
-			PlayMovie ("end.tex", "end.mve",MOVIE_ABORT_ON);
+			PlayMovie ("end.tex", "end.mve", play_movie_warn_missing::urgent);
 			Screen_mode = -1;
 			set_screen_mode(SCREEN_GAME);
 			reset_cockpit();
@@ -1301,6 +1452,9 @@ static window_event_result HandleTestKey(fvmsegptridx &vmsegptridx, int key)
 			break;
 		}
 #endif
+		case KEY_C + KEY_CTRLED + KEY_DEBUGGED:
+			window_create<choose_curseg_menu>(LevelSharedSegmentState, *grd_curcanv);
+			break;
 		case KEY_C + KEY_SHIFTED + KEY_DEBUGGED:
 			if (Player_dead_state == player_dead_state::no &&
 				!(Game_mode & GM_MULTI))
@@ -1312,7 +1466,10 @@ static window_event_result HandleTestKey(fvmsegptridx &vmsegptridx, int key)
 
 		#endif  //#ifdef EDITOR
 
-		case KEY_DEBUGGED+KEY_LAPOSTRO: Show_view_text_timer = 0x30000; object_goto_next_viewer(); break;
+		case KEY_DEBUGGED + KEY_LAPOSTRO:
+			Show_view_text_timer = 0x30000;
+			object_goto_next_viewer(LevelUniqueObjectState.Objects, Viewer);
+			break;
 		case KEY_DEBUGGED+KEY_SHIFTED+KEY_LAPOSTRO: Viewer=ConsoleObject; break;
 		case KEY_DEBUGGED+KEY_O: toggle_outline_mode(); break;
 		case KEY_DEBUGGED+KEY_T:
@@ -1340,20 +1497,28 @@ static window_event_result HandleTestKey(fvmsegptridx &vmsegptridx, int key)
 #endif
 
 		case KEY_DEBUGGED + KEY_C:
-			do_cheat_menu();
+		{
+			auto &plrobj = get_local_plrobj();
+			do_cheat_menu(plrobj, grd_curscreen->sc_canvas);
 			break;
+		}
 		case KEY_DEBUGGED + KEY_SHIFTED + KEY_A:
-			do_megawow_powerup(10);
+		{
+			auto &plrobj = get_local_plrobj();
+			do_megawow_powerup(plrobj, 10);
 			break;
+		}
 		case KEY_DEBUGGED + KEY_A:	{
-			do_megawow_powerup(200);
+			auto &plrobj = get_local_plrobj();
+			do_megawow_powerup(plrobj, 200);
 				break;
 		}
 
 		case KEY_DEBUGGED+KEY_SPACEBAR:		//KEY_F7:				// Toggle physics flying
 			slew_stop();
-			game_flush_inputs();
-			if ( ConsoleObject->control_type != CT_FLYING ) {
+			game_flush_inputs(Controls);
+			if (ConsoleObject->control_source != object::control_type::flying)
+			{
 				fly_init(*ConsoleObject);
 				Game_suspended &= ~SUSP_ROBOTS;	//robots move
 			} else {
@@ -1384,10 +1549,17 @@ static window_event_result HandleTestKey(fvmsegptridx &vmsegptridx, int key)
 		case KEY_DEBUGGED+KEY_B: {
 			d_fname text{};
 			int item;
-			array<newmenu_item, 1> m{{
-				nm_item_input(text),
+			std::array<newmenu_item, 1> m{{
+				newmenu_item::nm_item_input(text),
 			}};
-			item = newmenu_do( NULL, "Briefing to play?", m, unused_newmenu_subfunction, unused_newmenu_userdata);
+			struct briefing_menu : passive_newmenu
+			{
+				briefing_menu(grs_canvas &canvas, const ranges::subrange<newmenu_item *> items) :
+					passive_newmenu(menu_title{nullptr}, menu_subtitle{"Briefing to play?"}, menu_filename{nullptr}, tiny_mode_flag::normal, tab_processing_flag::ignore, adjusted_citem::create(items, 0), canvas)
+				{
+				}
+			};
+			item = run_blocking_newmenu<briefing_menu>(*grd_curcanv, m);
 			if (item != -1) {
 				do_briefing_screens(text,1);
 			}
@@ -1398,7 +1570,7 @@ static window_event_result HandleTestKey(fvmsegptridx &vmsegptridx, int key)
 			if (Player_dead_state != player_dead_state::no)
 				return window_event_result::ignored;
 
-			kill_and_so_forth(vmobjptridx, vmsegptridx);
+			kill_and_so_forth(LevelSharedRobotInfoState.Robot_info, vmobjptridx, vmsegptridx);
 			break;
 		case KEY_DEBUGGED+KEY_G:
 			GameTime64 = (INT64_MAX) - (F1_0*10);
@@ -1408,7 +1580,6 @@ static window_event_result HandleTestKey(fvmsegptridx &vmsegptridx, int key)
 			return window_event_result::ignored;
 	}
 	return window_event_result::handled;
-}
 }
 #endif		//#ifndef RELEASE
 
@@ -1467,8 +1638,56 @@ constexpr cheat_code cheat_codes[] = {
 	{ "bittersweet", &game_cheats::acid },
 };
 
-namespace dsx {
-static window_event_result FinalCheats()
+struct levelwarp_menu_items
+{
+	std::array<char, 8> text{};
+	std::array<newmenu_item, 1> menu_items{{
+		newmenu_item::nm_item_input(text),
+	}};
+};
+
+struct levelwarp_menu : levelwarp_menu_items, passive_newmenu
+{
+	levelwarp_menu(grs_canvas &src) :
+		passive_newmenu(menu_title{nullptr}, menu_subtitle{TXT_WARP_TO_LEVEL}, menu_filename{nullptr}, tiny_mode_flag::normal, tab_processing_flag::ignore, adjusted_citem::create(menu_items, 0), src)
+		{
+		}
+	virtual window_event_result event_handler(const d_event &event) override;
+	void handle_close_event();
+};
+
+void levelwarp_menu::handle_close_event()
+{
+	if (!text[0])
+		return;
+	char *p;
+	const auto l = strtoul(text.data(), &p, 0);
+	if (*p)
+		return;
+	/* No handling for secret levels.  Warping to secret
+	 * levels is not supported.
+	 */
+	if (l > Current_mission->last_level)
+		return;
+	const auto g = Game_wind;
+	g->set_visible(0);
+	StartNewLevel(l);
+	g->set_visible(1);
+}
+
+window_event_result levelwarp_menu::event_handler(const d_event &event)
+{
+	switch (event.type)
+	{
+		case EVENT_WINDOW_CLOSE:
+			handle_close_event();
+			return window_event_result::ignored;
+		default:
+			return newmenu::event_handler(event);
+	}
+}
+
+static window_event_result FinalCheats(const d_level_shared_robot_info_state &LevelSharedRobotInfoState)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vmobjptr = Objects.vmptr;
@@ -1478,12 +1697,12 @@ static window_event_result FinalCheats()
 	if (Game_mode & GM_MULTI)
 		return window_event_result::ignored;
 
-	static array<char, CHEAT_MAX_LEN> cheat_buffer;
+	static std::array<char, CHEAT_MAX_LEN> cheat_buffer;
 	std::move(std::next(cheat_buffer.begin()), cheat_buffer.end(), cheat_buffer.begin());
 	cheat_buffer.back() = key_ascii();
 	for (unsigned i = 0;; i++)
 	{
-		if (i >= sizeof(cheat_codes) / sizeof(cheat_codes[0]))
+		if (i >= std::size(cheat_codes))
 			return window_event_result::ignored;
 		int cheatlen = strlen(cheat_codes[i].string);
 		Assert(cheatlen <= CHEAT_MAX_LEN);
@@ -1515,7 +1734,7 @@ static window_event_result FinalCheats()
 
 		player_info.vulcan_ammo = VULCAN_AMMO_MAX;
 		auto &secondary_ammo = player_info.secondary_ammo;
-		range_for (const unsigned i, xrange(3u))
+		for (const auto i : {secondary_weapon_index_t::CONCUSSION_INDEX, secondary_weapon_index_t::HOMING_INDEX, secondary_weapon_index_t::PROXIMITY_INDEX})
 			secondary_ammo[i] = Secondary_ammo_max[i];
 
 		if (Newdemo_state == ND_STATE_RECORDING)
@@ -1556,7 +1775,7 @@ static window_event_result FinalCheats()
 	{
 		HUD_init_message_literal(HM_DEFAULT, TXT_WOWIE_ZOWIE);
 
-		if (Piggy_hamfile_version < 3) // SHAREWARE
+		if (Piggy_hamfile_version < pig_hamfile_version::_3) // SHAREWARE
 		{
 			player_info.primary_weapon_flags |= (HAS_LASER_FLAG | HAS_VULCAN_FLAG | HAS_SPREADFIRE_FLAG | HAS_PLASMA_FLAG) | (HAS_GAUSS_FLAG | HAS_HELIX_FLAG);
 		}
@@ -1569,7 +1788,7 @@ static window_event_result FinalCheats()
 		auto &secondary_ammo = player_info.secondary_ammo;
 		secondary_ammo = Secondary_ammo_max;
 
-		if (Piggy_hamfile_version < 3) // SHAREWARE
+		if (Piggy_hamfile_version < pig_hamfile_version::_3) // SHAREWARE
 		{
 			secondary_ammo[SMISSILE4_INDEX] = 0;
 			secondary_ammo[SMISSILE5_INDEX] = 0;
@@ -1638,9 +1857,7 @@ static window_event_result FinalCheats()
 #endif
 
 	if (gotcha == &game_cheats::killreactor)
-	{
-		kill_and_so_forth(vmobjptridx, vmsegptridx);
-	}
+		kill_and_so_forth(LevelSharedRobotInfoState.Robot_info, vmobjptridx, vmsegptridx);
 
 	if (gotcha == &game_cheats::exitpath)
 	{
@@ -1650,21 +1867,8 @@ static window_event_result FinalCheats()
 
 	if (gotcha == &game_cheats::levelwarp)
 	{
-		char text[10]="";
-		int new_level_num;
-		int item;
-		array<newmenu_item, 1> m{{
-			nm_item_input(text),
-		}};
-		item = newmenu_do( NULL, TXT_WARP_TO_LEVEL, m, unused_newmenu_subfunction, unused_newmenu_userdata);
-		if (item != -1) {
-			new_level_num = atoi(m[0].text);
-			if (new_level_num!=0 && new_level_num>=0 && new_level_num<=Last_level) {
-				window_set_visible(Game_wind, 0);
-				StartNewLevel(new_level_num);
-				window_set_visible(Game_wind, 1);
-			}
-		}
+		auto menu = window_create<levelwarp_menu>(grd_curscreen->sc_canvas);
+		(void)menu;
 	}
 
 #if defined(DXX_BUILD_DESCENT_II)
@@ -1682,7 +1886,7 @@ static window_event_result FinalCheats()
 		HUD_init_message(HM_DEFAULT, "Rapid fire %s!", cheats.rapidfire?TXT_ON:TXT_OFF);
 #if defined(DXX_BUILD_DESCENT_I)
                 if (cheats.rapidfire)
-                        do_megawow_powerup(200);
+					do_megawow_powerup(plrobj, 200);
 #endif
 	}
 
@@ -1728,7 +1932,7 @@ static window_event_result FinalCheats()
 	if (gotcha == &game_cheats::buddyclone)
 	{
 		HUD_init_message_literal(HM_DEFAULT, "What's this? Another buddy bot!");
-		create_buddy_bot();
+		create_buddy_bot(LevelSharedRobotInfoState);
 	}
 
 	if (gotcha == &game_cheats::buddyangry)
@@ -1754,12 +1958,9 @@ static window_event_result FinalCheats()
 
 	return window_event_result::handled;
 }
-}
 
 // Internal Cheat Menu
 #ifndef RELEASE
-
-namespace {
 
 class menu_fix_wrapper
 {
@@ -1785,9 +1986,9 @@ class cheat_menu_bit_invulnerability :
 	public menu_bit_wrapper_t<player_flags, std::integral_constant<PLAYER_FLAG, PLAYER_FLAGS_INVULNERABLE>>
 {
 public:
-	cheat_menu_bit_invulnerability(object &player) :
-		reference_wrapper(player.ctype.player_info),
-		menu_bit_wrapper_t(get().powerup_flags, {})
+	cheat_menu_bit_invulnerability(player_info &pl_info) :
+		reference_wrapper(pl_info),
+		menu_bit_wrapper_t(pl_info.powerup_flags, {})
 	{
 	}
 	cheat_menu_bit_invulnerability &operator=(const uint32_t n)
@@ -1808,9 +2009,9 @@ class cheat_menu_bit_cloak :
 	public menu_bit_wrapper_t<player_flags, std::integral_constant<PLAYER_FLAG, PLAYER_FLAGS_CLOAKED>>
 {
 public:
-	cheat_menu_bit_cloak(object &player) :
-		reference_wrapper(player.ctype.player_info),
-		menu_bit_wrapper_t(get().powerup_flags, {})
+	cheat_menu_bit_cloak(player_info &pl_info) :
+		reference_wrapper(pl_info),
+		menu_bit_wrapper_t(pl_info.powerup_flags, {})
 	{
 	}
 	cheat_menu_bit_cloak &operator=(const uint32_t n)
@@ -1827,8 +2028,6 @@ public:
 	}
 };
 
-}
-
 #if defined(DXX_BUILD_DESCENT_I)
 #define WIMP_MENU_DXX(VERB)
 #elif defined(DXX_BUILD_DESCENT_II)
@@ -1836,49 +2035,79 @@ public:
  * a cheat.  The player can change his energy up if he needs more.
  */
 #define WIMP_MENU_DXX(VERB)	\
-	DXX_MENUITEM(VERB, CHECK, TXT_AFTERBURNER, opt_afterburner, menu_bit_wrapper(player_info.powerup_flags, PLAYER_FLAGS_AFTERBURNER))	\
+	DXX_MENUITEM(VERB, CHECK, TXT_AFTERBURNER, opt_afterburner, menu_bit_wrapper(pl_info.powerup_flags, PLAYER_FLAGS_AFTERBURNER))	\
 
 #endif
 
 #define DXX_WIMP_MENU(VERB)	\
-	DXX_MENUITEM(VERB, CHECK, TXT_INVULNERABILITY, opt_invul, cheat_menu_bit_invulnerability(plrobj))	\
-	DXX_MENUITEM(VERB, CHECK, TXT_CLOAKED, opt_cloak, cheat_menu_bit_cloak(plrobj))	\
-	DXX_MENUITEM(VERB, CHECK, "BLUE KEY", opt_key_blue, menu_bit_wrapper(player_info.powerup_flags, PLAYER_FLAGS_BLUE_KEY))	\
-	DXX_MENUITEM(VERB, CHECK, "GOLD KEY", opt_key_gold, menu_bit_wrapper(player_info.powerup_flags, PLAYER_FLAGS_GOLD_KEY))	\
-	DXX_MENUITEM(VERB, CHECK, "RED KEY", opt_key_red, menu_bit_wrapper(player_info.powerup_flags, PLAYER_FLAGS_RED_KEY))	\
+	DXX_MENUITEM(VERB, CHECK, TXT_INVULNERABILITY, opt_invul, cheat_menu_bit_invulnerability(pl_info))	\
+	DXX_MENUITEM(VERB, CHECK, TXT_CLOAKED, opt_cloak, cheat_menu_bit_cloak(pl_info))	\
+	DXX_MENUITEM(VERB, CHECK, "BLUE KEY", opt_key_blue, menu_bit_wrapper(pl_info.powerup_flags, PLAYER_FLAGS_BLUE_KEY))	\
+	DXX_MENUITEM(VERB, CHECK, "GOLD KEY", opt_key_gold, menu_bit_wrapper(pl_info.powerup_flags, PLAYER_FLAGS_GOLD_KEY))	\
+	DXX_MENUITEM(VERB, CHECK, "RED KEY", opt_key_red, menu_bit_wrapper(pl_info.powerup_flags, PLAYER_FLAGS_RED_KEY))	\
 	WIMP_MENU_DXX(VERB)	\
-	DXX_MENUITEM(VERB, NUMBER, TXT_ENERGY, opt_energy, menu_fix_wrapper(plrobj.ctype.player_info.energy), 0, 200)	\
+	DXX_MENUITEM(VERB, NUMBER, TXT_ENERGY, opt_energy, menu_fix_wrapper(pl_info.energy), 0, 200)	\
 	DXX_MENUITEM(VERB, NUMBER, "Shields", opt_shields, menu_fix_wrapper(plrobj.shields), 0, 200)	\
 	DXX_MENUITEM(VERB, TEXT, TXT_SCORE, opt_txt_score)	\
 	DXX_MENUITEM(VERB, INPUT, score_text, opt_score)	\
-	DXX_MENUITEM(VERB, NUMBER, "Laser Level", opt_laser_level, menu_number_bias_wrapper<1>(plr_laser_level), LASER_LEVEL_1 + 1, DXX_MAXIMUM_LASER_LEVEL + 1)	\
-	DXX_MENUITEM(VERB, NUMBER, "Concussion", opt_concussion, plrobj.ctype.player_info.secondary_ammo[CONCUSSION_INDEX], 0, 200)	\
+	DXX_MENUITEM(VERB, NUMBER, "Laser Level", opt_laser_level, menu_number_bias_wrapper<1>(plr_laser_level), static_cast<uint8_t>(laser_level::_1) + 1, static_cast<uint8_t>(DXX_MAXIMUM_LASER_LEVEL) + 1)	\
+	DXX_MENUITEM(VERB, NUMBER, "Concussion", opt_concussion, pl_info.secondary_ammo[CONCUSSION_INDEX], 0, 200)	\
 
-static void do_cheat_menu()
+struct wimp_menu_items
 {
-	auto &Objects = LevelUniqueObjectState.Objects;
-	auto &vmobjptr = Objects.vmptr;
+	object &plrobj;
+	std::array<char, sizeof("2147483647")> score_text;
 	enum {
 		DXX_WIMP_MENU(ENUM)
 	};
-	int mmn;
-	array<newmenu_item, DXX_WIMP_MENU(COUNT)> m;
-	char score_text[sizeof("2147483647")];
-	auto &plrobj = get_local_plrobj();
-	auto &player_info = plrobj.ctype.player_info;
-	snprintf(score_text, sizeof(score_text), "%d", player_info.mission.score);
-	uint8_t plr_laser_level = player_info.laser_level;
-	DXX_WIMP_MENU(ADD);
-	mmn = newmenu_do("Wimp Menu",NULL,m, unused_newmenu_subfunction, unused_newmenu_userdata);
-	if (mmn > -1 )  {
-		DXX_WIMP_MENU(READ);
-		player_info.laser_level = laser_level_t(plr_laser_level);
-		char *p;
-		auto ul = strtoul(score_text, &p, 10);
-		if (!*p)
-			player_info.mission.score = static_cast<int>(ul);
-		init_gauges();
+	std::array<newmenu_item, DXX_WIMP_MENU(COUNT)> m;
+	wimp_menu_items(object &plr) :
+		plrobj(plr)
+	{
+		auto &pl_info = plrobj.ctype.player_info;
+		snprintf(score_text.data(), score_text.size(), "%d", pl_info.mission.score);
+		const uint8_t plr_laser_level = static_cast<uint8_t>(pl_info.laser_level);
+		DXX_WIMP_MENU(ADD);
 	}
+};
+
+struct wimp_menu : wimp_menu_items, newmenu
+{
+	wimp_menu(object &plr, grs_canvas &src) :
+		wimp_menu_items(plr),
+		newmenu(menu_title{"Wimp Menu"}, menu_subtitle{nullptr}, menu_filename{nullptr}, tiny_mode_flag::normal, tab_processing_flag::ignore, adjusted_citem::create(m, 0), src)
+		{
+		}
+	virtual window_event_result event_handler(const d_event &event) override;
+};
+
+window_event_result wimp_menu::event_handler(const d_event &event)
+{
+	switch (event.type)
+	{
+		case EVENT_WINDOW_CLOSE:
+			{
+				auto &pl_info = plrobj.ctype.player_info;
+				uint8_t plr_laser_level;
+				DXX_WIMP_MENU(READ);
+				pl_info.laser_level = laser_level{plr_laser_level};
+				char *p;
+				auto ul = strtoul(score_text.data(), &p, 10);
+				if (!*p)
+					pl_info.mission.score = static_cast<int>(ul);
+				init_gauges();
+				break;
+			}
+		default:
+			break;
+	}
+	return newmenu::event_handler(event);
+}
+
+static void do_cheat_menu(object &plrobj, grs_canvas &cv_canvas)
+{
+	auto menu = window_create<wimp_menu>(plrobj, cv_canvas);
+	(void)menu;
 }
 #endif
 
@@ -1897,10 +2126,11 @@ static void play_test_sound()
 }
 #endif  //ifndef NDEBUG
 
-namespace dsx {
+}
 
-window_event_result ReadControls(const d_event &event)
+window_event_result ReadControls(const d_level_shared_robot_info_state &LevelSharedRobotInfoState, const d_event &event, control_info &Controls)
 {
+	auto &LevelUniqueControlCenterState = LevelUniqueObjectState.ControlCenterState;
 	auto &Objects = LevelUniqueObjectState.Objects;
 	int key;
 	static ubyte exploding_flag=0;
@@ -1911,17 +2141,17 @@ window_event_result ReadControls(const d_event &event)
 	{
 		if (exploding_flag==0)  {
 			exploding_flag = 1;			// When player starts exploding, clear all input devices...
-			game_flush_inputs();
+			game_flush_inputs(Controls);
 		}
 	} else {
 		exploding_flag=0;
 	}
 	if (Player_dead_state != player_dead_state::no &&
 		!((Game_mode & GM_MULTI) &&
-			(multi_sending_message[Player_num] || multi_defining_message)
+			(multi_sending_message[Player_num] != msgsend_state::none || multi_defining_message)
 		)
 	)
-	HandleDeathInput(event);
+	HandleDeathInput(event, Controls);
 
 	if (Newdemo_state == ND_STATE_PLAYBACK)
 		update_vcr_state();
@@ -1932,12 +2162,12 @@ window_event_result ReadControls(const d_event &event)
 #if defined(DXX_BUILD_DESCENT_II)
 		if (MarkerState.DefiningMarkerMessage())
 		{
-			return MarkerInputMessage(key);
+			return MarkerInputMessage(key, Controls);
 		}
 #endif
-		if ( (Game_mode & GM_MULTI) && (multi_sending_message[Player_num] || multi_defining_message) )
+		if ( (Game_mode & GM_MULTI) && (multi_sending_message[Player_num] != msgsend_state::none || multi_defining_message) )
 		{
-			return multi_message_input_sub(key);
+			return multi_message_input_sub(LevelSharedRobotInfoState.Robot_info, key, Controls);
 		}
 
 #ifndef RELEASE
@@ -1961,18 +2191,18 @@ window_event_result ReadControls(const d_event &event)
 		}
 		else
 		{
-			window_event_result r = FinalCheats();
+			window_event_result r = FinalCheats(LevelSharedRobotInfoState);
 			if (r == window_event_result::ignored)
 				r = HandleSystemKey(key);
 			if (r == window_event_result::ignored)
-				r = HandleGameKey(key);
+				r = HandleGameKey(key, Controls);
 			if (r != window_event_result::ignored)
 				return r;
 		}
 
 #ifndef RELEASE
 		{
-			window_event_result r = HandleTestKey(vmsegptridx, key);
+			window_event_result r = HandleTestKey(LevelSharedRobotInfoState, vmsegptridx, key, Controls);
 			if (r != window_event_result::ignored)
 				return r;
 		}
@@ -1985,18 +2215,18 @@ window_event_result ReadControls(const d_event &event)
 
 	if (!Endlevel_sequence && Newdemo_state != ND_STATE_PLAYBACK)
 	{
-		kconfig_read_controls(event, 0);
+		kconfig_read_controls(Controls, event, 0);
 		const auto Player_is_dead = Player_dead_state;
-		if (Player_is_dead != player_dead_state::no && HandleDeathInput(event))
+		if (Player_is_dead != player_dead_state::no && HandleDeathInput(event, Controls))
 			return window_event_result::handled;
 
-		check_rear_view();
+		check_rear_view(Controls);
 
 		// If automap key pressed, enable automap unless you are in network mode, control center destroyed and < 10 seconds left
 		if ( Controls.state.automap )
 		{
 			Controls.state.automap = 0;
-			if (Player_is_dead != player_dead_state::no || (!((Game_mode & GM_MULTI) && Control_center_destroyed && (Countdown_seconds_left < 10))))
+			if (Player_is_dead != player_dead_state::no || !((Game_mode & GM_MULTI) && LevelUniqueControlCenterState.Control_center_destroyed && LevelUniqueControlCenterState.Countdown_seconds_left < 10))
 			{
 				do_automap();
 				return window_event_result::handled;
@@ -2004,8 +2234,15 @@ window_event_result ReadControls(const d_event &event)
 		}
 		if (Player_is_dead != player_dead_state::no)
 			return window_event_result::ignored;
-		do_weapon_n_item_stuff(Objects);
+		do_weapon_n_item_stuff(Objects, Controls);
 	}
+
+	if (Controls.state.show_menu)
+	{
+		Controls.state.show_menu = 0;
+		return HandleSystemKey(KEY_ESC);
+	}
+
 	return window_event_result::ignored;
 }
 

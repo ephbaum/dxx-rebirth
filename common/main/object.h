@@ -33,27 +33,28 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "vecmat.h"
 #include "aistruct.h"
 #include "polyobj.h"
-#include "laser.h"
 
-#ifdef __cplusplus
 #include <cassert>
 #include <cstdint>
 #include "dxxsconf.h"
-#include "compiler-array.h"
 #include "valptridx.h"
 #include "objnum.h"
 #include "fwd-segment.h"
 #include <vector>
 #include <stdexcept>
 #include "fwd-object.h"
-#include "weapon.h"
+#include "fwd-robot.h"
+#include "fwd-weapon.h"
+#include "fwd-player.h"
 #include "powerup.h"
-#include "compiler-integer_sequence.h"
 #include "compiler-poison.h"
+#include "physics_info.h"
 #include "player-flags.h"
 #if defined(DXX_BUILD_DESCENT_II)
 #include "escort.h"
 #endif
+#include <array>
+#include <utility>
 
 namespace dcx {
 
@@ -78,12 +79,46 @@ enum object_type_t : uint8_t
 	OBJ_MARKER	= 15,  // a map marker
 };
 
-enum movement_type_t : uint8_t
+enum render_type_t : uint8_t
 {
-	MT_NONE = 0,   // doesn't move
-	MT_PHYSICS = 1,   // moves by physics
-	MT_SPINNING = 3,   // this object doesn't move, just sits and spins
+	RT_NONE = 0,   // does not render
+	RT_POLYOBJ = 1,   // a polygon model
+	RT_FIREBALL = 2,   // a fireball
+	RT_LASER = 3,   // a laser
+	RT_HOSTAGE = 4,   // a hostage
+	RT_POWERUP = 5,   // a powerup
+	RT_MORPH = 6,   // a robot being morphed
+	RT_WEAPON_VCLIP = 7,   // a weapon that renders as a vclip
 };
+
+enum class gun_num_t : uint8_t
+{
+	_0,
+	_1,
+	_2,
+	_3,
+	_4,
+	center = 6,
+	_7,
+};
+
+static inline bool valid_render_type(const uint8_t r)
+{
+	switch (r)
+	{
+		case RT_NONE:
+		case RT_POLYOBJ:
+		case RT_FIREBALL:
+		case RT_LASER:
+		case RT_HOSTAGE:
+		case RT_POWERUP:
+		case RT_MORPH:
+		case RT_WEAPON_VCLIP:
+			return true;
+		default:
+			return false;
+	}
+}
 
 }
 
@@ -95,7 +130,7 @@ namespace dsx {
 
 struct reactor_static {
 	/* Location of the gun on the reactor object */
-	array<vms_vector, MAX_CONTROLCEN_GUNS>	gun_pos,
+	std::array<vms_vector, MAX_CONTROLCEN_GUNS>	gun_pos,
 	/* Orientation of the gun on the reactor object */
 		gun_dir;
 };
@@ -124,8 +159,8 @@ struct player_info
 	uint8_t missile_gun;
 	player_selected_weapon<primary_weapon_index_t> Primary_weapon;
 	player_selected_weapon<secondary_weapon_index_t> Secondary_weapon;
-	stored_laser_level laser_level;
-	array<uint8_t, MAX_SECONDARY_WEAPONS>  secondary_ammo; // How much ammo of each type.
+	enum laser_level laser_level;
+	std::array<uint8_t, MAX_SECONDARY_WEAPONS>  secondary_ammo; // How much ammo of each type.
 	uint8_t Spreadfire_toggle;
 #if defined(DXX_BUILD_DESCENT_II)
 	uint8_t Primary_last_was_super;
@@ -166,7 +201,7 @@ namespace dcx {
 // A compressed form for sending crucial data
 struct shortpos : prohibit_void_ptr<shortpos>
 {
-	array<int8_t, 9> bytemat;
+	std::array<int8_t, 9> bytemat;
 	int16_t xo, yo, zo;
 	segnum_t segment;
 	int16_t velx, vely, velz;
@@ -183,39 +218,13 @@ struct quaternionpos : prohibit_void_ptr<quaternionpos>
 	vms_vector rotvel;
 };
 
-// information for physics sim for an object
-struct physics_info : prohibit_void_ptr<physics_info>
-{
-	vms_vector  velocity;   // velocity vector of this object
-	vms_vector  thrust;     // constant force applied to this object
-	fix         mass;       // the mass of this object
-	fix         drag;       // how fast this slows down
-	vms_vector  rotvel;     // rotational velecity (angles)
-	vms_vector  rotthrust;  // rotational acceleration
-	fixang      turnroll;   // rotation caused by turn banking
-	ushort      flags;      // misc physics flags
-};
-
-struct physics_info_rw
-{
-	vms_vector  velocity;   // velocity vector of this object
-	vms_vector  thrust;     // constant force applied to this object
-	fix         mass;       // the mass of this object
-	fix         drag;       // how fast this slows down
-	fix         obsolete_brakes;     // how much brakes applied
-	vms_vector  rotvel;     // rotational velecity (angles)
-	vms_vector  rotthrust;  // rotational acceleration
-	fixang      turnroll;   // rotation caused by turn banking
-	ushort      flags;      // misc physics flags
-} __pack__;
-
 // stuctures for different kinds of simulation
 
 struct laser_parent
 {
 	int16_t parent_type = {};        // The type of the parent of this object
 	objnum_t parent_num = {};         // The object's parent's number
-	object_signature_t parent_signature = {};   // The object's parent's signature...
+	object_signature_t parent_signature = object_signature_t{0};   // The object's parent's signature...
 };
 
 struct laser_info : prohibit_void_ptr<laser_info>, laser_parent
@@ -236,21 +245,7 @@ struct laser_info : prohibit_void_ptr<laser_info>, laser_parent
 	fix multiplier = 0;         // Power if this is a fusion bolt (or other super weapon to be added).
 	uint_fast8_t test_set_hitobj(const vcobjidx_t o);
 	uint_fast8_t test_hitobj(const vcobjidx_t o) const;
-	icobjidx_t get_last_hitobj() const
-	{
-		if (!hitobj_count)
-			/* If no elements, return object_none */
-			return object_none;
-		/* Return the most recently written element.  `hitobj_pos`
-		 * indicates the element to write next, so return
-		 * hitobj_values[hitobj_pos - 1].  When hitobj_pos == 0, the
-		 * most recently written element is at the end of the array, not
-		 * before the beginning of the array.
-		 */
-		if (!hitobj_pos)
-			return hitobj_values.back();
-		return hitobj_values[hitobj_pos - 1];
-	}
+	icobjidx_t get_last_hitobj() const;
 	void clear_hitobj()
 	{
 		hitobj_pos = hitobj_count = 0;
@@ -275,6 +270,10 @@ struct laser_info : prohibit_void_ptr<laser_info>, laser_parent
 		hitobj_values[0] = o;
 	}
 };
+
+}
+
+namespace dcx {
 
 // Same as above but structure Savegames/Multiplayer objects expect
 struct laser_info_rw
@@ -361,11 +360,11 @@ struct vclip_info_rw
 
 struct polyobj_info : prohibit_void_ptr<polyobj_info>
 {
-	int     model_num;          // which polygon model
-	array<vms_angvec, MAX_SUBMODELS> anim_angles; // angles for each subobject
-	int     subobj_flags;       // specify which subobjs to draw
-	int     tmap_override;      // if this is not -1, map all face to this
-	int     alt_textures;       // if not -1, use these textures instead
+	polygon_model_index model_num{};// which polygon model
+	std::array<vms_angvec, MAX_SUBMODELS> anim_angles{}; // angles for each subobject
+	int     subobj_flags = 0;       // specify which subobjs to draw
+	int     tmap_override = 0;      // if this is not -1, map all face to this
+	int     alt_textures = 0;       // if not -1, use these textures instead
 };
 
 struct polyobj_info_rw
@@ -379,13 +378,15 @@ struct polyobj_info_rw
 
 struct object_base
 {
+	enum class control_type : uint8_t;
+	enum class movement_type : uint8_t;
 	object_signature_t signature;
 	object_type_t   type;           // what type of object this is... robot, weapon, hostage, powerup, fireball
 	ubyte   id;             // which form of object...which powerup, robot, etc.
 	objnum_t   next,prev;      // id of next and previous connected object in Objects, -1 = no connection
-	ubyte   control_type;   // how this object is controlled
-	movement_type_t   movement_type;  // how this object moves
-	ubyte   render_type;    // how this object renders
+	enum control_type control_source;   // how this object is controlled
+	enum movement_type movement_source; // how this object moves
+	render_type_t render_type;    // how this object renders
 	ubyte   flags;          // misc flags
 	segnum_t   segnum;         // segment number containing object
 	objnum_t   attached_obj;   // number of attached fireball object
@@ -393,7 +394,6 @@ struct object_base
 	vms_matrix orient;      // orientation of object in world
 	fix     size;           // 3d size of object - for collision detection
 	fix     shields;        // Starts at maximum, when <0, object dies..
-	vms_vector last_pos;    // where object was last frame
 	sbyte   contains_type;  // Type of object this object contains (eg, spider contains powerup)
 	sbyte   contains_id;    // ID of object this object contains (eg, id = blue type = key)
 	sbyte   contains_count; // number of objects of type:id this object contains
@@ -422,6 +422,32 @@ struct object_base
 			static_assert(sizeof(pobj_info) == sizeof(*this), "insufficient initialization");
 		}
 	} rtype;
+};
+
+// Control types - what tells this object what do do
+enum class object_base::control_type : uint8_t
+{
+	None	=	0,		// doesn't move (or change movement)
+	ai	=	1,			// driven by AI
+	explosion	=	2,	// explosion sequencer
+	flying	=	4,		// the player is flying
+	slew	=	5,		// slewing
+	flythrough	=	6,	// the flythrough system
+	weapon	=	9,		// laser, etc.
+	repaircen	=	10,	// under the control of the repair center
+	morph	=	11,		// this object is being morphed
+	debris	=	12,	// this is a piece of debris
+	powerup	=	13,	// animating powerup blob
+	light	=	14,		// doesn't actually do anything
+	remote	=	15,	// controlled by another net player
+	cntrlcen	=	16,	// the control center/main reactor
+};
+
+enum class object_base::movement_type : uint8_t
+{
+	None = 0,   // doesn't move
+	physics = 1,   // moves by physics
+	spinning = 3,   // this object doesn't move, just sits and spins
 };
 
 }
@@ -454,10 +480,6 @@ struct object : public ::dcx::object_base
 	} ctype;
 };
 
-}
-
-namespace dcx {
-
 // Same as above but structure Savegames/Multiplayer objects expect
 struct object_rw
 {
@@ -465,11 +487,11 @@ struct object_rw
 	ubyte   type;           // what type of object this is... robot, weapon, hostage, powerup, fireball
 	ubyte   id;             // which form of object...which powerup, robot, etc.
 	short   next,prev;      // id of next and previous connected object in Objects, -1 = no connection
-	ubyte   control_type;   // how this object is controlled
-	ubyte   movement_type;  // how this object moves
+	ubyte   control_source;   // how this object is controlled
+	ubyte   movement_source;  // how this object moves
 	ubyte   render_type;    // how this object renders
 	ubyte   flags;          // misc flags
-	short   segnum;         // segment number containing object
+	uint16_t segnum;         // segment number containing object
 	short   attached_obj;   // number of attached fireball object
 	vms_vector pos;         // absolute x,y,z coordinate of center of object
 	vms_matrix orient;      // orientation of object in world
@@ -505,12 +527,20 @@ struct object_rw
 	} __pack__ rtype;
 } __pack__;
 
+}
+
+static_assert(sizeof(object_rw) == 264);
+
+namespace dcx {
+
 struct obj_position
 {
 	vms_vector  pos;        // absolute x,y,z coordinate of center of object
 	vms_matrix  orient;     // orientation of object in world
 	segnum_t       segnum;     // segment number containing object
 };
+
+}
 
 #define set_object_type(O,T)	\
 	( DXX_BEGIN_COMPOUND_STATEMENT {	\
@@ -536,31 +566,50 @@ struct obj_position
 		dxx_object_type_ref.type = static_cast<object_type_t>(dxx_object_type_value);	\
 	} DXX_END_COMPOUND_STATEMENT )
 
-#define set_object_movement_type(O,T)	\
-	( DXX_BEGIN_COMPOUND_STATEMENT {	\
-		object_base &dxx_object_movement_type_ref = (O);	\
-		const uint8_t &dxx_object_movement_type_value = (T);	\
-		assert(	\
-			dxx_object_movement_type_value == MT_NONE ||	\
-			dxx_object_movement_type_value == MT_PHYSICS ||	\
-			dxx_object_movement_type_value == MT_SPINNING	\
-		);	\
-		dxx_object_movement_type_ref.movement_type = static_cast<movement_type_t>(dxx_object_movement_type_value);	\
-	} DXX_END_COMPOUND_STATEMENT )
+namespace dsx {
 
 template <typename T, std::size_t... N>
-constexpr array<T, sizeof...(N)> init_object_number_array(index_sequence<N...>)
+constexpr std::array<T, sizeof...(N)> init_object_number_array(std::index_sequence<N...>)
 {
 	return {{((void)N, object_none)...}};
 }
 
-template <typename T, std::size_t N>
-struct object_number_array : array<T, N>
+}
+
+namespace dcx {
+
+unsigned laser_parent_is_matching_signature(const laser_parent &l, const object_base &o);
+
+struct d_level_unique_control_center_state
 {
-	constexpr object_number_array() :
-		array<T, N>(init_object_number_array<T>(make_tree_index_sequence<N>()))
-	{
-	}
+	uint8_t Control_center_destroyed;
+	uint8_t Control_center_been_hit;
+	uint8_t Control_center_present;
+	player_visibility_state Control_center_player_been_seen;
+	objnum_t Dead_controlcen_object_num;
+	int Countdown_seconds_left;
+	fix Countdown_timer;
+	fix Frametime_until_next_fire;
+	/* If the player is not dead, this stays 0.  If the player is dead,
+	 * this accumulates FrameTime, up until it saturates.  When it
+	 * saturates, the reactor stops firing.
+	 *
+	 * FIXME: The original game defined this in terms of "the player",
+	 * but reactors are present in multiplayer games.
+	 */
+	fix Frametime_since_player_died;
+	int Total_countdown_time;		//in whole seconds
+};
+
+struct d_level_unique_boss_state
+{
+	fix64 Last_gate_time;
+	fix64 Boss_cloak_start_time;
+	fix64 Last_teleport_time;
+	fix64 Boss_dying_start_time;
+	int8_t Boss_hit_this_frame;
+	int8_t Boss_dying;
+	int8_t Boss_dying_sound_playing;
 };
 
 }
@@ -569,15 +618,70 @@ struct object_number_array : array<T, N>
 
 namespace dsx {
 
+// initialize a new object.  adds to the list for the given segment
+// returns the object number
+[[nodiscard]]
+imobjptridx_t obj_create(d_level_unique_object_state &LevelUniqueObjectState, const d_level_shared_segment_state &LevelSharedSegmentState, d_level_unique_segment_state &LevelUniqueSegmentState, object_type_t type, unsigned id, vmsegptridx_t segnum, const vms_vector &pos, const vms_matrix *orient, fix size, enum object::control_type ctype, enum object::movement_type mtype, render_type_t rtype);
+
+[[nodiscard]]
+imobjptridx_t obj_weapon_create(d_level_unique_object_state &LevelUniqueObjectState, const d_level_shared_segment_state &LevelSharedSegmentState, d_level_unique_segment_state &LevelUniqueSegmentState, const weapon_info_array &Weapon_info, unsigned id, vmsegptridx_t segnum, const vms_vector &pos, fix size, render_type_t rtype);
+
 #if defined(DXX_BUILD_DESCENT_II)
+
+/* game_marker_index values are assigned as the object.id field for
+ * marker objects, and are used as an index into most marker-related
+ * arrays.  These values are scoped to a single level.  Each player
+ * marker has a unique value for game_marker_index, computed based on
+ * the player's ID and the player_marker_index active for that player
+ * when the marker was created.
+ */
+enum class game_marker_index : uint8_t
+{
+	GuidebotDeathSite = 10,
+	None = UINT8_MAX
+};
+
+/* player_marker_index are per-player marker indexes.  Each player has
+ * their own private number space.  Valid values range from [0,
+ * maxdrop), where maxdrop depends on the game type (single player,
+ * competitive multiplayer, or cooperative multiplayer).
+ */
+enum class player_marker_index : uint8_t
+{
+	_0,
+	None = UINT8_MAX
+};
+
+static inline game_marker_index &operator++(game_marker_index &i)
+{
+	auto u = static_cast<unsigned>(i);
+	++ u;
+	i = static_cast<game_marker_index>(u);
+	return i;
+}
+
+static inline player_marker_index &operator++(player_marker_index &i)
+{
+	auto u = static_cast<unsigned>(i);
+	++ u;
+	i = static_cast<player_marker_index>(u);
+	return i;
+}
+
 struct d_unique_buddy_state
 {
+	enum class Escort_goal_reachability : uint8_t
+	{
+		unreachable,
+		reachable,
+	};
 	icobjidx_t Buddy_objnum = object_none;
-	icobjidx_t Escort_goal_index = object_none;
+	icobjidx_t Escort_goal_objidx = object_none;
+	Escort_goal_reachability Escort_goal_reachable = Escort_goal_reachability::unreachable;
 	uint8_t Buddy_allowed_to_talk;
 	uint8_t Buddy_messages_suppressed;
 	uint8_t Buddy_gave_hint_count;
-	uint8_t Looking_for_marker;
+	game_marker_index Looking_for_marker;
 	int Last_buddy_key;
 	int Last_buddy_polish_path_tick;
 	escort_goal_t Escort_goal_object;
@@ -592,41 +696,41 @@ struct d_unique_buddy_state
 	fix64 Last_buddy_message_time;
 };
 
-class d_guided_missile_indices : object_number_array<imobjidx_t, MAX_PLAYERS>
+struct d_level_unique_control_center_state :
+	::dcx::d_level_unique_control_center_state
+{
+	fix64 Last_time_cc_vis_check;
+};
+
+class d_guided_missile_indices : per_player_array<imobjidx_t>
 {
 	template <typename R, typename F>
-		R get_player_active_guided_missile_tmpl(F &fvcobj, unsigned pnum) const;
+		R get_player_active_guided_missile_tmpl(F &fvcobj, playernum_t pnum) const;
 	static bool debug_check_current_object(const object_base &);
 public:
-	imobjidx_t get_player_active_guided_missile(unsigned pnum) const;
-	imobjptr_t get_player_active_guided_missile(fvmobjptr &vmobjptr, unsigned pnum) const;
-	imobjptridx_t get_player_active_guided_missile(fvmobjptridx &vmobjptridx, unsigned pnum) const;
-	void set_player_active_guided_missile(vmobjidx_t, unsigned pnum);
-	void clear_player_active_guided_missile(unsigned pnum);
+	constexpr d_guided_missile_indices() :
+		per_player_array<imobjidx_t>(init_object_number_array<imobjidx_t>(std::make_index_sequence<MAX_PLAYERS>()))
+	{
+	}
+	imobjidx_t get_player_active_guided_missile(playernum_t pnum) const;
+	imobjptr_t get_player_active_guided_missile(fvmobjptr &vmobjptr, playernum_t pnum) const;
+	imobjptridx_t get_player_active_guided_missile(fvmobjptridx &vmobjptridx, playernum_t pnum) const;
+	void set_player_active_guided_missile(vmobjidx_t, playernum_t pnum);
+	void clear_player_active_guided_missile(playernum_t pnum);
 };
-#endif
 
-struct d_level_unique_object_state
+struct d_level_unique_boss_state : ::dcx::d_level_unique_boss_state
 {
-	unsigned num_objects = 0;
-	unsigned Debris_object_count = 0;
-#if defined(DXX_BUILD_DESCENT_II)
-	d_unique_buddy_state BuddyState;
-	d_guided_missile_indices Guided_missile;
-#endif
-	object_number_array<imobjidx_t, MAX_OBJECTS> free_obj_list;
-	object_array Objects;
-	auto &get_objects()
-	{
-		return Objects;
-	}
-	const auto &get_objects() const
-	{
-		return Objects;
-	}
+	fix64 Boss_hit_time;
 };
 
-extern d_level_unique_object_state LevelUniqueObjectState;
+const player &get_player_controlling_guidebot(const d_unique_buddy_state & /* reserved for future use */, const valptridx<player>::array_managed_type &Players);
+#endif
+
+unsigned laser_parent_is_player(fvcobjptr &, const laser_parent &, const object_base &);
+unsigned laser_parent_is_object(fvcobjptr &, const laser_parent &, const object_base &);
+unsigned laser_parent_is_object(const laser_parent &, vcobjptridx_t);
+unsigned laser_parent_object_exists(fvcobjptr &, const laser_parent &);
 
 static inline powerup_type_t get_powerup_id(const object_base &o)
 {
@@ -639,9 +743,9 @@ static inline weapon_id_type get_weapon_id(const object_base &o)
 }
 
 #if defined(DXX_BUILD_DESCENT_II)
-static inline uint8_t get_marker_id(const object_base &o)
+static inline game_marker_index get_marker_id(const object_base &o)
 {
-	return o.id;
+	return game_marker_index{o.id};
 }
 #endif
 
@@ -652,11 +756,16 @@ static inline void set_weapon_id(object_base &o, weapon_id_type id)
 	o.id = static_cast<uint8_t>(id);
 }
 
+window_event_result dead_player_frame(const d_robot_info_array &Robot_info);
+
+// move all objects for the current frame
+window_event_result game_move_all_objects(const d_level_shared_robot_info_state &LevelSharedRobotInfoState);     // moves all objects
+window_event_result endlevel_move_all_objects(const d_level_shared_robot_info_state &LevelSharedRobotInfoState);
 }
 
 namespace dcx {
 
-static inline uint8_t get_player_id(const object_base &o)
+static inline unsigned get_player_id(const object_base &o)
 {
 	return o.id;
 }
@@ -716,7 +825,7 @@ void check_warn_object_type(const object_base &, object_type_t, const char *file
 		DXX_CONSTANT_TRUE(dxx_check_warn_actual_type == dxx_check_warn_expected_type) || (	\
 			/* If the type is always wrong, force a compile-time error. */	\
 			DXX_CONSTANT_TRUE(dxx_check_warn_actual_type != dxx_check_warn_expected_type)	\
-			? DXX_ALWAYS_ERROR_FUNCTION(dxx_error_object_type_mismatch, "object type mismatch")	\
+			? DXX_ALWAYS_ERROR_FUNCTION("object type mismatch")	\
 			: (	\
 				check_warn_object_type(dxx_check_warn_o, dxx_check_warn_expected_type, F, L)	\
 			)	\
@@ -725,6 +834,5 @@ void check_warn_object_type(const object_base &, object_type_t, const char *file
 #endif
 
 }
-#endif
 
 #endif

@@ -40,9 +40,7 @@
 #include "args.h"
 #include "console.h"
 #include "u_mem.h"
-
-#include "compiler-exchange.h"
-#include "compiler-make_unique.h"
+#include <memory>
 
 #define MVE_OPCODE_ENDOFSTREAM          0x00
 #define MVE_OPCODE_ENDOFCHUNK           0x01
@@ -238,7 +236,7 @@ class MVE_audio_deleter
 public:
 	void operator()(int16_t *p) const
 	{
-		mve_free(p);
+		MovieMemoryFree(p);
 	}
 };
 
@@ -258,10 +256,9 @@ struct MVE_audio_clamp
 
 }
 
-static int audiobuf_created = 0;
 static void mve_audio_callback(void *userdata, unsigned char *stream, int len);
-static array<std::unique_ptr<short[], MVE_audio_deleter>, TOTAL_AUDIO_BUFFERS> mve_audio_buffers;
-static array<unsigned, TOTAL_AUDIO_BUFFERS> mve_audio_buflens;
+static std::array<std::unique_ptr<short[], MVE_audio_deleter>, TOTAL_AUDIO_BUFFERS> mve_audio_buffers;
+static std::array<unsigned, TOTAL_AUDIO_BUFFERS> mve_audio_buflens;
 static int    mve_audio_curbuf_curpos=0;
 static int mve_audio_bufhead=0;
 static int mve_audio_buftail=0;
@@ -273,7 +270,9 @@ static std::unique_ptr<SDL_AudioSpec> mve_audio_spec;
 
 static void mve_audio_callback(void *, unsigned char *stream, int len)
 {
+#ifdef DXX_REPORT_TOTAL_LENGTH
 	int total=0;
+#endif
 	int length;
 	if (mve_audio_bufhead == mve_audio_buftail)
 		return /* 0 */;
@@ -288,7 +287,9 @@ static void mve_audio_callback(void *, unsigned char *stream, int len)
 		       (reinterpret_cast<uint8_t *>(mve_audio_buffers[mve_audio_bufhead].get()))+mve_audio_curbuf_curpos,           /* cur input position  */
 		       length);                                                                 /* cur input length    */
 
+#ifdef DXX_REPORT_TOTAL_LENGTH
 		total += length;
+#endif
 		stream += length;                                                               /* advance output */
 		len -= length;                                                                  /* decrement avail ospace */
 		mve_audio_buffers[mve_audio_bufhead].reset();                                 /* free the buffer */
@@ -299,7 +300,9 @@ static void mve_audio_callback(void *, unsigned char *stream, int len)
 		mve_audio_curbuf_curpos = 0;
 	}
 
+#ifdef DXX_REPORT_TOTAL_LENGTH
 	//con_printf(CON_CRITICAL, "= <%d (%d), %d, %d>: %d", mve_audio_bufhead, mve_audio_curbuf_curpos, mve_audio_buftail, len, total);
+#endif
 	/*    return total; */
 
 	if (len != 0                                                                        /* ospace remaining  */
@@ -336,10 +339,8 @@ static int create_audiobuf_handler(unsigned char, unsigned char minor, const uns
 	if (!mve_audio_enabled)
 		return 1;
 
-	if (audiobuf_created)
+	if (mve_audio_spec)
 		return 1;
-	else
-		audiobuf_created = 1;
 
 	flags = get_ushort(data + 2);
 	sample_rate = get_ushort(data + 4);
@@ -363,7 +364,7 @@ static int create_audiobuf_handler(unsigned char, unsigned char minor, const uns
 				sample_rate, desired_buffer, stereo ? 1 : 0, bitsize ? 16 : 8, compressed ? 1 : 0);
 	}
 
-	mve_audio_spec = make_unique<SDL_AudioSpec>();
+	mve_audio_spec = std::make_unique<SDL_AudioSpec>();
 	mve_audio_spec->freq = sample_rate;
 	mve_audio_spec->format = format;
 	mve_audio_spec->channels = (stereo) ? 2 : 1;
@@ -435,13 +436,13 @@ static int audio_data_handler(unsigned char major, unsigned char, const unsigned
 				if (flags & MVE_AUDIO_FLAGS_COMPRESSED) {
 					nsamp += 4;
 
-					p.reset(reinterpret_cast<int16_t *>(mve_alloc(nsamp)));
+					p.reset(reinterpret_cast<int16_t *>(MovieMemoryAllocate(nsamp)));
 					mveaudio_uncompress(p.get(), data); /* XXX */
 				} else {
 					nsamp -= 8;
 					data += 8;
 
-					p.reset(reinterpret_cast<int16_t *>(mve_alloc(nsamp)));
+					p.reset(reinterpret_cast<int16_t *>(MovieMemoryAllocate(nsamp)));
 					memcpy(p.get(), data, nsamp);
 				}
 				if (DigiVolume < 8)
@@ -459,7 +460,7 @@ static int audio_data_handler(unsigned char major, unsigned char, const unsigned
 					}
 				}
 			} else {
-				p.reset(reinterpret_cast<int16_t *>(mve_alloc(nsamp)));
+				p.reset(reinterpret_cast<int16_t *>(MovieMemoryAllocate(nsamp)));
 				memset(p.get(), 0, nsamp); /* XXX */
 			}
 			unsigned buflen = nsamp;
@@ -477,8 +478,7 @@ static int audio_data_handler(unsigned char major, unsigned char, const unsigned
 				SDL_BuildAudioCVT(&cvt, mve_audio_spec->format, mve_audio_spec->channels, mve_audio_spec->freq,
 					out_format, out_channels, out_freq);
 
-				RAIIdmem<uint8_t[]> cvtbuf;
-				MALLOC(cvtbuf, uint8_t[], nsamp * cvt.len_mult);
+				const auto cvtbuf = std::make_unique<uint8_t[]>(nsamp * cvt.len_mult);
 				cvt.buf = cvtbuf.get();
 				cvt.len = nsamp;
 
@@ -492,7 +492,7 @@ static int audio_data_handler(unsigned char major, unsigned char, const unsigned
 				{
 				// copy back to the audio buffer
 					const std::size_t converted_buffer_size = cvt.len_cvt;
-					p.reset(reinterpret_cast<int16_t *>(mve_alloc(converted_buffer_size))); // free the old audio buffer
+					p.reset(reinterpret_cast<int16_t *>(MovieMemoryAllocate(converted_buffer_size))); // free the old audio buffer
 					buflen = converted_buffer_size;
 					memcpy(p.get(), cvt.buf, converted_buffer_size);
 				}
@@ -584,7 +584,7 @@ static int create_videobuf_handler(unsigned char, unsigned char minor, const uns
 
 static int display_video_handler(unsigned char, unsigned char, const unsigned char *, int, void *)
 {
-	mve_showframe(g_vBackBuf1, g_destX, g_destY, g_width, g_height, g_screenWidth, g_screenHeight);
+	MovieShowFrame(g_vBackBuf1, g_destX, g_destY, g_width, g_height, g_screenWidth, g_screenHeight);
 
 	g_frameUpdated = 1;
 
@@ -615,7 +615,7 @@ static int video_palette_handler(unsigned char, unsigned char, const unsigned ch
 	count = get_short(data+2);
 
 	auto p = data + 4;
-	mve_setpalette(p - 3*start, start, count);
+	MovieSetPalette(p - 3*start, start, count);
 	return 1;
 }
 
@@ -660,28 +660,7 @@ static int end_chunk_handler(unsigned char, unsigned char, const unsigned char *
 	return 1;
 }
 
-void MVE_ioCallbacks(mve_cb_Read io_read)
-{
-	mve_read = io_read;
-}
-
-void MVE_memCallbacks(mve_cb_Alloc mem_alloc, mve_cb_Free mem_free)
-{
-	mve_alloc = mem_alloc;
-	mve_free = mem_free;
-}
-
-void MVE_sfCallbacks(mve_cb_ShowFrame showframe)
-{
-	mve_showframe = showframe;
-}
-
-void MVE_palCallbacks(mve_cb_SetPalette setpalette)
-{
-	mve_setpalette = setpalette;
-}
-
-int MVE_rmPrepMovie(MVESTREAM_ptr_t &pMovie, void *src, int x, int y, int)
+int MVE_rmPrepMovie(MVESTREAM_ptr_t &pMovie, MVEFILE::stream_type *const src, int x, int y, int)
 {
 	if (pMovie) {
 		mve_reset(pMovie.get());
@@ -767,6 +746,10 @@ void MVE_rmEndMovie(std::unique_ptr<MVESTREAM>)
 		{
 			SDL_CloseAudio();
 		}
+#if DXX_USE_SDLMIXER
+		else
+			Mix_SetPostMix(nullptr, nullptr);
+#endif
 		mve_audio_canplay = 0;
 	}
 	mve_audio_buffers = {};
@@ -780,7 +763,6 @@ void MVE_rmEndMovie(std::unique_ptr<MVESTREAM>)
 	mve_audio_flags = 0;
 
 	mve_audio_spec.reset();
-	audiobuf_created = 0;
 	g_vBuffers.clear();
 	g_pCurMap=NULL;
 	g_nMapLength=0;

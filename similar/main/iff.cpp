@@ -41,14 +41,14 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #include "dxxsconf.h"
 #include "compiler-range_for.h"
-#include "compiler-make_unique.h"
 #include "partial_range.h"
+#include <memory>
 
 //Internal constants and structures for this library
 
 //Type values for bitmaps
-#define TYPE_PBM		0
-#define TYPE_ILBM		1
+#define TYPE_PBM		bm_mode::linear
+#define TYPE_ILBM		bm_mode::ilbm
 
 //Compression types
 #define cmpNone	0
@@ -64,9 +64,9 @@ struct iff_bitmap_header : prohibit_void_ptr<iff_bitmap_header>
 {
 	short w,h;						//width and height of this bitmap
 	short x,y;						//generally unused
-	short type;						//see types above
 	short transparentcolor;		//which color is transparent (if any)
 	short pagewidth,pageheight; //width & height of source screen
+	bm_mode type;						//see types above
 	sbyte nplanes;              //number of planes (8 for 256 color image)
 	sbyte masking,compression;  //see constants above
 	sbyte xaspect,yaspect;      //aspect ratio (usually 5/6)
@@ -89,10 +89,10 @@ ubyte iff_has_transparency;	// 0=no transparency, 1=iff_transparent_color is val
 #define anim_sig MAKE_SIG('A','N','I','M')
 #define dlta_sig MAKE_SIG('D','L','T','A')
 
+namespace {
 static int32_t get_sig(PHYSFS_File *f)
 {
 	int s;
-
 	PHYSFS_readSBE32(f, &s);
 	return s;
 }
@@ -137,10 +137,11 @@ static int parse_bmhd(PHYSFS_File *ifile,long len,iff_bitmap_header *bmheader)
 
 	return IFF_NO_ERROR;
 }
-
+}
 
 //  the buffer pointed to by raw_data is stuffed with a pointer to decompressed pixel data
 namespace dsx {
+namespace {
 static int parse_body(PHYSFS_File *ifile,long len,iff_bitmap_header *bmheader)
 {
 	auto p = bmheader->raw_data.get();
@@ -261,7 +262,9 @@ static int parse_body(PHYSFS_File *ifile,long len,iff_bitmap_header *bmheader)
 	return IFF_NO_ERROR;
 }
 }
+}
 
+namespace {
 //modify passed bitmap
 static int parse_delta(PHYSFS_File *ifile,long len,iff_bitmap_header *bmheader)
 {
@@ -485,10 +488,12 @@ static int convert_ilbm_to_pbm(iff_bitmap_header *bmheader)
 
 	return IFF_NO_ERROR;
 }
+}
 
 #define INDEX_TO_15BPP(i) (static_cast<short>((((palptr[(i)].r/2)&31)<<10)+(((palptr[(i)].g/2)&31)<<5)+((palptr[(i)].b/2 )&31)))
 
 namespace dsx {
+namespace {
 static int convert_rgb15(grs_bitmap &bm,iff_bitmap_header &bmheader)
 {
 	palette_array_t::iterator palptr = begin(bmheader.palette);
@@ -521,16 +526,18 @@ static int convert_rgb15(grs_bitmap &bm,iff_bitmap_header &bmheader)
 
 }
 }
+}
 
+namespace {
 //copy an iff header structure to a grs_bitmap structure
 static void copy_iff_to_grs(grs_bitmap &bm,iff_bitmap_header &bmheader)
 {
-	gr_init_bitmap(bm, static_cast<bm_mode>(bmheader.type), 0, 0, bmheader.w, bmheader.h, bmheader.w, bmheader.raw_data.release());
+	gr_init_bitmap(bm, bmheader.type, 0, 0, bmheader.w, bmheader.h, bmheader.w, bmheader.raw_data.release());
 }
 
 //if bm->bm_data is set, use it (making sure w & h are correct), else
 //allocate the memory
-static int iff_parse_bitmap(PHYSFS_File *ifile, grs_bitmap &bm, int bitmap_type, palette_array_t *palette, grs_bitmap *prev_bm)
+static int iff_parse_bitmap(PHYSFS_File *ifile, grs_bitmap &bm, const bm_mode bitmap_type, palette_array_t *const palette, grs_bitmap *const prev_bm)
 {
 	int ret;			//return code
 	iff_bitmap_header bmheader;
@@ -593,14 +600,14 @@ static int iff_parse_bitmap(PHYSFS_File *ifile, grs_bitmap &bm, int bitmap_type,
 	}
 
 	return ret;
-
+}
 }
 
 //returns error codes - see IFF.H.  see GR.H for bitmap_type
 int iff_read_bitmap(const char *const ifilename, grs_bitmap &bm, palette_array_t *const palette)
 {
 	int ret;			//return code
-	auto ifile = PHYSFSX_openReadBuffered(ifilename);
+	auto ifile = PHYSFSX_openReadBuffered(ifilename).first;
 	if (!ifile)
 		return IFF_NO_FILE;
 
@@ -739,10 +746,7 @@ static int write_body(PHYSFS_File *ofile,iff_bitmap_header *bitmap_header,int co
 	save_pos = PHYSFS_tell(ofile);
 	PHYSFS_writeSBE32(ofile, len);
 
-	RAIIdmem<uint8_t[]> new_span;
-	MALLOC( new_span, uint8_t[], bitmap_header->w + (bitmap_header->w/128+2)*2);
-	if (!new_span) return IFF_NO_MEM;
-
+	const auto new_span = compression_on ? std::make_unique<uint8_t[]>(bitmap_header->w + (bitmap_header->w / 128 + 2) * 2) : {};
 	for (y=bitmap_header->h;y--;) {
 
 		if (compression_on) {
@@ -756,7 +760,7 @@ static int write_body(PHYSFS_File *ofile,iff_bitmap_header *bitmap_header,int co
 	}
 
 	if (compression_on) {		//write actual data length
-		Assert(PHYSFSX_fseek(ofile,save_pos,SEEK_SET)==0);
+		assert(PHYSFS_seek(ofile, save_pos) != 0);
 		(void)save_pos;
 		PHYSFS_writeSBE32(ofile, total_len);
 		Assert(PHYSFSX_fseek(ofile,total_len,SEEK_CUR)==0);
@@ -810,7 +814,7 @@ int write_tiny(PHYSFS_File *ofile,iff_bitmap_header *bitmap_header,int compressi
 	}
 
 	if (compression_on) {
-		Assert(PHYSFSX_fseek(ofile,save_pos,SEEK_SET)==0);
+		assert(PHYSFS_seek(ofile, save_pos) != 0);
 		(void)save_pos;
 		PHYSFS_writeSBE32(ofile, 4+total_len);
 		Assert(PHYSFSX_fseek(ofile,4+total_len,SEEK_CUR)==0);
@@ -849,7 +853,7 @@ static int write_pbm(PHYSFS_File *ofile,iff_bitmap_header *bitmap_header,int com
 
 	pbm_size = 4 + BMHD_SIZE + body_size + tiny_size + sizeof(rgb_t)*(1<<bitmap_header->nplanes)+8;
 
-	Assert(PHYSFSX_fseek(ofile,save_pos,SEEK_SET)==0);
+	assert(PHYSFS_seek(ofile, save_pos) != 0);
 	(void)save_pos;
 	PHYSFS_writeSBE32(ofile, pbm_size+8);
 	Assert(PHYSFSX_fseek(ofile,pbm_size+8,SEEK_CUR)==0);
@@ -910,7 +914,7 @@ int iff_write_bitmap(const char *ofilename,grs_bitmap *bm,palette_array_t *palet
 
 //read in many brushes.  fills in array of pointers, and n_bitmaps.
 //returns iff error codes
-int iff_read_animbrush(const char *ifilename,array<std::unique_ptr<grs_main_bitmap>, MAX_BITMAPS_PER_BRUSH> &bm_list,unsigned *n_bitmaps,palette_array_t &palette)
+int iff_read_animbrush(const char *ifilename,std::array<std::unique_ptr<grs_main_bitmap>, MAX_BITMAPS_PER_BRUSH> &bm_list,unsigned *n_bitmaps,palette_array_t &palette)
 {
 	int ret = IFF_NO_ERROR;			//return code
 	int sig,form_len;
@@ -918,7 +922,7 @@ int iff_read_animbrush(const char *ifilename,array<std::unique_ptr<grs_main_bitm
 
 	*n_bitmaps=0;
 
-	auto ifile = PHYSFSX_openReadBuffered(ifilename);
+	auto ifile = PHYSFSX_openReadBuffered(ifilename).first;
 	if (!ifile)
 		return IFF_NO_FILE;
 
@@ -944,9 +948,14 @@ int iff_read_animbrush(const char *ifilename,array<std::unique_ptr<grs_main_bitm
 			prev_bm = *n_bitmaps>0?bm_list[*n_bitmaps-1].get() : nullptr;
 
 			auto &n = bm_list[*n_bitmaps];
-			n = make_unique<grs_main_bitmap>();
+			n = std::make_unique<grs_main_bitmap>();
 
-			ret = iff_parse_bitmap(ifile, *n.get(), form_type, *n_bitmaps > 0 ? nullptr : &palette, prev_bm);
+			/* iff_parse_bitmap needs a bm_mode, but only to test
+			 * whether to do RGB conversion.  Historically, anim files
+			 * do not require RGB conversion, so pass a mode that skips
+			 * the conversion.
+			 */
+			ret = iff_parse_bitmap(ifile, *n.get(), bm_mode::linear, *n_bitmaps > 0 ? nullptr : &palette, prev_bm);
 
 			if (ret != IFF_NO_ERROR)
 				goto done;

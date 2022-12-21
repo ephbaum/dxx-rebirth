@@ -31,17 +31,18 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "ui.h"
 #include "fmtcheck.h"
 
-#ifdef __cplusplus
 #include "fwd-window.h"
 #include "fwd-segment.h"
 #include "objnum.h"
+#ifdef dsx
+#include "robot.h"
+#endif
 
 /*
  * Constants
  *
  */
 
-#define ORTHO_VIEWS 0			// set to 1 to enable 3 orthogonal views
 #define ED_SCREEN_W	800		//width of editor screen
 #define ED_SCREEN_H	600		//height of editor screen
 
@@ -167,7 +168,7 @@ enum class editor_gamestate : uint8_t
  * 
  */
 
-extern array<editor_view *, ORTHO_VIEWS ? 4 : 1> Views;
+extern std::array<editor_view *, 1> Views;
 extern int Large_view_index;
 extern std::unique_ptr<UI_GADGET_USERBOX> LargeViewBox, GameViewBox, GroupViewBox;
 extern int Found_seg_index;				// Index in Found_segs corresponding to Cursegp
@@ -184,6 +185,9 @@ namespace dcx {
 extern   int		Autosave_count;		// Current counter for which autosave mine we are "on"
 extern	int		Autosave_flag;			// Whether or not Autosave is on.
 extern	struct tm Editor_time_of_day;
+
+using mine_filename_type = std::array<char, PATH_MAX>;
+extern mine_filename_type mine_filename;
 }
 
 extern	int		SegSizeMode;			// Mode = 0/1 = not/is legal to move bound vertices, 
@@ -191,25 +195,12 @@ extern	int		SegSizeMode;			// Mode = 0/1 = not/is legal to move bound vertices,
 #ifdef dsx
 namespace dsx {
 void init_editor(void);
-
-}
-#endif
-#ifdef dsx
-namespace dsx {
-
 //	Initialize all vertices to inactive status.
 extern void init_all_vertices(void);
-
 }
 #endif
 
-//	Returns true if vertex vi is contained in exactly one segment, else returns false.
-extern int is_free_vertex(int vi);
-
-//	Set existing vertex vnum to value *vp.
-int med_set_vertex(unsigned vnum, const vertex &vp);
-
-void med_combine_duplicate_vertices(array<uint8_t, MAX_VERTICES> &);
+void med_combine_duplicate_vertices(enumerated_array<uint8_t, MAX_VERTICES, vertnum_t> &);
 
 #ifdef dsx
 namespace dsx {
@@ -221,7 +212,7 @@ namespace dsx {
 //  0 = successful attach
 //  1 = No room in Segments[].
 //  2 = No room in Vertices[].
-int med_attach_segment(vmsegptridx_t destseg, vmsegptr_t newseg, int destside, int newside);
+int med_attach_segment(vmsegptridx_t destseg, csmusegment newseg, sidenum_t destside, sidenum_t newside);
 
 // Delete a segment.
 // Deletes a segment from the global array Segments.
@@ -248,7 +239,7 @@ int med_rotate_segment(vmsegptridx_t seg, const vms_matrix &rotmat);
 //    Creates wall at sp->sides[side], making it part of segment sp
 //    Removable walls must be placed between two connected segments.  You should add the removable
 //    wall on both sides.  In fact, you really must.
-void create_removable_wall(fvcvertptr &vcvertptr, vmsegptridx_t sp, unsigned side, unsigned tmap_num);
+void create_removable_wall(fvcvertptr &vcvertptr, vmsegptridx_t sp, sidenum_t side, texture1_value tmap_num);
 }
 #endif
 
@@ -261,7 +252,7 @@ void create_removable_wall(fvcvertptr &vcvertptr, vmsegptridx_t sp, unsigned sid
 // Returns:
 //  0 = successfully saved.
 //  1 = unable to save.
-extern	int med_save_mine(const char *name);
+int med_save_mine(const mine_filename_type &name);
 
 // Updates the screen... (I put the prototype here for curves.c)
 extern   int medlisp_update_screen();
@@ -297,7 +288,7 @@ extern void med_create_new_segment_from_cursegp(void);
 //		0	bridge segment formed
 //		1	unable to form bridge because one (or both) of the sides is not open.
 //	Note that no new vertices are created by this process.
-int med_form_bridge_segment(vmsegptridx_t seg1, int side1, vmsegptridx_t seg2, int side2);
+int med_form_bridge_segment(vmsegptridx_t seg1, sidenum_t side1, vmsegptridx_t seg2, sidenum_t side2);
 }
 #endif
 
@@ -307,7 +298,7 @@ int med_form_bridge_segment(vmsegptridx_t seg1, int side1, vmsegptridx_t seg2, i
 //	they are properly updated.
 extern	void med_compress_mine(void);
 
-void update_matrix_based_on_side(vms_matrix &rotmat,int destside);
+void update_matrix_based_on_side(vms_matrix &rotmat, sidenum_t destside);
 
 // Curves stuff.
 
@@ -317,7 +308,7 @@ struct vms_equation
 {
     union {
             struct {fix x3, x2, x1, x0, y3, y2, y1, y0, z3, z2, z1, z0;} n;
-		array<array<fix, 4>, 3> xyz;
+		std::array<std::array<fix, 4>, 3> xyz;
     };
 };
 
@@ -345,14 +336,10 @@ void med_extract_matrix_from_segment(const shared_segment &sp, vms_matrix &rotma
 //	This routine should only be used for segments which are not connected to anything else,
 //	ie the segment created at mine creation.
 void assign_default_uvs_to_segment(vmsegptridx_t segp);
-void assign_default_uvs_to_side(vmsegptridx_t segp, unsigned side);
-
-//	Assign u,v coordinates to con_seg, con_common_side from base_seg, base_common_side
-//	They are connected at the edge defined by the vertices abs_id1, abs_id2.
-void med_assign_uvs_to_side(vmsegptridx_t con_seg, unsigned con_common_side, vmsegptr_t base_seg, unsigned base_common_side, unsigned abs_id1, unsigned abs_id2);
+void assign_default_uvs_to_side(vmsegptridx_t segp, sidenum_t side);
 
 //	Create coordinate axes in orientation of specified segment, stores vertices at *vp.
-void create_coordinate_axes_from_segment(vmsegptr_t sp, array<unsigned, 16> &vertnums);
+void create_coordinate_axes_from_segment(const shared_segment &sp, std::array<vertnum_t, 16> &vertnums);
 
 //	Set Vertex_active to number of occurrences of each vertex.
 //	Set Num_vertices.
@@ -367,24 +354,24 @@ extern	void set_vertex_counts(void);
 //		0			joint formed
 //		1			unable to form joint because one or more vertices of side2 is not free
 //		2			unable to form joint because side1 is already used
-int med_form_joint(vmsegptridx_t seg1, int side1, vmsegptridx_t seg2, int side2);
+int med_form_joint(vmsegptridx_t seg1, sidenum_t side1, vmsegptridx_t seg2, sidenum_t side2);
 }
 
 // The current texture... use by saying something=bm_lock_bitmap(CurrentTexture)
-extern int CurrentTexture;
+extern texture_index CurrentTexture;
 
 namespace dsx {
-void med_propagate_tmaps_to_segments(vmsegptridx_t base_seg,vmsegptridx_t con_seg, int uv_only_flag);
-void med_propagate_tmaps_to_back_side(vmsegptridx_t base_seg, int back_side, int uv_only_flag);
+void med_propagate_tmaps_to_segments(vcsegptridx_t base_seg,vmsegptridx_t con_seg, int uv_only_flag);
+void med_propagate_tmaps_to_back_side(vmsegptridx_t base_seg, sidenum_t back_side, int uv_only_flag);
 
 //	Find segment adjacent to sp:side.
 //	Adjacent means a segment which shares all four vertices.
-//	Return true if segment found and fill in segment in adj_sp and side in adj_side.
-//	Return false if unable to find, in which case adj_sp and adj_side are undefined.
-int med_find_adjacent_segment_side(vmsegptridx_t sp, int side, imsegptridx_t &adj_sp, int *adj_side);
+//	If found, return a pair containing the found segment and side.
+//	If not found, return an empty optional.
+std::optional<std::pair<vmsegptridx_t, sidenum_t>> med_find_adjacent_segment_side(vmsegptridx_t sp, sidenum_t side);
 
 // Finds the closest segment and side to sp:side.
-int med_find_closest_threshold_segment_side(vmsegptridx_t sp, int side, imsegptridx_t &adj_sp, int *adj_side, fix threshold);
+std::optional<std::pair<vmsegptridx_t, sidenum_t>> med_find_closest_threshold_segment_side(vmsegptridx_t sp, sidenum_t side, fix threshold);
 
 // Select previous segment.
 //	If there is a connection on the side opposite to the current side, then choose that segment.
@@ -413,11 +400,11 @@ void warn_if_concave_segment(vmsegptridx_t s);
 }
 
 //	Add a vertex to the vertex list.
-int med_add_vertex(const vertex &vp);
+vertnum_t med_add_vertex(const vertex &vp);
 
 //	Add a vertex to the vertex list which may be identical to another vertex (in terms of coordinates).
 //	Don't scan list, looking for presence of a vertex with same coords, add this one.
-int med_create_duplicate_vertex(const vertex &vp);
+vertnum_t med_create_duplicate_vertex(const vertex &vp);
 
 namespace dsx {
 //	Create a new segment, duplicating exactly, including vertex ids and children, the passed segment.
@@ -473,7 +460,6 @@ void editor_status( const char *text);
 extern int MacroNumEvents;
 extern int MacroStatus;
 
-//extern	int	Highest_segment_index;			// Highest index in Segments, an efficiency hack
 extern	int	Lock_view_to_cursegp;			// !0 means whenever cursegp changes, view it
 
 //	eglobal.c
@@ -481,6 +467,11 @@ extern	int	Num_tilings;						// number of tilings/wall
 extern	int	Degenerate_segment_found;
 
 namespace dcx {
+
+#ifdef dsx
+//	Returns true if vertex vi is contained in exactly one segment, else returns false.
+int is_free_vertex(const fvcsegptr &vcsegptr, vertnum_t vi);
+#endif
 
 // Initializes autosave system.
 // Sets global Autosave_count to 0.
@@ -495,18 +486,17 @@ extern void close_autosave(void);
 // Increments Autosave_count, wrapping from 9 to 0.
 // (If there is no current mine name, assume "temp.min")
 // Call med_save_mine to save the mine.
-extern void autosave_mine(const char *name);
+void autosave_mine(const std::array<char, PATH_MAX> &name);
 
 // Timed autosave
-extern void TimedAutosave(const char *name);
+void TimedAutosave(const std::array<char, PATH_MAX> &name);
 extern void set_editor_time_of_day();
 
 // Undo function
 extern int undo(void);
-extern array<const char *, 10> undo_status;
-}
+extern std::array<const char *, 10> undo_status;
 
-extern char mine_filename[PATH_MAX];
+}
 
 //	group.c
 int RotateSegmentNew(vms_angvec *pbh);
@@ -524,13 +514,23 @@ extern int render_3d_in_big_window;
 extern void move_object_to_mouse_click(void);
 
 //these are instances of canvases, pointed to by variables below
-extern grs_canvas _canv_editor_game;		//the game on the editor screen
+extern grs_subcanvas _canv_editor_game;		//the game on the editor screen
 
 //these are pointers to our canvases
 extern grs_canvas *Canv_editor;			//the editor screen
-extern grs_canvas *const Canv_editor_game; //the game on the editor screen
+extern grs_subcanvas *const Canv_editor_game; //the game on the editor screen
 
-extern UI_DIALOG * EditorWindow;
+struct editor_dialog final : UI_DIALOG
+{
+	using UI_DIALOG::UI_DIALOG;
+	std::array<std::unique_ptr<UI_GADGET_BUTTON>, 9> pad_goto;
+	std::unique_ptr<UI_GADGET_BUTTON>
+		pad_prev,
+		pad_next;
+	virtual window_event_result callback_handler(const d_event &) override;
+};
+
+extern editor_dialog *EditorWindow;
 
 void med_point_2_vec(grs_canvas *canv,vms_vector &v,short sx,short sy);
 
@@ -540,11 +540,11 @@ void close_editor_screen(void);
 #ifdef dsx
 namespace dsx {
 //    From eobject.c
-int place_object(vmsegptridx_t segp, const vms_vector &object_pos, short object_type, short object_id);
+int place_object(d_level_unique_object_state &LevelUniqueObjectState, const d_level_shared_polygon_model_state &LevelSharedPolygonModelState, const d_robot_info_array &Robot_info, const d_level_shared_segment_state &LevelSharedSegmentState, d_level_unique_segment_state &LevelUniqueSegmentState, vmsegptridx_t segp, const vms_vector &object_pos, short object_type, short object_id);
 
 // from ksegsize.c
-void med_extract_up_vector_from_segment_side(vmsegptr_t sp, int sidenum, vms_vector &vp);
-void med_extract_right_vector_from_segment_side(vmsegptr_t sp, int sidenum, vms_vector &vp);
+void med_extract_up_vector_from_segment_side(const shared_segment &sp, sidenum_t sidenum, vms_vector &vp);
+void med_extract_right_vector_from_segment_side(const shared_segment &sp, sidenum_t sidenum, vms_vector &vp);
 }
 #endif
 
@@ -559,5 +559,3 @@ extern void close_all_windows(void);
 //	Amount to stretch a texture map by.
 //	The two different ones are for the two dimensions of a texture map.
 extern fix Stretch_scale_x, Stretch_scale_y;
-
-#endif

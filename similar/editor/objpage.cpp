@@ -27,23 +27,22 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include <stdlib.h>
 #include <stdio.h>
 #include "inferno.h"
-#include "screens.h"			// For GAME_SCREEN?????
 #include "editor.h"			// For TMAP_CURBOX??????
 #include "gr.h"				// For canves, font stuff
 #include "ui.h"				// For UI_GADGET stuff
 #include "object.h"			// For robot_bms
 #include "event.h"
-#include "dxxerror.h"
 #include "objpage.h"
 #include "bm.h"
 #include "player.h"
 #include "piggy.h"
 #include "cntrlcen.h"
 #include "kdefs.h"
+#include "vclip.h"
 
 constexpr std::integral_constant<unsigned, 8> OBJS_PER_PAGE{};
 
-static array<std::unique_ptr<UI_GADGET_USERBOX>, OBJS_PER_PAGE> ObjBox;
+static std::array<std::unique_ptr<UI_GADGET_USERBOX>, OBJS_PER_PAGE> ObjBox;
 static std::unique_ptr<UI_GADGET_USERBOX> ObjCurrent;
 
 static int ObjectPage = 0;
@@ -51,7 +50,6 @@ static int ObjectPage = 0;
 #include "vecmat.h"
 #include "3d.h"
 #include "robot.h"
-#include "texmap.h"
 
 #include "hostage.h"
 #include "powerup.h"
@@ -71,16 +69,19 @@ public:
 
 static object_dialog objpage_dialog;
 
-//this is bad to have the extern, but this snapshot stuff is special
+static void draw_model_picture(const enumerated_array<polymodel, MAX_POLYGON_MODELS, polygon_model_index> &Polygon_models, grs_canvas &canvas, const polygon_model_index model_num, const vms_angvec &orient_angles)
+{
+	draw_model_picture(canvas, Polygon_models[model_num], orient_angles);
+}
 
 //canvas set
 void draw_object_picture(grs_canvas &canvas, const unsigned id, const vms_angvec &orient_angles, const unsigned type)
 {
-
 	if (id >= Num_object_subtypes)
 		return;
 
 	auto &Robot_info = LevelSharedRobotInfoState.Robot_info;
+	auto &Polygon_models = LevelSharedPolygonModelState.Polygon_models;
 	switch (type) {
 
 		case OBJ_HOSTAGE:
@@ -96,18 +97,18 @@ void draw_object_picture(grs_canvas &canvas, const unsigned id, const vms_angvec
 			break;
 
 		case OBJ_PLAYER:
-			draw_model_picture(canvas, Player_ship->model_num, orient_angles);		// Draw a poly model below
+			draw_model_picture(Polygon_models, canvas, Player_ship->model_num, orient_angles);		// Draw a poly model below
 			break;
 
 		case OBJ_ROBOT:
-			draw_model_picture(canvas, Robot_info[id].model_num, orient_angles);	// Draw a poly model below
+			draw_model_picture(Polygon_models, canvas, Robot_info[id].model_num, orient_angles);	// Draw a poly model below
 			break;
 
 		case OBJ_CNTRLCEN:
-			draw_model_picture(canvas, get_reactor_model_number(id), orient_angles);
+			draw_model_picture(Polygon_models, canvas, get_reactor_model_number(id), orient_angles);
 			break;
 		case OBJ_CLUTTER:
-			draw_model_picture(canvas, id, orient_angles);
+			draw_model_picture(Polygon_models, canvas, static_cast<polygon_model_index>(id), orient_angles);
 			break;
 		default:
 			//Int3();	// Invalid type!!!
@@ -329,25 +330,25 @@ void objpage_init( UI_DIALOG *dlg )
 	//Assert (N_powerup_types < MAX_POWERUP_TYPES );
 
 	auto &o = objpage_dialog;
-	o.prev_object = ui_add_gadget_button( dlg, OBJCURBOX_X + 00, OBJCURBOX_Y - 27, 30, 20, "<<", objpage_goto_prev );
-	o.next_object = ui_add_gadget_button( dlg, OBJCURBOX_X + 32, OBJCURBOX_Y - 27, 30, 20, ">>", objpage_goto_next );
+	o.prev_object = ui_add_gadget_button(*dlg, OBJCURBOX_X + 00, OBJCURBOX_Y - 27, 30, 20, "<<", objpage_goto_prev);
+	o.next_object = ui_add_gadget_button(*dlg, OBJCURBOX_X + 32, OBJCURBOX_Y - 27, 30, 20, ">>", objpage_goto_next);
 
-	o.first_object = ui_add_gadget_button( dlg, OBJCURBOX_X + 00, OBJCURBOX_Y - 54, 30, 20, "B", objpage_goto_first );
-	o.last_object = ui_add_gadget_button( dlg, OBJCURBOX_X + 32, OBJCURBOX_Y - 54, 30, 20, "E", objpage_goto_last );
+	o.first_object = ui_add_gadget_button(*dlg, OBJCURBOX_X + 00, OBJCURBOX_Y - 54, 30, 20, "B", objpage_goto_first);
+	o.last_object = ui_add_gadget_button(*dlg, OBJCURBOX_X + 32, OBJCURBOX_Y - 54, 30, 20, "E", objpage_goto_last);
 
-	o.dec_pitch = ui_add_gadget_button( dlg, OBJCURBOX_X + 25, OBJCURBOX_Y + 62, 22, 13, "P-", objpage_decrease_pitch );
-	o.inc_pitch = ui_add_gadget_button( dlg, OBJCURBOX_X + 25, OBJCURBOX_Y + 90, 22, 13, "P+", objpage_increase_pitch );
-	o.dec_bank = ui_add_gadget_button( dlg, OBJCURBOX_X + 00, OBJCURBOX_Y + 90, 22, 13, "B-", objpage_decrease_bank );
-	o.inc_bank = ui_add_gadget_button( dlg, OBJCURBOX_X + 50, OBJCURBOX_Y + 90, 22, 13, "B+", objpage_increase_bank );
-	o.dec_heading = ui_add_gadget_button( dlg, OBJCURBOX_X + 00, OBJCURBOX_Y + 76, 22, 13, "H-", objpage_decrease_heading );
-	o.inc_heading = ui_add_gadget_button( dlg, OBJCURBOX_X + 50, OBJCURBOX_Y + 76, 22, 13, "H+", objpage_increase_heading );
-	o.inc_z = ui_add_gadget_button( dlg, OBJCURBOX_X + 00, OBJCURBOX_Y + 62, 22, 13, "Z+", objpage_increase_z );
-	o.dec_z = ui_add_gadget_button( dlg, OBJCURBOX_X + 50, OBJCURBOX_Y + 62, 22, 13, "Z-", objpage_decrease_z );
-	o.reset_orient = ui_add_gadget_button( dlg, OBJCURBOX_X + 25, OBJCURBOX_Y + 76, 22, 13, "R", objpage_reset_orient );
+	o.dec_pitch = ui_add_gadget_button(*dlg, OBJCURBOX_X + 25, OBJCURBOX_Y + 62, 22, 13, "P-", objpage_decrease_pitch);
+	o.inc_pitch = ui_add_gadget_button(*dlg, OBJCURBOX_X + 25, OBJCURBOX_Y + 90, 22, 13, "P+", objpage_increase_pitch);
+	o.dec_bank = ui_add_gadget_button(*dlg, OBJCURBOX_X + 00, OBJCURBOX_Y + 90, 22, 13, "B-", objpage_decrease_bank);
+	o.inc_bank = ui_add_gadget_button(*dlg, OBJCURBOX_X + 50, OBJCURBOX_Y + 90, 22, 13, "B+", objpage_increase_bank);
+	o.dec_heading = ui_add_gadget_button(*dlg, OBJCURBOX_X + 00, OBJCURBOX_Y + 76, 22, 13, "H-", objpage_decrease_heading);
+	o.inc_heading = ui_add_gadget_button(*dlg, OBJCURBOX_X + 50, OBJCURBOX_Y + 76, 22, 13, "H+", objpage_increase_heading);
+	o.inc_z = ui_add_gadget_button(*dlg, OBJCURBOX_X + 00, OBJCURBOX_Y + 62, 22, 13, "Z+", objpage_increase_z);
+	o.dec_z = ui_add_gadget_button(*dlg, OBJCURBOX_X + 50, OBJCURBOX_Y + 62, 22, 13, "Z-", objpage_decrease_z);
+	o.reset_orient = ui_add_gadget_button(*dlg, OBJCURBOX_X + 25, OBJCURBOX_Y + 76, 22, 13, "R", objpage_reset_orient);
 
 	for (int i=0;i<OBJS_PER_PAGE;i++)
-		ObjBox[i] = ui_add_gadget_userbox( dlg, OBJBOX_X + (i/2)*(2+OBJBOX_W), OBJBOX_Y + (i%2)*(2+OBJBOX_H), OBJBOX_W, OBJBOX_H);
-	ObjCurrent = ui_add_gadget_userbox( dlg, OBJCURBOX_X, OBJCURBOX_Y-5, 64, 64 );
+		ObjBox[i] = ui_add_gadget_userbox(*dlg, OBJBOX_X + (i / 2) * (2 + OBJBOX_W), OBJBOX_Y + (i % 2) * (2 + OBJBOX_H), OBJBOX_W, OBJBOX_H);
+	ObjCurrent = ui_add_gadget_userbox(*dlg, OBJCURBOX_X, OBJCURBOX_Y - 5, 64, 64);
 	objpage_reset_orient();
 }
 

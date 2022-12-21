@@ -24,7 +24,6 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
  */
 
 
-#include "inferno.h"
 #include "editor.h"
 #include "editor/esegment.h"
 #include "editor/medmisc.h"
@@ -73,6 +72,7 @@ int MoveAway()
 int ToggleChaseMode()
 {
 	Funky_chase_mode = !Funky_chase_mode;
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
 	set_view_target_from_segment(vcvertptr, Cursegp);

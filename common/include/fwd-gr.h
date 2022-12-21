@@ -26,26 +26,33 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include <cstdint>
 #include <memory>
 #include <utility>
+#include "d_array.h"
 #include "palette.h"
 #include "maths.h"
 #include "u_mem.h"
 
+namespace dcx {
+
+enum class gr_fade_level : uint8_t;
+
 // some defines for transparency and blending
-#define TRANSPARENCY_COLOR   255            // palette entry of transparency color -- 255 on the PC
+constexpr auto TRANSPARENCY_COLOR = color_palette_index{255};            // palette entry of transparency color -- 255 on the PC
 #define GR_FADE_LEVELS       34u
-#define GR_FADE_OFF          GR_FADE_LEVELS // yes, max means OFF - don't screw that up
-enum gr_blend {
-	GR_BLEND_NORMAL,		// normal blending
-	GR_BLEND_ADDITIVE_A,	// additive alpha blending
-	GR_BLEND_ADDITIVE_C,	// additive color blending
+#define GR_FADE_OFF          gr_fade_level::off
+enum class gr_blend : uint8_t {
+	normal,		// normal blending
+	additive_a,	// additive alpha blending
+	additive_c,	// additive color blending
 };
+
+}
 
 #define SWIDTH  (grd_curscreen->get_screen_width())
 #define SHEIGHT (grd_curscreen->get_screen_height())
 
 #if defined(DXX_BUILD_DESCENT_I)
 namespace dsx {
-extern int HiresGFXAvailable;
+extern uint8_t HiresGFXAvailable;
 }
 #define HIRESMODE HiresGFXAvailable		// descent.pig either contains hires or lowres graphics, not both
 #elif defined(DXX_BUILD_DESCENT_II)
@@ -67,14 +74,19 @@ extern int HiresGFXAvailable;
 #define CC_LSPACING_S   "\x2"   //next char specifies line spacing
 #define CC_UNDERLINE_S  "\x3"   //next char is underlined
 
-enum bm_mode : uint8_t
+namespace dcx {
+
+enum class bm_mode : uint8_t
 {
 	linear,
+	ilbm,
 	rgb15 = 3,	//5 bits each r,g,b stored at 16 bits
 #if DXX_USE_OGL
 	ogl = 5,
 #endif /* def OGL */
 };
+
+}
 
 #define BM_FLAG_TRANSPARENT         1
 #define BM_FLAG_SUPER_TRANSPARENT   2
@@ -83,10 +95,11 @@ enum bm_mode : uint8_t
 #define BM_FLAG_PAGED_OUT           16  // This bitmap's data is paged out.
 #define BM_FLAG_RLE_BIG             32  // for bitmaps that RLE to > 255 per row (i.e. cockpits)
 
-#ifdef __cplusplus
 #include "dxxsconf.h"
 #include "dsx-ns.h"
-#include "compiler-array.h"
+#include <array>
+
+namespace dcx {
 
 struct grs_bitmap;
 struct grs_canvas;
@@ -96,8 +109,6 @@ struct grs_point;
 union screen_mode;
 
 class grs_screen;
-
-namespace dcx {
 
 struct grs_main_canvas;
 typedef std::unique_ptr<grs_main_canvas> grs_canvas_ptr;
@@ -112,7 +123,7 @@ typedef std::unique_ptr<grs_main_bitmap> grs_bitmap_ptr;
 struct grs_font;
 
 #if SDL_MAJOR_VERSION == 1
-uint_fast32_t gr_list_modes(array<screen_mode, 50> &modes);
+uint_fast32_t gr_list_modes(std::array<screen_mode, 50> &modes);
 #elif SDL_MAJOR_VERSION == 2
 extern SDL_Window *g_pRebirthSDLMainWindow;
 #endif
@@ -145,7 +156,7 @@ void gr_init_canvas(grs_canvas &canv,unsigned char *pixdata, bm_mode pixtype, ui
 
 // Initialize the specified sub canvas. no memory allocation is performed.
 
-void gr_init_sub_canvas(grs_canvas &n, grs_canvas &src, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+void gr_init_sub_canvas(grs_subcanvas &n, grs_canvas &src, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 
 // Clear the current canvas to the specified color
 void gr_clear_canvas(grs_canvas &, color_t color);
@@ -154,7 +165,7 @@ void gr_clear_canvas(grs_canvas &, color_t color);
 // Bitmap functions:
 
 // these are the two workhorses, the others just use these
-void gr_init_bitmap(grs_bitmap &bm, bm_mode mode, uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t bytesperline, const uint8_t *data) noexcept;
+void gr_init_bitmap(grs_bitmap &bm, bm_mode mode, uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t bytesperline, color_palette_index *data) noexcept;
 void gr_init_main_bitmap(grs_main_bitmap &bm, bm_mode mode, uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t bytesperline, RAIIdmem<uint8_t[]> data);
 void gr_init_sub_bitmap (grs_bitmap &bm, grs_bitmap &bmParent, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 
@@ -203,19 +214,19 @@ void gr_use_palette_table(const char * filename);
 namespace dcx {
 
 // Sets transparency and blending function
-void gr_settransblend(grs_canvas &, int fade_level, gr_blend blend_func);
+void gr_settransblend(grs_canvas &, gr_fade_level fade_level, gr_blend blend_func);
 
 // Draws a point into the current canvas in the current color and drawmode.
-void gr_pixel(grs_bitmap &, unsigned x, unsigned y, uint8_t color);
-void gr_upixel(grs_bitmap &, unsigned x, unsigned y, uint8_t color);
+void gr_pixel(grs_bitmap &, unsigned x, unsigned y, color_palette_index color);
+void gr_upixel(grs_bitmap &, unsigned x, unsigned y, color_palette_index color);
 
 // Gets a pixel;
-unsigned char gr_gpixel(const grs_bitmap &bitmap, unsigned x, unsigned y);
-unsigned char gr_ugpixel(const grs_bitmap &bitmap, int x, int y);
+color_palette_index gr_gpixel(const grs_bitmap &bitmap, unsigned x, unsigned y);
+color_palette_index gr_ugpixel(const grs_bitmap &bitmap, int x, int y);
 
 // Draws a line into the current canvas in the current color and drawmode.
-void gr_line(grs_canvas &, fix x0,fix y0,fix x1,fix y1, uint8_t color);
-void gr_uline(grs_canvas &canvas, fix x0,fix y0,fix x1,fix y1, uint8_t color);
+void gr_line(grs_canvas &, fix x0,fix y0,fix x1,fix y1, color_palette_index color);
+void gr_uline(grs_canvas &canvas, fix x0,fix y0,fix x1,fix y1, color_palette_index color);
 
 // Draw the bitmap into the current canvas at the specified location.
 void gr_bitmap(grs_canvas &, unsigned x,unsigned y,grs_bitmap &bm);
@@ -232,24 +243,24 @@ void gr_ubitmapm(grs_canvas &, unsigned x, unsigned y, grs_bitmap &bm);
 #endif
 
 // Draw a rectangle into the current canvas.
-void gr_rect(grs_canvas &, int left,int top,int right,int bot, uint8_t color);
-void gr_urect(grs_canvas &, int left,int top,int right,int bot, uint8_t color);
+void gr_rect(grs_canvas &, int left,int top,int right,int bot, color_palette_index color);
+void gr_urect(grs_canvas &, int left,int top,int right,int bot, color_palette_index color);
 
 // Draw a filled circle
-int gr_disk(grs_canvas &, fix x,fix y,fix r, uint8_t color);
+int gr_disk(grs_canvas &, fix x,fix y,fix r, color_palette_index color);
 
 // Draw an outline circle
-int gr_ucircle(grs_canvas &, fix x,fix y,fix r, uint8_t color);
+int gr_ucircle(grs_canvas &, fix x,fix y,fix r, color_palette_index color);
 
 // Draw an unfilled rectangle into the current canvas
 #if DXX_USE_EDITOR
-void gr_box(grs_canvas &, uint_fast32_t left,uint_fast32_t top,uint_fast32_t right,uint_fast32_t bot, uint8_t color);
+void gr_box(grs_canvas &, uint_fast32_t left,uint_fast32_t top,uint_fast32_t right,uint_fast32_t bot, color_palette_index color);
 #endif
-void gr_ubox(grs_canvas &, int left,int top,int right,int bot, uint8_t color);
+void gr_ubox(grs_canvas &, int left,int top,int right,int bot, color_palette_index color);
 
-void gr_scanline(grs_canvas &canvas, int x1, int x2, unsigned y, uint8_t color);
+void gr_scanline(grs_canvas &canvas, int x1, int x2, unsigned y, color_palette_index color);
 #if !DXX_USE_OGL
-void gr_uscanline(grs_canvas &canvas, unsigned x1, unsigned x2, unsigned y, uint8_t color);
+void gr_uscanline(grs_canvas &canvas, unsigned x1, unsigned x2, unsigned y, color_palette_index color);
 #endif
 void gr_close_font(std::unique_ptr<grs_font> font);
 
@@ -281,8 +292,7 @@ namespace dcx {
 
 //remap (by re-reading) all the color fonts
 void gr_remap_color_fonts();
-void gr_set_curfont(grs_canvas &, const grs_font *);
-void gr_set_fontcolor(grs_canvas &, int fg_color, int bg_color);
+void gr_set_curfont(grs_canvas &, const grs_font &);
 void gr_string(grs_canvas &, const grs_font &, int x, int y, const char *s, int w, int h);
 void gr_string(grs_canvas &, const grs_font &, int x, int y, const char *s);
 void gr_ustring(grs_canvas &, const grs_font &, int x, int y, const char *s);
@@ -293,11 +303,18 @@ void gr_printt(grs_canvas &, const grs_font &, int x, int y, const char *format,
 #define gr_printf(A1,A2,A3,A4,F,...)	dxx_call_printf_checked(gr_printfs,gr_string,(A1,A2,A3,A4),(F),##__VA_ARGS__)
 #define gr_uprintf(A1,A2,A3,A4,F,...)	dxx_call_printf_checked(gr_printfus,gr_ustring,(A1,A2,A3,A4),(F),##__VA_ARGS__)
 std::pair<const char *, unsigned> gr_get_string_wrap(const grs_font &, const char *s, unsigned limit);
-void gr_get_string_size(const grs_font &, const char *s, int *string_width, int *string_height, int *average_width);
-void gr_get_string_size(const grs_font &, const char *s, int *string_width, int *string_height, int *average_width, const unsigned max_chars_per_line);
+unsigned gr_get_string_height(const grs_font &cv_font, unsigned lines);
+
+struct gr_string_size
+{
+	unsigned long width;
+	unsigned long height;
+};
+gr_string_size gr_get_string_size(const grs_font &, const char *s);
+gr_string_size gr_get_string_size(const grs_font &, const char *s, unsigned max_chars_per_line);
 
 // From scale.c
-void scale_bitmap(const grs_bitmap &bp, const array<grs_point, 3> &vertbuf, int orientation, grs_bitmap &);
+void scale_bitmap(const grs_bitmap &bp, const std::array<grs_point, 3> &vertbuf, int orientation, grs_bitmap &);
 
 //===========================================================================
 // Global variables
@@ -312,18 +329,22 @@ extern std::unique_ptr<grs_screen> grd_curscreen;           //active screen
  * Use this to trace which functions update the global canvas pointer
  * without requiring a debugger trap on every update.
  */
+#ifndef DXX_DEBUG_CURRENT_CANVAS_ORIGIN
 #define DXX_DEBUG_CURRENT_CANVAS_ORIGIN	0
+#endif
 
 #if DXX_DEBUG_CURRENT_CANVAS_ORIGIN > 0
-#define DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_N_DECL_VARS	const char *const file, const unsigned line
+#define DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_N_DECL_VARS	const char *file = __builtin_FILE(), unsigned line = __builtin_LINE()
+#define DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_N_DEFN_VARS	const char *const file, const unsigned line
 #define DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_L_DECL_VARS	, DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_N_DECL_VARS
+#define DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_L_DEFN_VARS	, DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_N_DEFN_VARS
 #define DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_N_PASS_VARS	file, line
 #define DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_L_PASS_VARS	, DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_N_PASS_VARS
-#define gr_set_default_canvas()	gr_set_default_canvas(__FILE__, __LINE__)
-#define gr_set_current_canvas(C)	gr_set_current_canvas(C, __FILE__, __LINE__)
 #else
 #define DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_N_DECL_VARS
+#define DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_N_DEFN_VARS
 #define DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_L_DECL_VARS
+#define DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_L_DEFN_VARS
 #define DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_N_PASS_VARS
 #define DXX_DEBUG_CURRENT_CANVAS_FILE_LINE_COMMA_L_PASS_VARS
 #endif
@@ -356,7 +377,7 @@ static inline void (gr_set_current_canvas)(grs_canvas *const canv DXX_DEBUG_CURR
 #define FT_KERNED       4
 
 extern palette_array_t gr_palette;
-typedef array<array<color_t, 256>, GR_FADE_LEVELS> gft_array1;
+using gft_array1 = enumerated_array<std::array<color_t, 256>, GR_FADE_LEVELS, gr_fade_level>;
 extern gft_array1 gr_fade_table;
 }
 
@@ -387,8 +408,8 @@ void gr_palette_step_up(int r, int g, int b);
 
 // Given: r,g,b, each in range of 0-63, return the color index that
 // best matches the input.
-color_t gr_find_closest_color(int r, int g, int b);
-int gr_find_closest_color_15bpp(int rgb);
+color_palette_index gr_find_closest_color(int r, int g, int b);
+color_palette_index gr_find_closest_color_15bpp(int rgb);
 void gr_flip();
 
 /*
@@ -402,10 +423,9 @@ int gr_check_fullscreen();
  */
 void gr_toggle_fullscreen();
 
+#if DXX_USE_OGL
 void ogl_do_palfx();
 void ogl_init_pixel_buffers(unsigned w, unsigned h);
 void ogl_close_pixel_buffers();
-}
-void ogl_cache_polymodel_textures(unsigned model_num);
-
 #endif
+}

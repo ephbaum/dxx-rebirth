@@ -29,14 +29,11 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #include "physfsx.h"
 #include "pstypes.h"
-#include "u_mem.h"
 #include "dxxerror.h"
-#include "inferno.h"
 #include "text.h"
 #include "strutil.h"
 #include "args.h"
-
-#include "compiler-make_unique.h"
+#include <memory>
 
 #ifdef GENERATE_BUILTIN_TEXT_TABLE
 #include <ctype.h>
@@ -49,49 +46,54 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #define SHAREWARE_TEXTSIZE  14677
 #endif
 
+namespace {
+
 static std::unique_ptr<char[]> text;
 static std::unique_ptr<char[]> overwritten_text;
 
-array<const char *, N_TEXT_STRINGS> Text_string;
-
 // rotates a byte left one bit, preserving the bit falling off the right
-static void encode_rotate_left(char *c)
+static uint8_t encode_rotate_left(const uint8_t v)
 {
-	unsigned char v = *c;
-	*c = (v >> 7) | (v << 1);
+	return (v >> 7) | (v << 1);
 }
 
-#define BITMAP_TBL_XOR 0xD3
+constexpr std::integral_constant<uint8_t, 0xd3> BITMAP_TBL_XOR{};
+
+static uint8_t decode_char(const uint8_t c)
+{
+	const auto c1 = encode_rotate_left(c);
+	const auto c2 = c1 ^ BITMAP_TBL_XOR;
+	return encode_rotate_left(c2);
+}
+
+}
 
 //decode an encoded line of text of bitmaps.tbl
 void decode_text_line(char *p)
 {
-	for (;*p;p++) {
-		encode_rotate_left(p);
-		*p = *p ^ BITMAP_TBL_XOR;
-		encode_rotate_left(p);
-	}
+	for (; const char c = *p; p++)
+		*p = decode_char(c);
 }
 
 // decode buffer of text, preserves newlines
-void decode_text(char *buf, int len)
+void decode_text(char *ptr, unsigned len)
 {
-	char *ptr;
-	int i;
-
-	for (i = 0, ptr = buf; i < len; i++, ptr++)
+	for (; len--; ptr++)
 	{
-		if (*ptr != '\n')
-		{
-			encode_rotate_left(ptr);
-			*ptr = *ptr  ^ BITMAP_TBL_XOR;
-			encode_rotate_left(ptr);
-		}
+		const char c = *ptr;
+		if (c != '\n')
+			*ptr = decode_char(c);
 	}
 }
 
 //load all the text strings for Descent
 namespace dsx {
+
+#ifdef USE_BUILTIN_ENGLISH_TEXT_STRINGS
+static
+#endif
+std::array<const char *, N_TEXT_STRINGS> Text_string;
+
 void load_text()
 {
 	int len,i, have_binary = 0;
@@ -212,14 +214,14 @@ void load_text()
 	if (!CGameArg.DbgAltTex.empty())
 		filename = CGameArg.DbgAltTex.c_str();
 
-	auto tfile = PHYSFSX_openReadBuffered(filename);
-	if (!tfile)
+	if (auto &&[tfile, physfserr] = PHYSFSX_openReadBuffered(filename); !tfile)
 	{
+		const auto texfilename = filename;
 		filename="descent.txb";
-		auto ifile = PHYSFSX_openReadBuffered(filename);
+		auto &&[ifile, physfserr2] = PHYSFSX_openReadBuffered(filename);
 		if (!ifile)
 		{
-			Error("Cannot open file DESCENT.TEX or DESCENT.TXB");
+			Error("Failed to open file %s, DESCENT.TXB: \"%s\", \"%s\"", texfilename, PHYSFS_getErrorByCode(physfserr), PHYSFS_getErrorByCode(physfserr2));
 			return;
 		}
 		have_binary = 1;
@@ -227,7 +229,7 @@ void load_text()
 		len = PHYSFS_fileLength(ifile);
 
 //edited 05/17/99 Matt Mueller - malloc an extra byte, and null terminate.
-		text = make_unique<char[]>(len + 1);
+		text = std::make_unique<char[]>(len + 1);
 		PHYSFS_read(ifile,text,1,len);
 		text[len]=0;
 //end edit -MM
@@ -238,7 +240,7 @@ void load_text()
 		len = PHYSFS_fileLength(tfile);
 
 //edited 05/17/99 Matt Mueller - malloc an extra byte, and null terminate.
-		text = make_unique<char[]>(len + 1);
+		text = std::make_unique<char[]>(len + 1);
 		//fread(text,1,len,tfile);
 		p = text.get();
 		do {
@@ -288,11 +290,11 @@ void load_text()
 			for (char *q = p; assert(*p == '\\'), *p;) {
 			char newchar;
 
-			if (p[1] == 'n') newchar = '\n';
-			else if (p[1] == 't') newchar = '\t';
-			else if (p[1] == '\\') newchar = '\\';
-			else
-				Error("Unsupported key sequence <\\%c> on line %d of file <%s>",p[1],i+1,filename);
+				if (p[1] == 'n') newchar = '\n';
+				else if (p[1] == 't') newchar = '\t';
+				else if (p[1] == '\\') newchar = '\\';
+				else
+					Error("Unsupported key sequence <\\%c> on line %d of file <%s>", p[1], i + 1, filename);
 
 				*q++ = newchar;
 				p += 2;
@@ -325,7 +327,7 @@ void load_text()
 				{
 				  static const char extra[] = "\n<Ctrl-C> converts format\nIntel <-> PowerPC";
 				std::size_t l = strlen(ts);
-				overwritten_text = make_unique<char[]>(l + sizeof(extra));
+				overwritten_text = std::make_unique<char[]>(l + sizeof(extra));
 				char *o = overwritten_text.get();
 				std::copy_n(extra, sizeof(extra), std::copy_n(ts, l, o));
 				Text_string[i] = o;
@@ -356,7 +358,7 @@ void load_text()
 #endif
 
 #ifdef GENERATE_BUILTIN_TEXT_TABLE
-	for (unsigned u = 0; u < sizeof(Text_string) / sizeof(Text_string[0]); ++u)
+	for (unsigned u = 0; u < std::size(Text_string); ++u)
 	{
 		printf("\t%u\t\"", u);
 		for (char *px = Text_string[u]; *px; ++px) {

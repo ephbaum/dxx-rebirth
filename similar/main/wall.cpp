@@ -18,7 +18,6 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 */
 
 #include "wall.h"
-#include "player.h"
 #include "text.h"
 #include "fireball.h"
 #include "textures.h"
@@ -28,25 +27,25 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "physfs-serial.h"
 #include "gameseg.h"
 #include "hudmsg.h"
-#include "laser.h"		//	For seeing if a flare is stuck in a wall.
 #include "effects.h"
 
 #include "d_enumerate.h"
+#include "d_levelstate.h"
 #include "d_range.h"
 #include "compiler-range_for.h"
 #include "segiter.h"
+#include "d_zip.h"
 
 //	Special door on boss level which is locked if not in multiplayer...sorry for this awful solution --MK.
 #define	BOSS_LOCKED_DOOR_LEVEL	7
 #define	BOSS_LOCKED_DOOR_SEG		595
-#define	BOSS_LOCKED_DOOR_SIDE	5
+#define	BOSS_LOCKED_DOOR_SIDE	sidenum_t::WFRONT
 
 namespace dcx {
 unsigned Num_wall_anims;
 }
 
 namespace dsx {
-wall_animations_array WallAnims;		// Wall animations
 
 namespace {
 
@@ -90,7 +89,7 @@ namespace {
 struct cwframe
 {
 	wall &w;
-	array<uvl, 4> &uvls;
+	std::array<uvl, 4> &uvls;
 	cwframe(fvmsegptr &vmsegptr, wall &wr) :
 		w(wr),
 		uvls(vmsegptr(w.segnum)->unique_segment::sides[w.sidenum].uvls)
@@ -139,11 +138,13 @@ struct find_cloaked_wall_predicate
 }
 #endif
 
+namespace {
+
 static std::pair<uint_fast32_t, uint_fast32_t> get_transparency_check_values(const unique_side &side)
 {
-	if (const uint_fast32_t masked_tmap_num2 = side.tmap_num2 & 0x3FFF)
+	if (const auto masked_tmap_num2 = static_cast<uint_fast32_t>(get_texture_index(side.tmap_num2)))
 		return {masked_tmap_num2, BM_FLAG_SUPER_TRANSPARENT};
-	return {side.tmap_num, BM_FLAG_TRANSPARENT};
+	return {get_texture_index(side.tmap_num), BM_FLAG_TRANSPARENT};
 }
 
 // This function determines whether the current segment/side is transparent
@@ -153,6 +154,8 @@ static uint_fast32_t check_transparency(const GameBitmaps_array &GameBitmaps, co
 {
 	const auto &&v = get_transparency_check_values(side);
 	return GameBitmaps[Textures[v.first].index].get_flag_mask(v.second);
+}
+
 }
 
 //-----------------------------------------------------------------
@@ -170,6 +173,8 @@ static uint_fast32_t check_transparency(const GameBitmaps_array &GameBitmaps, co
 //		WID_NO_WALL					5	//	1/0/1		no wall, can fly through
 namespace dsx {
 
+namespace {
+
 static WALL_IS_DOORWAY_result_t wall_is_doorway(const GameBitmaps_array &GameBitmaps, const Textures_array &Textures, fvcwallptr &vcwallptr, const shared_side &sside, const unique_side &uside)
 {
 	auto &w = *vcwallptr(sside.wall_num);
@@ -184,7 +189,7 @@ static WALL_IS_DOORWAY_result_t wall_is_doorway(const GameBitmaps_array &GameBit
 
 	const auto flags = w.flags;
 	if (type == WALL_ILLUSION) {
-		if (flags & WALL_ILLUSION_OFF)
+		if (flags & wall_flag::illusion_off)
 			return WID_NO_WALL;
 		else {
 			if (check_transparency(GameBitmaps, Textures, uside))
@@ -195,14 +200,14 @@ static WALL_IS_DOORWAY_result_t wall_is_doorway(const GameBitmaps_array &GameBit
 	}
 
 	if (type == WALL_BLASTABLE) {
-	 	if (flags & WALL_BLASTED)
+	 	if (flags & wall_flag::blasted)
 			return WID_TRANSILLUSORY_WALL;
 	}	
 	else
 	{
-	if (unlikely(flags & WALL_DOOR_OPENED))
+	if (unlikely(flags & wall_flag::door_opened))
 		return WID_TRANSILLUSORY_WALL;
-	if (likely(type == WALL_DOOR) && unlikely(w.state == WALL_DOOR_OPENING))
+	if (likely(type == WALL_DOOR) && unlikely(w.state == wall_state::opening))
 		return WID_TRANSPARENT_WALL;
 	}
 // If none of the above flags are set, there is no doorway.
@@ -212,27 +217,26 @@ static WALL_IS_DOORWAY_result_t wall_is_doorway(const GameBitmaps_array &GameBit
 		return WID_WALL; // There are children behind the door.
 }
 
-WALL_IS_DOORWAY_result_t WALL_IS_DOORWAY(const GameBitmaps_array &GameBitmaps, const Textures_array &Textures, fvcwallptr &vcwallptr, const shared_segment &sseg, const unique_segment &useg, const uint_fast32_t side)
+}
+
+WALL_IS_DOORWAY_result_t WALL_IS_DOORWAY(const GameBitmaps_array &GameBitmaps, const Textures_array &Textures, fvcwallptr &vcwallptr, const cscusegment seg, const sidenum_t side)
 {
-	const auto child = sseg.children[side];
+	const auto child = seg.s.children[side];
 	if (unlikely(child == segment_none))
 		return WID_WALL;
 	if (unlikely(child == segment_exit))
 		return WID_EXTERNAL;
-	auto &sside = sseg.sides[side];
+	auto &sside = seg.s.sides[side];
 	if (likely(sside.wall_num == wall_none))
 		return WID_NO_WALL;
-	auto &uside = useg.sides[side];
+	auto &uside = seg.u.sides[side];
 	return wall_is_doorway(GameBitmaps, Textures, vcwallptr, sside, uside);
-}
-
 }
 
 #if DXX_USE_EDITOR
 //-----------------------------------------------------------------
 // Initializes all the walls (in other words, no special walls)
-namespace dsx {
-void wall_init()
+void wall_init(d_level_unique_wall_subsystem_state &LevelUniqueWallSubsystemState)
 {
 	init_exploding_walls();
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
@@ -240,13 +244,13 @@ void wall_init()
 	range_for (auto &w, Walls)
 	{
 		w.segnum = segment_none;
-		w.sidenum = -1;
+		w.sidenum = side_none;
 		w.type = WALL_NORMAL;
-		w.flags = 0;
+		w.flags = {};
 		w.hps = 0;
-		w.trigger = -1;
+		w.trigger = trigger_none;
 		w.clip_num = -1;
-		w.linked_wall = -1;
+		w.linked_wall = wall_none;
 	}
 	auto &ActiveDoors = LevelUniqueWallSubsystemState.ActiveDoors;
 	ActiveDoors.set_count(0);
@@ -256,11 +260,10 @@ void wall_init()
 #endif
 
 }
-}
 #endif
 
 //set the tmap_num or tmap_num2 field for a wall/door
-void wall_set_tmap_num(const wclip &anim, const vmsegptridx_t seg, const unsigned side, const vmsegptridx_t csegp, const unsigned cside, const unsigned frame_num)
+void wall_set_tmap_num(const wclip &anim, const vmsegptridx_t seg, const sidenum_t side, const vmsegptridx_t csegp, const sidenum_t cside, const unsigned frame_num)
 {
 	const auto newdemo_state = Newdemo_state;
 	if (newdemo_state == ND_STATE_PLAYBACK)
@@ -270,39 +273,46 @@ void wall_set_tmap_num(const wclip &anim, const vmsegptridx_t seg, const unsigne
 	auto &uside = seg->unique_segment::sides[side];
 	auto &cuside = csegp->unique_segment::sides[cside];
 	if (anim.flags & WCF_TMAP1)	{
-		if (tmap != uside.tmap_num || tmap != cuside.tmap_num)
+		const texture1_value t1{tmap};
+		if (t1 != uside.tmap_num || t1 != cuside.tmap_num)
 		{
-			uside.tmap_num = cuside.tmap_num = tmap;
+			uside.tmap_num = cuside.tmap_num = t1;
 			if (newdemo_state == ND_STATE_RECORDING)
-				newdemo_record_wall_set_tmap_num1(seg,side,csegp,cside,tmap);
+				newdemo_record_wall_set_tmap_num1(seg,side,csegp,cside,t1);
 		}
 	} else	{
-		assert(tmap != 0 && uside.tmap_num2 != 0);
-		if (tmap != uside.tmap_num2 || tmap != cuside.tmap_num2)
+		const texture2_value t2{tmap};
+		if (t2 != uside.tmap_num2 || t2 != cuside.tmap_num2)
 		{
-			uside.tmap_num2 = cuside.tmap_num2 = tmap;
+			uside.tmap_num2 = cuside.tmap_num2 = t2;
 			if (newdemo_state == ND_STATE_RECORDING)
-				newdemo_record_wall_set_tmap_num2(seg,side,csegp,cside,tmap);
+				newdemo_record_wall_set_tmap_num2(seg,side,csegp,cside,t2);
 		}
 	}
 }
 
+}
+
+namespace {
 
 // -------------------------------------------------------------------------------
 //when the wall has used all its hitpoints, this will destroy it
-static void blast_blastable_wall(const vmsegptridx_t seg, const unsigned side, wall &w0)
+static void blast_blastable_wall(const vmsegptridx_t seg, const sidenum_t side, wall &w0)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vmobjptr = Objects.vmptr;
 	auto &sside = seg->shared_segment::sides[side];
 	const auto wall_num = sside.wall_num;
 	w0.hps = -1;	//say it's blasted
 
-	const auto &&csegp = seg.absolute_sibling(seg->children[side]);
+	const auto &&csegp = seg.absolute_sibling(seg->shared_segment::children[side]);
 	auto Connectside = find_connect_side(seg, csegp);
 	Assert(Connectside != side_none);
 	const auto cwall_num = csegp->shared_segment::sides[Connectside].wall_num;
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
+	auto &WallAnims = GameSharedState.WallAnims;
 	auto &imwallptr = Walls.imptr;
 	const auto &&w1 = imwallptr(cwall_num);
 	if (w1)
@@ -311,28 +321,29 @@ static void blast_blastable_wall(const vmsegptridx_t seg, const unsigned side, w
 	flush_fcd_cache();
 
 	const auto a = w0.clip_num;
+	auto &wa = WallAnims[a];
 	//if this is an exploding wall, explode it
-	if (WallAnims[a].flags & WCF_EXPLODES)
+	if (wa.flags & WCF_EXPLODES)
 	{
-		auto &Vertices = LevelSharedVertexState.get_vertices();
 		auto &vcvertptr = Vertices.vcptr;
-		explode_wall(vcvertptr, seg, side, w0);
+		explode_wall(vcvertptr, seg, static_cast<sidenum_t>(side), w0);
 	}
 	else {
 		//if not exploding, set final frame, and make door passable
-		const auto n = WallAnims[a].num_frames;
-		w0.flags |= WALL_BLASTED;
+		const auto n = wa.num_frames;
+		w0.flags |= wall_flag::blasted;
 		if (w1)
-			w1->flags |= WALL_BLASTED;
-		wall_set_tmap_num(WallAnims[a], seg, side, csegp, Connectside, n - 1);
+			w1->flags |= wall_flag::blasted;
+		wall_set_tmap_num(wa, seg, side, csegp, Connectside, n - 1);
 	}
 
 }
 
+}
 
 //-----------------------------------------------------------------
 // Destroys a blastable wall.
-void wall_destroy(const vmsegptridx_t seg, const unsigned side)
+void wall_destroy(const vmsegptridx_t seg, const sidenum_t side)
 {
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
 	auto &vmwallptr = Walls.vmptr;
@@ -345,8 +356,9 @@ void wall_destroy(const vmsegptridx_t seg, const unsigned side)
 
 //-----------------------------------------------------------------
 // Deteriorate appearance of wall. (Changes bitmap (paste-ons))
-void wall_damage(const vmsegptridx_t seg, const unsigned side, fix damage)
+void wall_damage(const vmsegptridx_t seg, const sidenum_t side, fix damage)
 {
+	auto &WallAnims = GameSharedState.WallAnims;
 	int i;
 
 	auto &sside = seg->shared_segment::sides[side];
@@ -361,9 +373,9 @@ void wall_damage(const vmsegptridx_t seg, const unsigned side, fix damage)
 	if (w0.type != WALL_BLASTABLE)
 		return;
 	
-	if (!(w0.flags & WALL_BLASTED) && w0.hps >= 0)
+	if (!(w0.flags & wall_flag::blasted) && w0.hps >= 0)
 		{
-		const auto &&csegp = seg.absolute_sibling(seg->children[side]);
+		const auto &&csegp = seg.absolute_sibling(seg->shared_segment::children[side]);
 		auto Connectside = find_connect_side(seg, csegp);
 		Assert(Connectside != side_none);
 		const auto cwall_num = csegp->shared_segment::sides[Connectside].wall_num;
@@ -396,9 +408,12 @@ void wall_damage(const vmsegptridx_t seg, const unsigned side, fix damage)
 //-----------------------------------------------------------------
 // Opens a door
 namespace dsx {
-void wall_open_door(const vmsegptridx_t seg, const unsigned side)
+void wall_open_door(const vmsegptridx_t seg, const sidenum_t side)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
+	auto &WallAnims = GameSharedState.WallAnims;
 	auto &vmobjptr = Objects.vmptr;
 	active_door *d;
 
@@ -409,20 +424,21 @@ void wall_open_door(const vmsegptridx_t seg, const unsigned side)
 	wall *const w = vmwallptr(wall_num);
 	LevelUniqueStuckObjectState.kill_stuck_objects(vmobjptr, wall_num);
 
-	if ((w->state == WALL_DOOR_OPENING) ||		//already opening
-		 (w->state == WALL_DOOR_WAITING))		//open, waiting to close
+	if (w->state == wall_state::opening ||		//already opening
+		w->state == wall_state::waiting)		//open, waiting to close
 		return;
 #if defined(DXX_BUILD_DESCENT_II)
-	if (w->state == WALL_DOOR_OPEN)			//open, & staying open
+	if (w->state == wall_state::open)			//open, & staying open
 		return;
 #endif
 
 	auto &ActiveDoors = LevelUniqueWallSubsystemState.ActiveDoors;
 	auto &vmactdoorptr = ActiveDoors.vmptr;
-	if (w->state == WALL_DOOR_CLOSING) {		//closing, so reuse door
+	if (w->state == wall_state::closing) {		//closing, so reuse door
 		const auto &&r = make_range(vmactdoorptr);
-		const auto &&i = std::find_if(r.begin(), r.end(), find_active_door_predicate(wall_num));
-		if (i == r.end())	// likely in demo playback or multiplayer
+		const auto &&re = r.end();
+		const auto &&i = ranges::find_if(r.begin(), re, find_active_door_predicate(wall_num));
+		if (i == re)	// likely in demo playback or multiplayer
 		{
 			const auto c = ActiveDoors.get_count();
 			ActiveDoors.set_count(c + 1);
@@ -438,7 +454,7 @@ void wall_open_door(const vmsegptridx_t seg, const unsigned side)
 		}
 	}
 	else {											//create new door
-		Assert(w->state == WALL_DOOR_CLOSED);
+		Assert(w->state == wall_state::closed);
 		const auto i = ActiveDoors.get_count();
 		ActiveDoors.set_count(i + 1);
 		d = vmactdoorptr(static_cast<actdoornum_t>(i));
@@ -446,10 +462,10 @@ void wall_open_door(const vmsegptridx_t seg, const unsigned side)
 	}
 
 
-	w->state = WALL_DOOR_OPENING;
+	w->state = wall_state::opening;
 
 	// So that door can't be shot while opening
-	const auto &&csegp = vcsegptr(seg->children[side]);
+	const auto &&csegp = vcsegptr(seg->shared_segment::children[side]);
 	auto Connectside = find_connect_side(seg, csegp);
 	if (Connectside != side_none)
 	{
@@ -457,13 +473,13 @@ void wall_open_door(const vmsegptridx_t seg, const unsigned side)
 		auto &imwallptr = Walls.imptr;
 		if (const auto &&w1 = imwallptr(cwall_num))
 		{
-			w1->state = WALL_DOOR_OPENING;
+			w1->state = wall_state::opening;
 			d->back_wallnum[0] = cwall_num;
 		}
 		d->front_wallnum[0] = seg->shared_segment::sides[side].wall_num;
 	}
 	else
-		con_printf(CON_URGENT, "Illegal Connectside %i in wall_open_door. Trying to hop over. Please check your level!", side);
+		con_printf(CON_URGENT, "Illegal Connectside %i in wall_open_door on segment %hu. Trying to hop over. Please check your level!", underlying_value(side), seg.get_unchecked_index());
 
 	if (Newdemo_state == ND_STATE_RECORDING) {
 		newdemo_record_door_opening(seg, side);
@@ -476,15 +492,16 @@ void wall_open_door(const vmsegptridx_t seg, const unsigned side)
 		Assert(w2->linked_wall == seg->shared_segment::sides[side].wall_num);
 		//Assert(!(w2->flags & WALL_DOOR_OPENING  ||  w2->flags & WALL_DOOR_OPENED));
 
-		w2->state = WALL_DOOR_OPENING;
+		w2->state = wall_state::opening;
 
 		const auto &&seg2 = vcsegptridx(w2->segnum);
-		Connectside = find_connect_side(seg2, vcsegptr(seg2->children[w2->sidenum]));
+		const auto &&csegp2 = vcsegptr(seg2->shared_segment::children[w2->sidenum]);
+		Connectside = find_connect_side(seg2, csegp2);
 		Assert(Connectside != side_none);
-		const auto cwall_num = csegp->shared_segment::sides[Connectside].wall_num;
+		const auto cwall_num = csegp2->shared_segment::sides[Connectside].wall_num;
 		auto &imwallptr = Walls.imptr;
 		if (const auto &&w3 = imwallptr(cwall_num))
-			w3->state = WALL_DOOR_OPENING;
+			w3->state = wall_state::opening;
 
 		d->n_parts = 2;
 		d->front_wallnum[1] = w->linked_wall;
@@ -497,23 +514,22 @@ void wall_open_door(const vmsegptridx_t seg, const unsigned side)
 	if ( Newdemo_state != ND_STATE_PLAYBACK )
 	{
 		// NOTE THE LINK TO ABOVE!!!!
-		auto &Vertices = LevelSharedVertexState.get_vertices();
 		auto &vcvertptr = Vertices.vcptr;
 		const auto &&cp = compute_center_point_on_side(vcvertptr, seg, side);
-		if (WallAnims[w->clip_num].open_sound > -1 )
-			digi_link_sound_to_pos( WallAnims[w->clip_num].open_sound, seg, side, cp, 0, F1_0 );
+		const auto open_sound = WallAnims[w->clip_num].open_sound;
+		if (open_sound > -1)
+			digi_link_sound_to_pos(open_sound, seg, side, cp, 0, F1_0);
 
 	}
 }
-}
 
 #if defined(DXX_BUILD_DESCENT_II)
-namespace dsx {
-
 //-----------------------------------------------------------------
 // start the transition from closed -> open wall
-void start_wall_cloak(const vmsegptridx_t seg, const unsigned side)
+void start_wall_cloak(const vmsegptridx_t seg, const sidenum_t side)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	cloaking_wall *d;
 
 	if ( Newdemo_state==ND_STATE_PLAYBACK ) return;
@@ -521,7 +537,7 @@ void start_wall_cloak(const vmsegptridx_t seg, const unsigned side)
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
 	const auto &&w = Walls.vmptridx(seg->shared_segment::sides[side].wall_num);
 
-	if (w->type == WALL_OPEN || w->state == WALL_DOOR_CLOAKING)		//already open or cloaking
+	if (w->type == WALL_OPEN || w->state == wall_state::cloaking)		//already open or cloaking
 		return;
 
 	const auto &&csegp = vcsegptr(seg->children[side]);
@@ -530,10 +546,12 @@ void start_wall_cloak(const vmsegptridx_t seg, const unsigned side)
 	const auto cwall_num = csegp->shared_segment::sides[Connectside].wall_num;
 
 	auto &CloakingWalls = LevelUniqueWallSubsystemState.CloakingWalls;
-	if (w->state == WALL_DOOR_DECLOAKING) {	//decloaking, so reuse door
+	if (w->state == wall_state::decloaking)
+	{	//decloaking, so reuse door
 		const auto &&r = make_range(CloakingWalls.vmptr);
-		const auto i = std::find_if(r.begin(), r.end(), find_cloaked_wall_predicate(w));
-		if (i == r.end())
+		const auto &&re = r.end();
+		const auto &&i = ranges::find_if(r.begin(), re, find_cloaked_wall_predicate(w));
+		if (i == re)
 		{
 			d_debugbreak();
 			return;
@@ -541,14 +559,14 @@ void start_wall_cloak(const vmsegptridx_t seg, const unsigned side)
 		d = *i;
 		d->time = CLOAKING_WALL_TIME - d->time;
 	}
-	else if (w->state == WALL_DOOR_CLOSED) {	//create new door
+	else if (w->state == wall_state::closed) {	//create new door
 		const clwallnum_t c = CloakingWalls.get_count();
 		if (c >= CloakingWalls.size())
 		{
 			Int3();		//ran out of cloaking wall slots
 			w->type = WALL_OPEN;
-			if (const auto &&w1 = Walls.imptr(cwall_num))
-				w1->type = WALL_OPEN;
+			if (const auto &&w1 = Walls.vmptr.check_untrusted(cwall_num))
+				(*w1)->type = WALL_OPEN;
 			return;
 		}
 		CloakingWalls.set_count(c + 1);
@@ -560,37 +578,38 @@ void start_wall_cloak(const vmsegptridx_t seg, const unsigned side)
 		return;
 	}
 
-	w->state = WALL_DOOR_CLOAKING;
+	w->state = wall_state::cloaking;
 	if (const auto &&w1 = Walls.imptr(cwall_num))
-		w1->state = WALL_DOOR_CLOAKING;
+		w1->state = wall_state::cloaking;
 
 	d->front_wallnum = seg->shared_segment::sides[side].wall_num;
 	d->back_wallnum = cwall_num;
 	Assert(w->linked_wall == wall_none);
 
 	if ( Newdemo_state != ND_STATE_PLAYBACK ) {
-		auto &Vertices = LevelSharedVertexState.get_vertices();
 		auto &vcvertptr = Vertices.vcptr;
 		const auto &&cp = compute_center_point_on_side(vcvertptr, seg, side);
 		digi_link_sound_to_pos( SOUND_WALL_CLOAK_ON, seg, side, cp, 0, F1_0 );
 	}
 
-	auto &df = d->front_ls;
-	auto &db = d->back_ls;
-	auto &s0_uvls = seg->unique_segment::sides[side].uvls;
-	auto &s1_uvls = csegp->unique_segment::sides[Connectside].uvls;
-	// d_zip
-	range_for (const unsigned i, xrange(4u))
+	for (auto &&[front_ls, back_ls, s0_uvls, s1_uvls] : zip(
+			d->front_ls,
+			d->back_ls,
+			seg->unique_segment::sides[side].uvls,
+			csegp->unique_segment::sides[Connectside].uvls
+	))
 	{
-		df[i] = s0_uvls[i].l;
-		db[i] = s1_uvls[i].l;
+		front_ls = s0_uvls.l;
+		back_ls = s1_uvls.l;
 	}
 }
 
 //-----------------------------------------------------------------
 // start the transition from open -> closed wall
-void start_wall_decloak(const vmsegptridx_t seg, const unsigned side)
+void start_wall_decloak(const vmsegptridx_t seg, const sidenum_t side)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	cloaking_wall *d;
 
 	if ( Newdemo_state==ND_STATE_PLAYBACK ) return;
@@ -601,14 +620,15 @@ void start_wall_decloak(const vmsegptridx_t seg, const unsigned side)
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
 	const auto &&w = Walls.vmptridx(sside.wall_num);
 
-	if (w->type == WALL_CLOSED || w->state == WALL_DOOR_DECLOAKING)		//already closed or decloaking
+	if (w->type == WALL_CLOSED || w->state == wall_state::decloaking)		//already closed or decloaking
 		return;
 
 	auto &CloakingWalls = LevelUniqueWallSubsystemState.CloakingWalls;
-	if (w->state == WALL_DOOR_CLOAKING) {	//cloaking, so reuse door
+	if (w->state == wall_state::cloaking) {	//cloaking, so reuse door
 		const auto &&r = make_range(CloakingWalls.vmptr);
-		const auto i = std::find_if(r.begin(), r.end(), find_cloaked_wall_predicate(w));
-		if (i == r.end())
+		const auto &&re = r.end();
+		const auto &&i = ranges::find_if(r.begin(), re, find_cloaked_wall_predicate(w));
+		if (i == re)
 		{
 			d_debugbreak();
 			return;
@@ -616,7 +636,7 @@ void start_wall_decloak(const vmsegptridx_t seg, const unsigned side)
 		d = *i;
 		d->time = CLOAKING_WALL_TIME - d->time;
 	}
-	else if (w->state == WALL_DOOR_CLOSED) {	//create new door
+	else if (w->state == wall_state::closed) {	//create new door
 		const clwallnum_t c = CloakingWalls.get_count();
 		if (c >= CloakingWalls.size())
 		{
@@ -636,7 +656,7 @@ void start_wall_decloak(const vmsegptridx_t seg, const unsigned side)
 		return;
 	}
 
-	w->state = WALL_DOOR_DECLOAKING;
+	w->state = wall_state::decloaking;
 
 	// So that door can't be shot while opening
 	const auto &&csegp = vcsegptr(seg->children[side]);
@@ -645,31 +665,28 @@ void start_wall_decloak(const vmsegptridx_t seg, const unsigned side)
 	auto &csside = csegp->shared_segment::sides[Connectside];
 	const auto cwall_num = csside.wall_num;
 	if (const auto &&w1 = Walls.imptr(cwall_num))
-		w1->state = WALL_DOOR_DECLOAKING;
+		w1->state = wall_state::decloaking;
 
 	d->front_wallnum = seg->shared_segment::sides[side].wall_num;
 	d->back_wallnum = csside.wall_num;
 	Assert(w->linked_wall == wall_none);
 
 	if ( Newdemo_state != ND_STATE_PLAYBACK ) {
-		auto &Vertices = LevelSharedVertexState.get_vertices();
 		auto &vcvertptr = Vertices.vcptr;
 		const auto &&cp = compute_center_point_on_side(vcvertptr, seg, side);
 		digi_link_sound_to_pos( SOUND_WALL_CLOAK_OFF, seg, side, cp, 0, F1_0 );
 	}
 
-	auto &df = d->front_ls;
-	auto &db = d->back_ls;
-	auto &s0_uvls = seg->unique_segment::sides[side].uvls;
-	auto &s1_uvls = csegp->unique_segment::sides[Connectside].uvls;
-	// d_zip
-	range_for (const unsigned i, xrange(4u))
+	for (auto &&[front_ls, back_ls, s0_uvls, s1_uvls] : zip(
+			d->front_ls,
+			d->back_ls,
+			seg->unique_segment::sides[side].uvls,
+			csegp->unique_segment::sides[Connectside].uvls
+	))
 	{
-		df[i] = s0_uvls[i].l;
-		db[i] = s1_uvls[i].l;
+		front_ls = s0_uvls.l;
+		back_ls = s1_uvls.l;
 	}
-}
-
 }
 #endif
 
@@ -684,32 +701,46 @@ void wall_close_door_ref(fvmsegptridx &vmsegptridx, wall_array &Walls, const wal
 
 		const auto &&seg = vmsegptridx(w.segnum);
 		const auto side = w.sidenum;
-		w.state = WALL_DOOR_CLOSED;
+		w.state = wall_state::closed;
 
 		assert(seg->shared_segment::sides[side].wall_num != wall_none);		//Closing door on illegal wall
 
-		const auto &&csegp = seg.absolute_sibling(seg->children[side]);
+		const auto &&csegp = seg.absolute_sibling(seg->shared_segment::children[side]);
 		auto Connectside = find_connect_side(seg, csegp);
 		Assert(Connectside != side_none);
 		const auto cwall_num = csegp->shared_segment::sides[Connectside].wall_num;
 		if (const auto &&w1 = Walls.imptr(cwall_num))
-			w1->state = WALL_DOOR_CLOSED;
+			w1->state = wall_state::closed;
 
 		wall_set_tmap_num(WallAnims[w.clip_num], seg, side, csegp, Connectside, 0);
 	}
 }
 
-static unsigned check_poke(fvcvertptr &vcvertptr, const object_base &obj, const shared_segment &seg, const unsigned side)
+}
+
+namespace dcx {
+
+namespace {
+
+static unsigned check_poke(fvcvertptr &vcvertptr, const object_base &obj, const shared_segment &seg, const sidenum_t side)
 {
 	//note: don't let objects with zero size block door
 	if (!obj.size)
 		return 0;
-	return get_seg_masks(vcvertptr, obj.pos, seg, obj.size).sidemask & (1 << side);		//pokes through side!
+	return get_seg_masks(vcvertptr, obj.pos, seg, obj.size).sidemask & build_sidemask(side);		//pokes through side!
+}
+
+}
+
 }
 
 namespace dsx {
-static unsigned is_door_side_obstructed(fvcobjptridx &vcobjptridx, fvcsegptr &vcsegptr, const vcsegptr_t seg, const unsigned side)
+
+namespace {
+
+static unsigned is_door_side_obstructed(fvcobjptridx &vcobjptridx, fvcsegptr &vcsegptr, const cscusegment seg, const sidenum_t side)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
 	range_for (const object_base &obj, objects_in(seg, vcobjptridx, vcsegptr))
@@ -727,11 +758,11 @@ static unsigned is_door_side_obstructed(fvcobjptridx &vcobjptridx, fvcsegptr &vc
 }
 
 //returns true if door is obstructed (& thus cannot close)
-static unsigned is_door_obstructed(fvcobjptridx &vcobjptridx, fvcsegptr &vcsegptr, const vcsegptridx_t seg, const unsigned side)
+static unsigned is_door_obstructed(fvcobjptridx &vcobjptridx, fvcsegptr &vcsegptr, const vcsegptridx_t seg, const sidenum_t side)
 {
 	if (const auto obstructed = is_door_side_obstructed(vcobjptridx, vcsegptr, seg, side))
 		return obstructed;
-	const auto &&csegp = vcsegptr(seg->children[side]);
+	const auto &&csegp = vcsegptr(seg->shared_segment::children[side]);
 	const auto &&Connectside = find_connect_side(seg, csegp);
 	Assert(Connectside != side_none);
 	//go through each object in each of two segments, and see if
@@ -739,20 +770,25 @@ static unsigned is_door_obstructed(fvcobjptridx &vcobjptridx, fvcsegptr &vcsegpt
 	return is_door_side_obstructed(vcobjptridx, vcsegptr, csegp, Connectside);
 }
 
+}
+
 #if defined(DXX_BUILD_DESCENT_II)
 //-----------------------------------------------------------------
 // Closes a door
-void wall_close_door(wall_array &Walls, const vmsegptridx_t seg, const unsigned side)
+void wall_close_door(wall_array &Walls, const vmsegptridx_t seg, const sidenum_t side)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
+	auto &WallAnims = GameSharedState.WallAnims;
 	auto &vcobjptridx = Objects.vcptridx;
 	active_door *d;
 
 	const auto wall_num = seg->shared_segment::sides[side].wall_num;
 	wall *const w = Walls.vmptr(wall_num);
-	if ((w->state == WALL_DOOR_CLOSING) ||		//already closing
-		 (w->state == WALL_DOOR_WAITING)	||		//open, waiting to close
-		 (w->state == WALL_DOOR_CLOSED))			//closed
+	if ((w->state == wall_state::closing) ||		//already closing
+		 (w->state == wall_state::waiting)	||		//open, waiting to close
+		 (w->state == wall_state::closed))			//closed
 		return;
 
 	if (is_door_obstructed(vcobjptridx, vcsegptr, seg, side))
@@ -760,10 +796,12 @@ void wall_close_door(wall_array &Walls, const vmsegptridx_t seg, const unsigned 
 
 	auto &ActiveDoors = LevelUniqueWallSubsystemState.ActiveDoors;
 	auto &vmactdoorptr = ActiveDoors.vmptr;
-	if (w->state == WALL_DOOR_OPENING) {	//reuse door
+	if (w->state == wall_state::opening)
+	{	//reuse door
 		const auto &&r = make_range(vmactdoorptr);
-		const auto &&i = std::find_if(r.begin(), r.end(), find_active_door_predicate(wall_num));
-		if (i == r.end())
+		const auto &&re = r.end();
+		const auto &&i = ranges::find_if(r.begin(), re, find_active_door_predicate(wall_num));
+		if (i == re)
 		{
 			d_debugbreak();
 			return;
@@ -776,14 +814,14 @@ void wall_close_door(wall_array &Walls, const vmsegptridx_t seg, const unsigned 
 
 	}
 	else {											//create new door
-		Assert(w->state == WALL_DOOR_OPEN);
+		assert(w->state == wall_state::open);
 		const auto i = ActiveDoors.get_count();
 		ActiveDoors.set_count(i + 1);
 		d = vmactdoorptr(static_cast<actdoornum_t>(i));
 		d->time = 0;
 	}
 
-	w->state = WALL_DOOR_CLOSING;
+	w->state = wall_state::closing;
 
 	// So that door can't be shot while opening
 	const auto &&csegp = vcsegptr(seg->children[side]);
@@ -791,7 +829,7 @@ void wall_close_door(wall_array &Walls, const vmsegptridx_t seg, const unsigned 
 	Assert(Connectside != side_none);
 	const auto cwall_num = csegp->shared_segment::sides[Connectside].wall_num;
 	if (const auto &&w1 = Walls.imptr(cwall_num))
-		w1->state = WALL_DOOR_CLOSING;
+		w1->state = wall_state::closing;
 
 	d->front_wallnum[0] = seg->shared_segment::sides[side].wall_num;
 	d->back_wallnum[0] = cwall_num;
@@ -810,15 +848,17 @@ void wall_close_door(wall_array &Walls, const vmsegptridx_t seg, const unsigned 
 	if ( Newdemo_state != ND_STATE_PLAYBACK )
 	{
 		// NOTE THE LINK TO ABOVE!!!!
-		auto &Vertices = LevelSharedVertexState.get_vertices();
 		auto &vcvertptr = Vertices.vcptr;
 		const auto &&cp = compute_center_point_on_side(vcvertptr, seg, side);
-		if (WallAnims[w->clip_num].open_sound > -1 )
-			digi_link_sound_to_pos( WallAnims[w->clip_num].open_sound, seg, side, cp, 0, F1_0 );
+		const auto open_sound = WallAnims[w->clip_num].open_sound;
+		if (open_sound > -1)
+			digi_link_sound_to_pos(open_sound, seg, side, cp, 0, F1_0);
 
 	}
 }
 #endif
+
+namespace {
 
 //-----------------------------------------------------------------
 // Animates opening of a door.
@@ -826,13 +866,13 @@ void wall_close_door(wall_array &Walls, const vmsegptridx_t seg, const unsigned 
 static bool do_door_open(active_door &d)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &WallAnims = GameSharedState.WallAnims;
 	auto &vmobjptr = Objects.vmptr;
 	bool remove = false;
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
 	auto &vmwallptr = Walls.vmptr;
 	for (unsigned p = 0; p < d.n_parts; ++p)
 	{
-		int side;
 		fix time_elapsed, time_total, one_frame;
 		int i;
 
@@ -841,15 +881,15 @@ static bool do_door_open(active_door &d)
 		LevelUniqueStuckObjectState.kill_stuck_objects(vmobjptr, d.back_wallnum[p]);
 
 		const auto &&seg = vmsegptridx(w.segnum);
-		side = w.sidenum;
+		const auto side = w.sidenum;
 
 		if (seg->shared_segment::sides[side].wall_num == wall_none)
 		{
-			con_printf(CON_URGENT, "Trying to do_door_open on illegal wall %i. Please check your level!",side);
+			con_printf(CON_URGENT, "Trying to do_door_open on illegal wall %i. Please check your level!", underlying_value(side));
 			continue;
 		}
 
-		const auto &&csegp = seg.absolute_sibling(seg->children[side]);
+		const auto &&csegp = seg.absolute_sibling(seg->shared_segment::children[side]);
 		const auto &&Connectside = find_connect_side(seg, csegp);
 		Assert(Connectside != side_none);
 
@@ -865,29 +905,30 @@ static bool do_door_open(active_door &d)
 		i = time_elapsed/one_frame;
 
 		if (i < n)
-			wall_set_tmap_num(WallAnims[w.clip_num], seg, side, csegp, Connectside, i);
+			wall_set_tmap_num(wa, seg, side, csegp, Connectside, i);
 
 		const auto cwall_num = csegp->shared_segment::sides[Connectside].wall_num;
 		auto &w1 = *vmwallptr(cwall_num);
 		if (i> n/2) {
-			w.flags |= WALL_DOOR_OPENED;
-			w1.flags |= WALL_DOOR_OPENED;
+			w.flags |= wall_flag::door_opened;
+			w1.flags |= wall_flag::door_opened;
 		}
 
 		if (i >= n-1) {
-			wall_set_tmap_num(WallAnims[w.clip_num], seg, side, csegp, Connectside, n - 1);
+			wall_set_tmap_num(wa, seg, side, csegp, Connectside, n - 1);
 
 			// If our door is not automatic just remove it from the list.
-			if (!(w.flags & WALL_DOOR_AUTO)) {
+			if (!(w.flags & wall_flag::door_auto))
+			{
 				remove = true;
 #if defined(DXX_BUILD_DESCENT_II)
-				w.state = WALL_DOOR_OPEN;
-				w1.state = WALL_DOOR_OPEN;
+				w.state = wall_state::open;
+				w1.state = wall_state::open;
 #endif
 			}
 			else {
-				w.state = WALL_DOOR_WAITING;
-				w1.state = WALL_DOOR_WAITING;
+				w.state = wall_state::waiting;
+				w1.state = wall_state::waiting;
 			}
 		}
 
@@ -901,20 +942,23 @@ static bool do_door_open(active_door &d)
 // Called from the game loop.
 static bool do_door_close(active_door &d)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcobjptridx = Objects.vcptridx;
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
+	auto &WallAnims = GameSharedState.WallAnims;
 	auto &vmwallptr = Walls.vmptr;
 	auto &w0 = *vmwallptr(d.front_wallnum[0]);
-	const auto &&wsegp = vmsegptridx(w0.segnum);
+	const auto &&seg0 = vmsegptridx(w0.segnum);
 
 	//check for objects in doorway before closing
-	if (w0.flags & WALL_DOOR_AUTO)
-		if (is_door_obstructed(vcobjptridx, vcsegptr, wsegp, w0.sidenum))
+	if (w0.flags & wall_flag::door_auto)
+		if (is_door_obstructed(vcobjptridx, vcsegptr, seg0, w0.sidenum))
 		{
 #if defined(DXX_BUILD_DESCENT_II)
 			digi_kill_sound_linked_to_segment(w0.segnum, w0.sidenum, -1);
-			wall_open_door(wsegp, w0.sidenum);		//re-open door
+			wall_open_door(seg0, w0.sidenum);		//re-open door
 #endif
 			return false;
 		}
@@ -923,14 +967,13 @@ static bool do_door_close(active_door &d)
 	bool remove = false;
 	range_for (const auto p, partial_const_range(d.front_wallnum, d.n_parts))
 	{
-		int side;
 		fix time_elapsed, time_total, one_frame;
 		int i;
 
 		auto &wp = *vmwallptr(p);
 
-		const auto &seg = wsegp;
-		side = wp.sidenum;
+		const auto &&seg = vmsegptridx(wp.segnum);
+		const auto side = wp.sidenum;
 
 		if (seg->shared_segment::sides[side].wall_num == wall_none) {
 			return false;
@@ -939,15 +982,16 @@ static bool do_door_close(active_door &d)
 #if defined(DXX_BUILD_DESCENT_I)
 		//if here, must be auto door
 //don't assert here, because now we have triggers to close non-auto doors
-		Assert(wp.flags & WALL_DOOR_AUTO);
+		assert(wp.flags & wall_flag::door_auto);
 #endif
 
 		// Otherwise, close it.
-		const auto &&csegp = seg.absolute_sibling(seg->children[side]);
+		const auto &&csegp = seg.absolute_sibling(seg->shared_segment::children[side]);
 		const auto &&Connectside = find_connect_side(seg, csegp);
 		Assert(Connectside != side_none);
 
 
+		auto &wa = WallAnims[wp.clip_num];
 		if ( Newdemo_state != ND_STATE_PLAYBACK )
 		{
 			// NOTE THE LINK TO ABOVE!!
@@ -956,11 +1000,11 @@ static bool do_door_close(active_door &d)
 				played_sound = true;
 				if (d.time == 0)
 				{		//first time
-					if (WallAnims[wp.clip_num].close_sound > -1 )
+					const auto close_sound = wa.close_sound;
+					if (close_sound > -1)
 					{
-						auto &Vertices = LevelSharedVertexState.get_vertices();
 						auto &vcvertptr = Vertices.vcptr;
-						digi_link_sound_to_pos(WallAnims[wp.clip_num].close_sound, seg, side, compute_center_point_on_side(vcvertptr, seg, side), 0, F1_0);
+						digi_link_sound_to_pos(close_sound, seg, side, compute_center_point_on_side(vcvertptr, seg, side), 0, F1_0);
 					}
 				}
 			}
@@ -969,8 +1013,8 @@ static bool do_door_close(active_door &d)
 		d.time += FrameTime;
 
 		time_elapsed = d.time;
-		const auto n = WallAnims[wp.clip_num].num_frames;
-		time_total = WallAnims[wp.clip_num].play_time;
+		const auto n = wa.num_frames;
+		time_total = wa.play_time;
 
 		one_frame = time_total/n;	
 
@@ -979,31 +1023,31 @@ static bool do_door_close(active_door &d)
 		const auto cwall_num = csegp->shared_segment::sides[Connectside].wall_num;
 		auto &w1 = *vmwallptr(cwall_num);
 		if (i < n/2) {
-			wp.flags &= ~WALL_DOOR_OPENED;
-			w1.flags &= ~WALL_DOOR_OPENED;
+			wp.flags &= ~wall_flag::door_opened;
+			w1.flags &= ~wall_flag::door_opened;
 		}
 
 		// Animate door.
 		if (i > 0) {
-			wall_set_tmap_num(WallAnims[wp.clip_num], seg, side, csegp, Connectside, i);
+			wall_set_tmap_num(wa, seg, side, csegp, Connectside, i);
 
-			wp.state = WALL_DOOR_CLOSING;
-			w1.state = WALL_DOOR_CLOSING;
+			wp.state = wall_state::closing;
+			w1.state = wall_state::closing;
 		} else
-		{
-			wall_close_door_ref(Segments.vmptridx, Walls, WallAnims, d);
 			remove = true;
-		}
 	}
+
+	if (remove)
+		wall_close_door_ref(Segments.vmptridx, Walls, WallAnims, d);
 	return remove;
 }
 
-static std::pair<wall *, wall *> wall_illusion_op(fvmwallptr &vmwallptr, const vcsegptridx_t seg, const unsigned side)
+static std::pair<wall *, wall *> wall_illusion_op(fvmwallptr &vmwallptr, const vcsegptridx_t seg, const sidenum_t side)
 {
 	const auto wall0 = seg->shared_segment::sides[side].wall_num;
 	if (wall0 == wall_none)
 		return {nullptr, nullptr};
-	const shared_segment &csegp = *seg.absolute_sibling(seg->children[side]);
+	const shared_segment &csegp = *seg.absolute_sibling(seg->shared_segment::children[side]);
 	const auto &&cside = find_connect_side(seg, csegp);
 	if (cside == side_none)
 	{
@@ -1017,7 +1061,7 @@ static std::pair<wall *, wall *> wall_illusion_op(fvmwallptr &vmwallptr, const v
 }
 
 template <typename F>
-static void wall_illusion_op(fvmwallptr &vmwallptr, const vcsegptridx_t seg, const unsigned side, const F op)
+static void wall_illusion_op(fvmwallptr &vmwallptr, const vcsegptridx_t seg, const sidenum_t side, const F op)
 {
 	const auto &&r = wall_illusion_op(vmwallptr, seg, side);
 	if (r.first)
@@ -1027,13 +1071,15 @@ static void wall_illusion_op(fvmwallptr &vmwallptr, const vcsegptridx_t seg, con
 	}
 }
 
+}
+
 //-----------------------------------------------------------------
 // Turns off an illusionary wall (This will be used primarily for
 //  wall switches or triggers that can turn on/off illusionary walls.)
-void wall_illusion_off(fvmwallptr &vmwallptr, const vcsegptridx_t seg, const unsigned side)
+void wall_illusion_off(fvmwallptr &vmwallptr, const vcsegptridx_t seg, const sidenum_t side)
 {
 	const auto &&op = [](wall &w) {
-		w.flags |= WALL_ILLUSION_OFF;
+		w.flags |= wall_flag::illusion_off;
 	};
 	wall_illusion_op(vmwallptr, seg, side, op);
 }
@@ -1041,24 +1087,28 @@ void wall_illusion_off(fvmwallptr &vmwallptr, const vcsegptridx_t seg, const uns
 //-----------------------------------------------------------------
 // Turns on an illusionary wall (This will be used primarily for
 //  wall switches or triggers that can turn on/off illusionary walls.)
-void wall_illusion_on(fvmwallptr &vmwallptr, const vcsegptridx_t seg, const unsigned side)
+void wall_illusion_on(fvmwallptr &vmwallptr, const vcsegptridx_t seg, const sidenum_t side)
 {
 	const auto &&op = [](wall &w) {
-		w.flags &= ~WALL_ILLUSION_OFF;
+		w.flags &= ~wall_flag::illusion_off;
 	};
 	wall_illusion_op(vmwallptr, seg, side, op);
 }
 
 }
 
+namespace {
+
 //	-----------------------------------------------------------------------------
 //	Allowed to open the normally locked special boss door if in multiplayer mode.
-static int special_boss_opening_allowed(segnum_t segnum, int sidenum)
+static int special_boss_opening_allowed(const segnum_t segnum, const sidenum_t sidenum)
 {
 	if (Game_mode & GM_MULTI)
 		return (Current_level_num == BOSS_LOCKED_DOOR_LEVEL) && (segnum == BOSS_LOCKED_DOOR_SEG) && (sidenum == BOSS_LOCKED_DOOR_SIDE);
 	else
 		return 0;
+}
+
 }
 
 //-----------------------------------------------------------------
@@ -1068,7 +1118,7 @@ static int special_boss_opening_allowed(segnum_t segnum, int sidenum)
 //playernum is the number the player who hit the wall or fired the weapon,
 //or -1 if a robot fired the weapon
 namespace dsx {
-wall_hit_process_t wall_hit_process(const player_flags powerup_flags, const vmsegptridx_t seg, const unsigned side, const fix damage, const unsigned playernum, const object &obj)
+wall_hit_process_t wall_hit_process(const player_flags powerup_flags, const vmsegptridx_t seg, const sidenum_t side, const fix damage, const unsigned playernum, const object &obj)
 {
 	fix	show_message;
 
@@ -1115,16 +1165,16 @@ wall_hit_process_t wall_hit_process(const player_flags powerup_flags, const vmse
 	 */
 	const char *key_color;
 	if (
-		(w->keys == KEY_BLUE && (key_color = TXT_BLUE, true)) ||
-		(w->keys == KEY_GOLD && (key_color = TXT_YELLOW, true)) ||
-		(w->keys == KEY_RED && (key_color = TXT_RED, true))
+		(w->keys == wall_key::blue && (key_color = TXT_BLUE, true)) ||
+		(w->keys == wall_key::gold && (key_color = TXT_YELLOW, true)) ||
+		(w->keys == wall_key::red && (key_color = TXT_RED, true))
 	)
 	{
 		if (!(powerup_flags & static_cast<PLAYER_FLAG>(w->keys)))
 		{
-			static_assert(KEY_BLUE == static_cast<unsigned>(PLAYER_FLAGS_BLUE_KEY), "BLUE key flag mismatch");
-			static_assert(KEY_GOLD == static_cast<unsigned>(PLAYER_FLAGS_GOLD_KEY), "GOLD key flag mismatch");
-			static_assert(KEY_RED == static_cast<unsigned>(PLAYER_FLAGS_RED_KEY), "RED key flag mismatch");
+			static_assert(static_cast<unsigned>(wall_key::blue) == static_cast<unsigned>(PLAYER_FLAGS_BLUE_KEY), "BLUE key flag mismatch");
+			static_assert(static_cast<unsigned>(wall_key::gold) == static_cast<unsigned>(PLAYER_FLAGS_GOLD_KEY), "GOLD key flag mismatch");
+			static_assert(static_cast<unsigned>(wall_key::red) == static_cast<unsigned>(PLAYER_FLAGS_RED_KEY), "RED key flag mismatch");
 				if (show_message)
 					HUD_init_message(HM_DEFAULT, "%s %s",key_color,TXT_ACCESS_DENIED);
 			return wall_hit_process_t::WHP_NO_KEY;
@@ -1133,22 +1183,22 @@ wall_hit_process_t wall_hit_process(const player_flags powerup_flags, const vmse
 
 	if (w->type == WALL_DOOR)
 	{
-		if ((w->flags & WALL_DOOR_LOCKED ) && !(special_boss_opening_allowed(seg, side)) ) {
+		if ((w->flags & wall_flag::door_locked) && !special_boss_opening_allowed(seg, side))
+		{
 				if (show_message)
 					HUD_init_message_literal(HM_DEFAULT, TXT_CANT_OPEN_DOOR);
 			return wall_hit_process_t::WHP_NO_KEY;
 		}
 		else {
-			if (w->state != WALL_DOOR_OPENING)
+			if (w->state != wall_state::opening)
 			{
 				wall_open_door(seg, side);
 				if (Game_mode & GM_MULTI)
 				{
-					int flags;
 #if defined(DXX_BUILD_DESCENT_I)
-					flags = 0;
+					const wall_flags flags{};
 #elif defined(DXX_BUILD_DESCENT_II)
-					flags = w->flags;
+					const auto flags = w->flags;
 #endif
 					multi_send_door_open(seg, side,flags);
 				}
@@ -1159,23 +1209,22 @@ wall_hit_process_t wall_hit_process(const player_flags powerup_flags, const vmse
 	}
 	return wall_hit_process_t::WHP_NOT_SPECIAL;		//default is treat like normal wall
 }
-}
 
 //-----------------------------------------------------------------
 // Opens doors/destroys wall/shuts off triggers.
-void wall_toggle(fvmwallptr &vmwallptr, const vmsegptridx_t segp, const unsigned side)
+void wall_toggle(fvmwallptr &vmwallptr, const vmsegptridx_t segp, const sidenum_t side)
 {
 	if (side >= MAX_SIDES_PER_SEGMENT)
 	{
 #ifndef NDEBUG
-		Warning("Can't toggle side %u of segment %d (%u)!\n", side, static_cast<segnum_t>(segp), Highest_segment_index);
+		Warning("Can't toggle side %u of segment %d (%u)!\n", underlying_value(side), segp.get_unchecked_index(), Highest_segment_index);
 #endif
 		return;
 	}
 	const auto wall_num = segp->shared_segment::sides[side].wall_num;
 	if (wall_num == wall_none)
 	{
-		LevelError("Ignoring attempt to toggle wall in segment %hu, side %u: no wall exists there.", segp.get_unchecked_index(), side);
+		LevelError("Ignoring attempt to toggle wall in segment %hu, side %u: no wall exists there.", segp.get_unchecked_index(), underlying_value(side));
 		return;
 	}
 
@@ -1186,7 +1235,7 @@ void wall_toggle(fvmwallptr &vmwallptr, const vmsegptridx_t segp, const unsigned
 	if (w->type == WALL_BLASTABLE)
 		wall_destroy(segp, side);
 
-	if (w->type == WALL_DOOR && w->state == WALL_DOOR_CLOSED)
+	if (w->type == WALL_DOOR && w->state == wall_state::closed)
 		wall_open_door(segp, side);
 }
 
@@ -1198,22 +1247,23 @@ bool ad_removal_predicate::operator()(active_door &d) const
 #endif
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
 	wall &w = *Walls.vmptr(d.front_wallnum[0]);
-	if (w.state == WALL_DOOR_OPENING)
+	if (w.state == wall_state::opening)
 		return do_door_open(d);
-	else if (w.state == WALL_DOOR_CLOSING)
+	else if (w.state == wall_state::closing)
 		return do_door_close(d);
-	else if (w.state == WALL_DOOR_WAITING) {
+	else if (w.state == wall_state::waiting)
+	{
 		d.time += FrameTime;
 		// set flags to fix occasional netgame problem where door is waiting to close but open flag isn't set
-		w.flags |= WALL_DOOR_OPENED;
+		w.flags |= wall_flag::door_opened;
 		if (wall *const w1 = Walls.imptr(d.back_wallnum[0]))
-			w1->flags |= WALL_DOOR_OPENED;
+			w1->flags |= wall_flag::door_opened;
 		if (d.time > DOOR_WAIT_TIME)
 #if defined(DXX_BUILD_DESCENT_II)
 			if (!is_door_obstructed(vcobjptridx, vcsegptr, vcsegptridx(w.segnum), w.sidenum))
 #endif
 			{
-				w.state = WALL_DOOR_CLOSING;
+				w.state = wall_state::closing;
 				d.time = 0;
 			}
 	}
@@ -1221,7 +1271,9 @@ bool ad_removal_predicate::operator()(active_door &d) const
 }
 
 #if defined(DXX_BUILD_DESCENT_II)
-static void copy_cloaking_wall_light_to_wall(array<uvl, 4> &back_uvls, array<uvl, 4> &front_uvls, const cloaking_wall &d)
+namespace {
+
+static void copy_cloaking_wall_light_to_wall(std::array<uvl, 4> &back_uvls, std::array<uvl, 4> &front_uvls, const cloaking_wall &d)
 {
 	range_for (const uint_fast32_t i, xrange(4u))
 	{
@@ -1230,7 +1282,7 @@ static void copy_cloaking_wall_light_to_wall(array<uvl, 4> &back_uvls, array<uvl
 	}
 }
 
-static void scale_cloaking_wall_light_to_wall(array<uvl, 4> &back_uvls, array<uvl, 4> &front_uvls, const cloaking_wall &d, const fix light_scale)
+static void scale_cloaking_wall_light_to_wall(std::array<uvl, 4> &back_uvls, std::array<uvl, 4> &front_uvls, const cloaking_wall &d, const fix light_scale)
 {
 	range_for (const uint_fast32_t i, xrange(4u))
 	{
@@ -1244,7 +1296,7 @@ static cwresult do_cloaking_wall_frame(const bool initial, cloaking_wall &d, con
 	cwresult r(initial);
 	if (d.time > CLOAKING_WALL_TIME) {
 		front.w.type = back.w.type = WALL_OPEN;
-		front.w.state = back.w.state = WALL_DOOR_CLOSED;		//why closed? why not?
+		front.w.state = back.w.state = wall_state::closed;		//why closed? why not?
 		r.remove = true;
 	}
 	else if (d.time > CLOAKING_WALL_TIME/2) {
@@ -1274,8 +1326,8 @@ static cwresult do_decloaking_wall_frame(const bool initial, cloaking_wall &d, c
 	cwresult r(initial);
 	if (d.time > CLOAKING_WALL_TIME) {
 
-		back.w.state = WALL_DOOR_CLOSED;
-		front.w.state = WALL_DOOR_CLOSED;
+		back.w.state = wall_state::closed;
+		front.w.state = wall_state::closed;
 		copy_cloaking_wall_light_to_wall(back.uvls, front.uvls, d);
 		r.remove = true;
 	}
@@ -1308,9 +1360,9 @@ bool cw_removal_predicate::operator()(cloaking_wall &d)
 	d.time += FrameTime;
 
 	cwresult r;
-	if (front.w.state == WALL_DOOR_CLOAKING)
+	if (front.w.state == wall_state::cloaking)
 		r = do_cloaking_wall_frame(initial, d, front, back);
-	else if (front.w.state == WALL_DOOR_DECLOAKING)
+	else if (front.w.state == wall_state::decloaking)
 		r = do_decloaking_wall_frame(initial, d, front, back);
 	else
 	{
@@ -1327,10 +1379,13 @@ bool cw_removal_predicate::operator()(cloaking_wall &d)
 		++ num_cloaking_walls;
 	return r.remove;
 }
+
+}
 #endif
 
-namespace dsx {
-static void process_exploding_walls()
+namespace {
+
+static void process_exploding_walls(const d_robot_info_array &Robot_info)
 {
 	if (Newdemo_state == ND_STATE_PLAYBACK)
 		return;
@@ -1340,28 +1395,23 @@ static void process_exploding_walls()
 		range_for (auto &&wp, Walls.vmptr)
 		{
 			auto &w1 = *wp;
-			if (w1.flags & WALL_EXPLODING)
+			if (w1.flags & wall_flag::exploding)
 			{
 				assert(num_exploding_walls);
-				do_exploding_wall_frame(w1);
-				if (! -- num_exploding_walls)
-				{
-					/* In debug builds, iterate over all remaining walls
-					 * to verify that none are marked as WALL_EXPLODING.
-					 */
-#ifdef NDEBUG
+				const auto n = do_exploding_wall_frame(Robot_info, w1);
+				num_exploding_walls -= n;
+				if (!num_exploding_walls)
 					break;
-#endif
-				}
 			}
 		}
-		assert(!num_exploding_walls);
 	}
 }
 
-void wall_frame_process()
+}
+
+void wall_frame_process(const d_robot_info_array &Robot_info)
 {
-	process_exploding_walls();
+	process_exploding_walls(Robot_info);
 	{
 		auto &ActiveDoors = LevelUniqueWallSubsystemState.ActiveDoors;
 		const auto &&r = partial_range(ActiveDoors, ActiveDoors.get_count());
@@ -1385,12 +1435,12 @@ d_level_unique_stuck_object_state LevelUniqueStuckObjectState;
 
 //	An object got stuck in a door (like a flare).
 //	Add global entry.
-void d_level_unique_stuck_object_state::add_stuck_object(fvcwallptr &vcwallptr, const vmobjptridx_t objp, const shared_segment &segp, const unsigned sidenum)
+void d_level_unique_stuck_object_state::add_stuck_object(fvcwallptr &vcwallptr, const vmobjptridx_t objp, const shared_segment &segp, const sidenum_t sidenum)
 {
 	const auto wallnum = segp.sides[sidenum].wall_num;
 	if (wallnum != wall_none)
 	{
-		if (vcwallptr(wallnum)->flags & WALL_BLASTED)
+		if (vcwallptr(wallnum)->flags & wall_flag::blasted)
 		{
 			objp->flags |= OF_SHOULD_BE_DEAD;
 			return;
@@ -1411,9 +1461,10 @@ void d_level_unique_stuck_object_state::add_stuck_object(fvcwallptr &vcwallptr, 
 void d_level_unique_stuck_object_state::remove_stuck_object(const vcobjidx_t obj)
 {
 	auto &&pr = partial_range(Stuck_objects, Num_stuck_objects);
+	auto &&pre = pr.end();
 	const auto predicate = [obj](const stuckobj &so) { return so.objnum == obj; };
-	const auto i = std::find_if(pr.begin(), pr.end(), predicate);
-	if (i == pr.end())
+	const auto &&i = ranges::find_if(pr.begin(), pre, predicate);
+	if (i == pre)
 		/* Objects enter this function if they are able to become stuck,
 		 * without regard to whether they actually are stuck.  If the
 		 * object terminated without being stuck in a wall, then it will
@@ -1431,17 +1482,7 @@ void d_level_unique_stuck_object_state::remove_stuck_object(const vcobjidx_t obj
 	 * last object.
 	 */
 	auto &last_element = *std::prev(pr.end());
-#if defined(__clang__) || __GNUC__ >= 5
-	/* gcc-4.9.x shipped without support for
-	 * `std::is_trivially_move_assignable`.  Since this is just a sanity check
-	 * to warn developers to be careful, restricting it to occur only with
-	 * later compilers is acceptable.
-	 *
-	 * clang claims to be gcc 4.2.1, but does implement
-	 * `std::is_trivially_move_assignable`, so enable it for clang.
-	 */
 	static_assert(std::is_trivially_move_assignable<stuckobj>::value, "stuckobj move may require a check to prevent self-move");
-#endif
 	*i = std::move(last_element);
 	DXX_POISON_VAR(last_element.wallnum, 0xcc);
 	DXX_POISON_VAR(last_element.objnum, 0xcc);
@@ -1466,7 +1507,7 @@ void d_level_unique_stuck_object_state::kill_stuck_objects(fvmobjptr &vmobjptr, 
 #define DXX_WEAPON_LIFELEFT	F1_0/8
 #endif
 		assert(obj.type == OBJ_WEAPON);
-		assert(obj.movement_type == MT_PHYSICS);
+		assert(obj.movement_source == object::movement_type::physics);
 		assert(obj.mtype.phys_info.flags & PF_STICK);
 		obj.lifeleft = DXX_WEAPON_LIFELEFT;
 		return true;
@@ -1474,7 +1515,7 @@ void d_level_unique_stuck_object_state::kill_stuck_objects(fvmobjptr &vmobjptr, 
 	const auto i = std::remove_if(pr.begin(), pr.end(), predicate);
 	static_assert(std::is_trivially_destructible<stuckobj>::value, "stuckobj destructor not called");
 	Num_stuck_objects = std::distance(pr.begin(), i);
-	array<stuckobj, 1> empty;
+	std::array<stuckobj, 1> empty;
 	DXX_POISON_VAR(empty, 0xcc);
 	std::fill(i, pr.end(), empty[0]);
 }
@@ -1511,7 +1552,7 @@ class blast_nearby_glass_context
 	fvcvertptr &vcvertptr;
 	fvcwallptr &vcwallptr;
 	visited_segment_bitarray_t visited;
-	unsigned can_blast(const int16_t &tmap_num2) const;
+	unsigned can_blast(texture2_value tmap_num2) const;
 public:
 	blast_nearby_glass_context(const object &obj, const fix damage, const d_eclip_array &Effects, const GameBitmaps_array &GameBitmaps, const Textures_array &Textures, const TmapInfo_array &TmapInfo, const d_vclip_array &Vclip, fvcvertptr &vcvertptr, fvcwallptr &vcwallptr) :
 		obj(obj), damage(damage), Effects(Effects), GameBitmaps(GameBitmaps),
@@ -1524,9 +1565,9 @@ public:
 	void process_segment(vmsegptridx_t segp, unsigned steps_remaining);
 };
 
-unsigned blast_nearby_glass_context::can_blast(const int16_t &tmap_num2) const
+unsigned blast_nearby_glass_context::can_blast(const texture2_value tmap_num2) const
 {
-	const auto tm = tmap_num2 & 0x3fff;			//tm without flags
+	const auto tm = get_texture_index(tmap_num2);			//tm without flags
 	auto &ti = TmapInfo[tm];
 	const auto ec = ti.eclip_num;
 	if (ec == eclip_none)
@@ -1545,25 +1586,23 @@ void blast_nearby_glass_context::process_segment(const vmsegptridx_t segp, const
 	visited[segp] = true;
 
 	const auto &objp = obj;
-	range_for (const auto &&e, enumerate(segp->unique_segment::sides))
+	for (const auto &&[sidenum, uside] : enumerate(segp->unique_segment::sides))
 	{
 		fix			dist;
 
 		//	Process only walls which have glass.
-		auto &&uside = e.value;
-		if (const auto &tmap_num2 = uside.tmap_num2)
+		if (const auto tmap_num2 = uside.tmap_num2; tmap_num2 != texture2_value::None)
 		{
 			if (can_blast(tmap_num2))
 			{
-				auto &&sidenum = e.idx;
 				const auto &&pnt = compute_center_point_on_side(vcvertptr, segp, sidenum);
 				dist = vm_vec_dist_quick(pnt, objp.pos);
 				if (dist < damage/2) {
-					dist = find_connected_distance(pnt, segp, objp.pos, segp.absolute_sibling(objp.segnum), MAX_BLAST_GLASS_DEPTH, WID_RENDPAST_FLAG);
+					dist = find_connected_distance(pnt, segp, objp.pos, segp.absolute_sibling(objp.segnum), MAX_BLAST_GLASS_DEPTH, WALL_IS_DOORWAY_FLAG::rendpast);
 					if ((dist > 0) && (dist < damage/2))
 					{
 						assert(objp.type == OBJ_WEAPON);
-						check_effect_blowup(LevelSharedSegmentState.DestructibleLights, Vclip, segp, sidenum, pnt, objp.ctype.laser_info, 1, 0);
+						check_effect_blowup(LevelSharedSegmentState.DestructibleLights, Vclip, segp, static_cast<sidenum_t>(sidenum), pnt, objp.ctype.laser_info, 1, 0);
 					}
 				}
 			}
@@ -1573,13 +1612,11 @@ void blast_nearby_glass_context::process_segment(const vmsegptridx_t segp, const
 	const unsigned next_steps_remaining = steps_remaining - 1;
 	if (!next_steps_remaining)
 		return;
-	range_for (const auto &&e, enumerate(segp->children))
+	for (const auto &&[i, segnum] : enumerate(segp->children))
 	{
-		auto &&segnum = e.value;
 		if (segnum != segment_none) {
 			if (!visited[segnum]) {
-				auto &&i = e.idx;
-				if (WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, segp, segp, i) & WID_FLY_FLAG)
+				if (WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, segp, static_cast<sidenum_t>(i)) & WALL_IS_DOORWAY_FLAG::fly)
 				{
 					process_segment(segp.absolute_sibling(segnum), next_steps_remaining);
 				}
@@ -1604,6 +1641,7 @@ ASSERT_SERIAL_UDT_MESSAGE_SIZE(d1wclip, 26 + (sizeof(int16_t) * MAX_CLIP_FRAMES_
 //	blast nearby monitors, lights, maybe other things
 void blast_nearby_glass(const object &objp, const fix damage)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Effects = LevelUniqueEffectsClipState.Effects;
 	auto &TmapInfo = LevelUniqueTmapInfoState.TmapInfo;
 	auto &Vertices = LevelSharedVertexState.get_vertices();
@@ -1620,6 +1658,7 @@ void blast_nearby_glass(const object &objp, const fix damage)
 DEFINE_SERIAL_UDT_TO_MESSAGE(wclip, wc, (wc.play_time, wc.num_frames, wc.frames, wc.open_sound, wc.close_sound, wc.flags, wc.filename, serial::pad<1>()));
 ASSERT_SERIAL_UDT_MESSAGE_SIZE(wclip, 26 + (sizeof(int16_t) * MAX_CLIP_FRAMES));
 
+namespace dsx {
 /*
  * reads a wclip structure from a PHYSFS_File
  */
@@ -1634,6 +1673,7 @@ void wclip_write(PHYSFS_File *fp, const wclip &wc)
 	PHYSFSX_serialize_write(fp, wc);
 }
 #endif
+}
 
 struct wrap_v16_wall
 {
@@ -1661,7 +1701,7 @@ struct wrap_v19_wall
 	wrap_v19_wall(const wall &t) : w(&t) {}
 };
 
-DEFINE_SERIAL_UDT_TO_MESSAGE(v19_wall, w, (w.segnum, serial::pad<2>(), w.sidenum, w.type, w.flags, w.hps, w.trigger, w.clip_num, w.keys, w.linked_wall));
+DEFINE_SERIAL_UDT_TO_MESSAGE(v19_wall, w, (w.segnum, serial::pad<2>(), w.sidenum, w.type, w.flags, w.hps, w.trigger, w.clip_num, w.keys, w.linked_wall, serial::pad<2>()));
 DEFINE_SERIAL_UDT_TO_MESSAGE(wrap_v19_wall, w, (w.w->segnum, serial::pad<2>(), w.w->sidenum, serial::pad<3>(), w.w->type, w.w->flags, w.w->hps, w.w->trigger, w.w->clip_num, w.w->keys, w.w->linked_wall, serial::pad<2>()));
 ASSERT_SERIAL_UDT_MESSAGE_SIZE(v19_wall, 21);
 ASSERT_SERIAL_UDT_MESSAGE_SIZE(wrap_v19_wall, 21);
@@ -1679,16 +1719,19 @@ void v19_wall_read(PHYSFS_File *fp, v19_wall &w)
 #elif defined(DXX_BUILD_DESCENT_II)
 #define _SERIAL_UDT_WALL_D2X_MEMBERS	w.controlling_trigger, w.cloak_value
 #endif
-DEFINE_SERIAL_UDT_TO_MESSAGE(wall, w, (serial::sign_extend<int>(w.segnum), w.sidenum, serial::pad<3, 0>(), w.hps, serial::sign_extend<int>(w.linked_wall), w.type, w.flags, w.state, w.trigger, w.clip_num, w.keys, _SERIAL_UDT_WALL_D2X_MEMBERS));
+DEFINE_SERIAL_UDT_TO_MESSAGE(wall, w, (serial::sign_extend<int>(w.segnum), w.sidenum, serial::pad<3, 0>(), w.hps, w.linked_wall, serial::pad<2, 0>(), w.type, w.flags, w.state, w.trigger, w.clip_num, w.keys, _SERIAL_UDT_WALL_D2X_MEMBERS));
 ASSERT_SERIAL_UDT_MESSAGE_SIZE(wall, 24);
 
+namespace dsx {
 /*
  * reads a wall structure from a PHYSFS_File
  */
 void wall_read(PHYSFS_File *fp, wall &w)
 {
 	PHYSFSX_serialize_read(fp, w);
-	w.flags &= ~WALL_EXPLODING;
+	w.flags &= ~wall_flag::exploding;
+}
+
 }
 
 DEFINE_SERIAL_UDT_TO_MESSAGE(active_door, d, (d.n_parts, d.front_wallnum, d.back_wallnum, d.time));
@@ -1707,6 +1750,8 @@ void active_door_write(PHYSFS_File *fp, const active_door &ad)
 	PHYSFSX_serialize_write(fp, ad);
 }
 
+namespace dsx {
+
 void wall_write(PHYSFS_File *fp, const wall &w, short version)
 {
 	if (version <= 16)
@@ -1717,9 +1762,11 @@ void wall_write(PHYSFS_File *fp, const wall &w, short version)
 		PHYSFSX_serialize_write(fp, w);
 }
 
+}
+
 #if defined(DXX_BUILD_DESCENT_II)
-DEFINE_SERIAL_UDT_TO_MESSAGE(cloaking_wall, cw, (cw.front_wallnum, cw.back_wallnum, cw.front_ls, cw.back_ls, cw.time));
-ASSERT_SERIAL_UDT_MESSAGE_SIZE(cloaking_wall, 40);
+DEFINE_SERIAL_UDT_TO_MESSAGE(dsx::cloaking_wall, cw, (cw.front_wallnum, cw.back_wallnum, cw.front_ls, cw.back_ls, cw.time));
+ASSERT_SERIAL_UDT_MESSAGE_SIZE(dsx::cloaking_wall, 40);
 
 namespace dsx {
 void cloaking_wall_read(cloaking_wall &cw, PHYSFS_File *fp)

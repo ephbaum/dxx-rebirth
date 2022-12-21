@@ -45,13 +45,10 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "menu.h"
 #include "player.h"
 #include "screens.h"
-#include "cntrlcen.h"
-#include "mouse.h"
 #include "joy.h"
 #include "timer.h"
 #include "text.h"
-#include "rbaudio.h"
-#include "multi.h"
+#include "net_udp.h"
 #include "kmatrix.h"
 #include "gauges.h"
 #include "pcx.h"
@@ -59,30 +56,35 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "args.h"
 
 #include "compiler-range_for.h"
-
-#if DXX_USE_OGL
-#include "ogl_init.h"
-#endif
+#include "d_levelstate.h"
 
 #define CENTERING_OFFSET(x) ((300 - (70 + (x)*25 ))/2)
 #define CENTERSCREEN (SWIDTH/2)
 #define KMATRIX_VIEW_SEC 7 // Time after reactor explosion until new level - in seconds
-static void kmatrix_redraw_coop(fvcobjptr &vcobjptr);
 
-static void kmatrix_draw_item(fvcobjptr &vcobjptr, grs_canvas &canvas, const grs_font &cv_font, const int i, const playernum_array_t &sorted)
+namespace {
+
+enum class kmatrix_status_mode
 {
-	int x, y;
+	reactor_countdown_running,
+	level_finished,
+	mission_finished,
+};
 
-	y = FSPACY(50+i*9);
+static void kmatrix_redraw_coop(grs_canvas &canvas, fvcobjptr &vcobjptr, font_y_scale_float);
+
+static void kmatrix_draw_item(fvcobjptr &vcobjptr, grs_canvas &canvas, const grs_font &cv_font, const playernum_t i, const playernum_array_t &sorted, const font_y_scale_float fspacy)
+{
+	const auto y = fspacy(80 + i * 9);
 	const auto &&fspacx = FSPACX();
 	auto &p = *vcplayerptr(sorted[i]);
 	gr_string(canvas, cv_font, fspacx(CENTERING_OFFSET(N_players)), y, static_cast<const char *>(p.callsign));
 
 	const auto &&rgb10 = BM_XRGB(10, 10, 10);
 	const auto &&rgb25 = BM_XRGB(25, 25, 25);
-	for (int j=0; j<N_players; j++)
+	for (playernum_t j = 0; j < N_players; ++j)
 	{
-		x = fspacx(70 + CENTERING_OFFSET(N_players) + j * 25);
+		const auto x = fspacx(70 + CENTERING_OFFSET(N_players) + j * 25);
 
 		const auto kmij = kill_matrix[sorted[i]][sorted[j]];
 		if (sorted[i]==sorted[j])
@@ -114,87 +116,124 @@ static void kmatrix_draw_item(fvcobjptr &vcobjptr, grs_canvas &canvas, const grs
 				) * 100.0
 			);
 
-	x = fspacx(60 + CENTERING_OFFSET(N_players) + N_players * 25);
+	const auto x = fspacx(60 + CENTERING_OFFSET(N_players) + N_players * 25);
 	gr_set_fontcolor(canvas, rgb25, -1);
 	gr_printf(canvas, cv_font, x, y, "%4d/%i%%", player_info.net_kills_total, eff <= 0 ? 0 : eff);
 }
 
-static void kmatrix_draw_names(grs_canvas &canvas, const grs_font &cv_font, const playernum_array_t &sorted)
+static void kmatrix_draw_names(grs_canvas &canvas, const grs_font &cv_font, const playernum_array_t &sorted, const font_y_scale_float fspacy)
 {
-	int x;
-
 	const auto &&fspacx = FSPACX();
-	const auto &&fspacy = FSPACY();
+	const auto &&fspacy_header = fspacy(65);
 	const auto &&rgb31 = BM_XRGB(31, 31, 31);
-	for (int j=0; j<N_players; j++)
+	for (playernum_t j = 0; j < N_players; ++j)
 	{
-		x = fspacx(70 + CENTERING_OFFSET(N_players) + j * 25);
+		const auto x = fspacx(70 + CENTERING_OFFSET(N_players) + j * 25);
 
 		color_t c;
-		auto &p = *vcplayerptr(sorted[j]);
-		if (p.connected==CONNECT_DISCONNECTED)
+		const auto sj = sorted[j];
+		auto &p = *vcplayerptr(sj);
+		if (p.connected == player_connection_status::disconnected)
 			c = rgb31;
 		else
 		{
-			const auto color = get_player_or_team_color(sorted[j]);
+			const auto color = get_player_or_team_color(sj);
 			const auto &rgb = player_rgb[color];
 			c = BM_XRGB(rgb.r, rgb.g, rgb.b);
 		}
 		gr_set_fontcolor(canvas, c, -1);
-		gr_printf(canvas, cv_font, x, fspacy(40), "%c", p.callsign[0u]);
+		gr_printf(canvas, cv_font, x, fspacy_header, "%c", p.callsign[0u]);
 	}
-
-	x = fspacx(72 + CENTERING_OFFSET(N_players) + N_players * 25);
+	const auto x = fspacx(72 + CENTERING_OFFSET(N_players) + N_players * 25);
 	gr_set_fontcolor(canvas, rgb31, -1);
-	gr_string(canvas, cv_font, x, fspacy(40), "K/E");
+	gr_string(canvas, cv_font, x, fspacy_header, "K/E");
+	if (const auto m = Current_mission.get())
+	{
+		gr_string(canvas, cv_font, 0x8000, fspacy(30), m->mission_name.data());
+		if (const auto level_num = Current_level_num; level_num > 0 && level_num <= m->last_level)
+			gr_printf(canvas, cv_font, 0x8000, fspacy(42), "%s [%u/%u]", Current_level_name.line().data(), level_num, m->last_level);
+	}
 }
 
-static void kmatrix_draw_coop_names(grs_canvas &canvas, const grs_font &cv_font)
+static void kmatrix_draw_coop_names(grs_canvas &canvas, const grs_font &cv_font, const font_y_scale_float fspacy)
 {
 	gr_set_fontcolor(canvas, BM_XRGB(63, 31, 31),-1);
-	const auto &&fspacy40 = FSPACY(40);
 	const auto centerscreen = CENTERSCREEN;
-	gr_string(canvas, cv_font, centerscreen, fspacy40, "SCORE");
-	gr_string(canvas, cv_font, centerscreen + FSPACX(50), fspacy40, "DEATHS");
+	if (const auto m = Current_mission.get())
+	{
+		gr_string(canvas, cv_font, 0x8000, fspacy(30), m->mission_name.data());
+		if (const auto level_num = Current_level_num; level_num > 0 && level_num <= m->last_level)
+			gr_printf(canvas, cv_font, 0x8000, fspacy(42), "%s [%u/%u]", Current_level_name.line().data(), level_num, m->last_level);
+	}
+	const auto &&fspacy_header = fspacy(58);
+	gr_string(canvas, cv_font, centerscreen, fspacy_header, "SCORE");
+	gr_string(canvas, cv_font, centerscreen + FSPACX(50), fspacy_header, "DEATHS");
 }
 
-static void kmatrix_status_msg(grs_canvas &canvas, const fix time, const int reactor)
+static void kmatrix_status_msg(grs_canvas &canvas, const fix time, const kmatrix_status_mode message_mode)
 {
 	gr_set_fontcolor(canvas, gr_find_closest_color(255, 255, 255),-1);
 	auto &game_font = *GAME_FONT;
-	gr_printf(canvas, game_font, 0x8000, SHEIGHT - LINE_SPACING(game_font, game_font), reactor
+	gr_printf(canvas, game_font, 0x8000, SHEIGHT - LINE_SPACING(game_font, game_font),
+		message_mode == kmatrix_status_mode::reactor_countdown_running
 		? "Waiting for players to finish level. Reactor time: T-%d"
-		: "Level finished. Wait (%d) to proceed or ESC to Quit."
+		: (
+			message_mode == kmatrix_status_mode::level_finished
+			? (
+				time > 0
+				? "Level finished.  Wait %d seconds to proceed or press ESC to Quit."
+				: "Level finished.  Focus score screen to proceed."
+			)
+			: "Mission finished.  Press ESC to Quit."
+		)
 	, time);
 }
 
+}
+
+namespace dcx {
+
 namespace {
 
-struct kmatrix_screen : ignore_window_pointer_t
+struct kmatrix_window : window
 {
+	kmatrix_window(grs_canvas &src, int x, int y, int w, int h, kmatrix_result &result) :
+		window(src, x, y, w, h), result(result)
+	{
+	}
 	grs_main_bitmap background;
-	int network;
-	fix64 end_time;
-	int playing;
-        int aborted;
+	fix64 end_time = -1;
+	fix64 last_endlevel_time = 0;
+	kmatrix_network network;
+	kmatrix_result &result;
 };
 
 }
 
+}
+
 namespace dsx {
-static void kmatrix_redraw(kmatrix_screen *km)
+
+namespace {
+
+struct kmatrix_window : ::dcx::kmatrix_window
+{
+	using ::dcx::kmatrix_window::kmatrix_window;
+	virtual window_event_result event_handler(const d_event &) override;
+};
+
+static void kmatrix_redraw(grs_canvas &canvas, kmatrix_window *const km)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vcobjptr = Objects.vcptr;
 	playernum_array_t sorted;
 
-	gr_set_default_canvas();
-	auto &canvas = *grd_curcanv;
 	show_fullscr(canvas, km->background);
+	const auto &&fspacy = FSPACY();
 	
 	if (Game_mode & GM_MULTI_COOP)
 	{
-		kmatrix_redraw_coop(vcobjptr);
+		kmatrix_redraw_coop(canvas, vcobjptr, fspacy);
 	}
 	else
 	{
@@ -213,38 +252,41 @@ static void kmatrix_redraw(kmatrix_screen *km)
 
 		auto &game_font = *GAME_FONT;
 		multi_get_kill_list(sorted);
-		kmatrix_draw_names(canvas, game_font, sorted);
+		kmatrix_draw_names(canvas, game_font, sorted, fspacy);
 
 		for (int i=0; i<N_players; i++ )
 		{
-			if (vcplayerptr(sorted[i])->connected == CONNECT_DISCONNECTED)
+			if (vcplayerptr(sorted[i])->connected == player_connection_status::disconnected)
 				gr_set_fontcolor(canvas, gr_find_closest_color(31, 31, 31),-1);
 			else
 			{
 				const auto color = get_player_or_team_color(sorted[i]);
 				gr_set_fontcolor(canvas, BM_XRGB(player_rgb[color].r, player_rgb[color].g, player_rgb[color].b),-1);
 			}
-			kmatrix_draw_item(vcobjptr, canvas, game_font, i, sorted);
+			kmatrix_draw_item(vcobjptr, canvas, game_font, i, sorted, fspacy);
 		}
 	}
 
 	gr_palette_load(gr_palette);
 }
+
 }
 
-static void kmatrix_redraw_coop(fvcobjptr &vcobjptr)
+}
+
+namespace {
+
+static void kmatrix_redraw_coop(grs_canvas &canvas, fvcobjptr &vcobjptr, const font_y_scale_float fspacy)
 {
 	playernum_array_t sorted;
 
 	multi_sort_kill_list();
-	auto &canvas = *grd_curcanv;
 	auto &medium3_font = *MEDIUM3_FONT;
 	gr_string(canvas, medium3_font,  0x8000, FSPACY(10), "COOPERATIVE SUMMARY");
 	multi_get_kill_list(sorted);
 	auto &game_font = *GAME_FONT;
-	kmatrix_draw_coop_names(canvas, game_font);
 	const auto &&fspacx = FSPACX();
-	const auto &&fspacy = FSPACY();
+	kmatrix_draw_coop_names(canvas, game_font, fspacy);
 	const auto x_callsign = fspacx(CENTERING_OFFSET(N_players));
 	const auto x_centerscreen = CENTERSCREEN;
 	const auto &&fspacx50 = fspacx(50);
@@ -254,7 +296,7 @@ static void kmatrix_redraw_coop(fvcobjptr &vcobjptr)
 	{
 		auto &plr = *vcplayerptr(sorted[i]);
 		int r, g, b;
-		if (plr.connected == CONNECT_DISCONNECTED)
+		if (plr.connected == player_connection_status::disconnected)
 			r = g = b = 31;
 		else
 		{
@@ -265,7 +307,7 @@ static void kmatrix_redraw_coop(fvcobjptr &vcobjptr)
 		}
 		gr_set_fontcolor(canvas, gr_find_closest_color(r, g, b), -1);
 
-		const auto &&y = fspacy(50 + i * 9);
+		const auto &&y = fspacy(80 + i * 9);
 		gr_string(canvas, game_font, x_callsign, y, static_cast<const char *>(plr.callsign));
 		gr_set_fontcolor(canvas, rgb60_40_10, -1);
 		auto &player_info = vcobjptr(plr.objnum)->ctype.player_info;
@@ -276,10 +318,14 @@ static void kmatrix_redraw_coop(fvcobjptr &vcobjptr)
 	gr_palette_load(gr_palette);
 }
 
+}
+
 namespace dsx {
-static window_event_result kmatrix_handler(window *, const d_event &event, kmatrix_screen *km)
+
+window_event_result kmatrix_window::event_handler(const d_event &event)
 {
-	int k = 0, choice = 0;
+	auto &LevelUniqueControlCenterState = LevelUniqueObjectState.ControlCenterState;
+	int k = 0;
 	
 	switch (event.type)
 	{
@@ -289,87 +335,101 @@ static window_event_result kmatrix_handler(window *, const d_event &event, kmatr
 			{
 				case KEY_ESC:
 					{
-						array<newmenu_item, 2> nm_message_items{{
-							nm_item_menu(TXT_YES),
-							nm_item_menu(TXT_NO),
-						}};
-						choice = newmenu_do(nullptr, TXT_ABORT_GAME, nm_message_items, km->network ? get_multi_endlevel_poll2() : unused_newmenu_subfunction, unused_newmenu_userdata);
+						using items_type = std::array<newmenu_item, 2>;
+						struct abort_game_menu : items_type, passive_newmenu
+						{
+							abort_game_menu(grs_canvas &canvas) :
+								items_type{{
+									newmenu_item::nm_item_menu{TXT_YES},
+									newmenu_item::nm_item_menu{TXT_NO},
+								}},
+								passive_newmenu(menu_title{nullptr}, menu_subtitle{TXT_ABORT_GAME}, menu_filename{nullptr}, tiny_mode_flag::normal, tab_processing_flag::ignore, adjusted_citem::create(*static_cast<items_type *>(this), 0), canvas)
+							{
+							}
+						};
+						if (run_blocking_newmenu<abort_game_menu>(*grd_curcanv) != 0)
+							return window_event_result::handled;
 					}
-					
-					if (choice==0)
 					{
-						get_local_player().connected=CONNECT_DISCONNECTED;
+						get_local_player().connected = player_connection_status::disconnected;
 						
-						if (km->network)
-							multi_send_endlevel_packet();
+						if (network != kmatrix_network::offline)
+							multi::dispatch->send_endlevel_packet();
 						
 						multi_leave_game();
-                                                km->aborted = 1;
+						this->result = kmatrix_result::abort;
 
 						return window_event_result::close;
 					}
-					return window_event_result::handled;
-					
 				default:
 					break;
 			}
 			break;
 			
 		case EVENT_WINDOW_DRAW:
+			{
 			timer_delay2(50);
+			gr_set_default_canvas();
+			kmatrix_redraw(*grd_curcanv, this);
 
-			if (km->network)
-				multi_do_protocol_frame(0, 1);
-			
-			km->playing = 0;
+			if (network != kmatrix_network::offline)
+				multi::dispatch->do_protocol_frame(0, 1);
+			kmatrix_status_mode playing = (Current_level_num == Current_mission->last_level)
+				? kmatrix_status_mode::mission_finished
+				: kmatrix_status_mode::level_finished;
 
 			// Check if all connected players are also looking at this screen ...
 			range_for (auto &i, Players)
-				if (i.connected)
-					if (i.connected != CONNECT_END_MENU && i.connected != CONNECT_DIED_IN_MINE)
+					if (i.connected != player_connection_status::disconnected && i.connected != player_connection_status::end_menu && i.connected != player_connection_status::died_in_mine)
 					{
-						km->playing = 1;
+						playing = kmatrix_status_mode::reactor_countdown_running;
 						break;
 					}
 			
 			// ... and let the reactor blow sky high!
-			if (!km->playing)
-				Countdown_seconds_left = -1;
+			if (playing != kmatrix_status_mode::reactor_countdown_running)
+			{
+				LevelUniqueControlCenterState.Countdown_seconds_left = -1;
 			
 			// If Reactor is finished and end_time not inited, set the time when we will exit this loop
-			if (km->end_time == -1 && Countdown_seconds_left < 0 && !km->playing)
-				km->end_time = timer_query() + (KMATRIX_VIEW_SEC * F1_0);
-			
+				if (end_time == -1)
+					end_time = timer_query() + (KMATRIX_VIEW_SEC * F1_0);
+			}
+
 			// Check if end_time has been reached and exit loop
-			if (timer_query() >= km->end_time && km->end_time != -1)
+			if (end_time != -1 && timer_query() >= end_time && this == window_get_front())
 			{
-				if (km->network)
-					multi_send_endlevel_packet();  // make sure
-				
+				if (network != kmatrix_network::offline)
+					multi::dispatch->send_endlevel_packet();  // make sure
+
 #if defined(DXX_BUILD_DESCENT_II)
 				if (is_D2_OEM)
 				{
 					if (Current_level_num==8)
 					{
-						get_local_player().connected=CONNECT_DISCONNECTED;
-						
-						if (km->network)
-							multi_send_endlevel_packet();
-						
+						get_local_player().connected = player_connection_status::disconnected;
 						multi_leave_game();
-                                                km->aborted = 1;
+						this->result = kmatrix_result::abort;
 					}
 				}
 #endif
-				return window_event_result::close;
+				if (playing != kmatrix_status_mode::mission_finished)
+					return window_event_result::close;
 			}
 
-			kmatrix_redraw(km);
-			kmatrix_status_msg(*grd_curcanv, km->playing ? Countdown_seconds_left : f2i(timer_query() - km->end_time), km->playing);
+			// If Control_center_destroyed is still true this is handled by do_protocol_frame
+			if (timer_query() >= last_endlevel_time + F1_0 && !LevelUniqueObjectState.ControlCenterState.Control_center_destroyed)
+			{
+				last_endlevel_time = timer_query();
+				multi::dispatch->send_endlevel_packet();
+			}
+
+			kmatrix_status_msg(*grd_curcanv, playing == kmatrix_status_mode::reactor_countdown_running ? LevelUniqueControlCenterState.Countdown_seconds_left : f2i(end_time - timer_query()), playing);
 			break;
+			}
 			
 		case EVENT_WINDOW_CLOSE:
-			game_flush_inputs();
+			game_flush_inputs(Controls);
 			newmenu_free_background();
 			break;
 			
@@ -378,38 +438,34 @@ static window_event_result kmatrix_handler(window *, const d_event &event, kmatr
 	}
 	return window_event_result::ignored;
 }
-}
 
-kmatrix_result kmatrix_view(int network)
+kmatrix_result kmatrix_view(const kmatrix_network network, control_info &Controls)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vcobjptridx = Objects.vcptridx;
-	kmatrix_screen km;
-	if (pcx_read_bitmap(STARS_BACKGROUND, km.background, gr_palette) != PCX_ERROR_NONE)
+	kmatrix_result result = kmatrix_result::proceed;
 	{
-		return kmatrix_result::abort;
-	}
+	const auto pkm = window_create<kmatrix_window>(grd_curscreen->sc_canvas, 0, 0, SWIDTH, SHEIGHT, result);
+	auto &km = *pkm;
+	pcx_read_bitmap_or_default(STARS_BACKGROUND, km.background, gr_palette);
 	gr_palette_load(gr_palette);
-	
+
 	km.network = network;
-	km.end_time = -1;
-	km.playing = 0;
-        km.aborted = 0;
 	
 	set_screen_mode( SCREEN_MENU );
-	game_flush_inputs();
+	game_flush_inputs(Controls);
 
 	range_for (auto &i, Players)
 		if (i.objnum != object_none)
 			digi_kill_sound_linked_to_object(vcobjptridx(i.objnum));
 
-	const auto wind = window_create(grd_curscreen->sc_canvas, 0, 0, SWIDTH, SHEIGHT, kmatrix_handler, &km);
-	if (!wind)
-	{
-		return kmatrix_result::abort;
-	}
-	
 	event_process_all();
+	}
+	/* After event_process_all returns, kmatrix_window has been freed
+	 * and cannot be accessed.  The result is therefore stored in a
+	 * stack local, which will persist.
+	 */
+	return result;
+}
 
-	return (km.aborted ? kmatrix_result::abort : kmatrix_result::proceed);
 }

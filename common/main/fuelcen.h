@@ -28,13 +28,15 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #ifdef __cplusplus
 #include "pack.h"
 #include "fwd-object.h"
+#include "fwd-robot.h"
 #include "fwd-segment.h"
 #include "fwd-vecmat.h"
+#include "d_array.h"
 
 //------------------------------------------------------------
 // A refueling center is one segment... to identify it in the
 // segment structure, the "special" field is set to
-// SEGMENT_IS_FUELCEN.  The "value" field is then used for how
+// segment_special::fuelcen.  The "value" field is then used for how
 // much fuel the center has left, with a maximum value of 100.
 
 //-------------------------------------------------------------
@@ -64,10 +66,7 @@ void fuelcen_create( vmsegptridx_t segp);
 // a segment is loaded from disk.
 void fuelcen_activate(vmsegptridx_t segp);
 // Deletes a segment as a fuel center.
-void fuelcen_delete(vmsegptr_t segp);
-
-// Create a matcen robot
-imobjptridx_t create_morph_robot(vmsegptridx_t segp, const vms_vector &object_pos, unsigned object_id);
+void fuelcen_delete(shared_segment &segp);
 
 // Returns the amount of fuel/shields this segment can give up.
 // Can be from 0 to 100.
@@ -75,16 +74,7 @@ fix fuelcen_give_fuel(const shared_segment &segp, fix MaxAmountCanTake);
 }
 
 // Call once per frame.
-void fuelcen_update_all();
-
-// Called to repair an object
-//--repair-- int refuel_do_repair_effect( object * obj, int first_time, int repair_seg );
-
-namespace dsx {
-#if defined(DXX_BUILD_DESCENT_II)
-fix repaircen_give_shields(const shared_segment &segp, fix MaxAmountCanTake);
-#endif
-}
+void fuelcen_update_all(const d_robot_info_array &Robot_info);
 #endif
 
 //--repair-- //do the repair center for this frame
@@ -102,7 +92,7 @@ namespace dcx {
 struct FuelCenter : public prohibit_void_ptr<FuelCenter>
 {
 	segnum_t     segnum;
-	uint8_t     Type;
+	segment_special     Type;
 	sbyte   Flag;
 	sbyte   Enabled;
 	sbyte   Lives;          // Number of times this can be enabled.
@@ -114,20 +104,23 @@ struct FuelCenter : public prohibit_void_ptr<FuelCenter>
 // The max number of robot centers per mine.
 struct d1_matcen_info : public prohibit_void_ptr<d1_matcen_info>
 {
-	array<unsigned, 1>     robot_flags;    // Up to 32 different robots
+	std::array<unsigned, 1>     robot_flags;    // Up to 32 different robots
 	segnum_t   segnum;         // Segment this is attached to.
-	short   fuelcen_num;    // Index in fuelcen array.
+	station_number fuelcen_num;    // Index in fuelcen array.
 };
 
 struct d_level_unique_fuelcenter_state
 {
 	unsigned Num_fuelcenters;
 	// Original D1 size: 50, Original D2 size: 70
-	array<FuelCenter, 128> Station;
+	enumerated_array<FuelCenter, 128, station_number> Station;
 };
 
 extern d_level_unique_fuelcenter_state LevelUniqueFuelcenterState;
 
+#ifdef dsx
+fix repaircen_give_shields(const shared_segment &segp, fix MaxAmountCanTake);
+#endif
 }
 
 #ifdef dsx
@@ -138,21 +131,23 @@ void matcen_info_read(PHYSFS_File *fp, matcen_info &ps, int version);
 #elif defined(DXX_BUILD_DESCENT_II)
 struct matcen_info : public prohibit_void_ptr<matcen_info>
 {
-	array<unsigned, 2>     robot_flags; // Up to 64 different robots
+	std::array<unsigned, 2>     robot_flags; // Up to 64 different robots
 	segnum_t   segnum;         // Segment this is attached to.
-	short   fuelcen_num;    // Index in fuelcen array.
+	station_number fuelcen_num;    // Index in fuelcen array.
 };
 
 void matcen_info_read(PHYSFS_File *fp, matcen_info &ps);
 #endif
 
-extern const char Special_names[MAX_CENTER_TYPES][11];
+#if DXX_USE_EDITOR
+extern const enumerated_array<char[11], MAX_CENTER_TYPES, segment_special> Special_names;
+#endif
 
 struct d_level_shared_robotcenter_state
 {
 	unsigned Num_robot_centers;
 	// Original D1/D2 size: 20
-	array<matcen_info, 128> RobotCenters;
+	enumerated_array<matcen_info, 128, materialization_center_number> RobotCenters;
 };
 
 extern d_level_shared_robotcenter_state LevelSharedRobotcenterState;
@@ -181,7 +176,6 @@ void matcen_info_write(PHYSFS_File *fp, const matcen_info &mi, short version);
 }
 
 namespace dcx {
-constexpr std::integral_constant<uint8_t, 0xff> station_none{};
 extern const fix EnergyToCreateOneRobot;
 }
 #endif

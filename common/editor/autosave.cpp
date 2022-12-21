@@ -46,14 +46,42 @@ namespace dcx {
 #define AUTOSAVE_PERIOD 5			// Number of minutes for timed autosave
 
 int		Autosave_count;
+
+namespace {
+
 static int Autosave_numfiles;
 static int Autosave_total;
 static int undo_count;
 
+const char *set_autosave_name(mine_filename_type &out, const std::array<char, PATH_MAX> &in, const unsigned i)
+{
+	d_strupr(out, in);
+	char *ext;
+#define DXX_AUTOSAVE_MINE_EXTENSION	".MIN"
+	if (!strcmp(out.data(), "*" DXX_AUTOSAVE_MINE_EXTENSION))
+	{
+#define DXX_DEFAULT_AUTOSAVE_MINE_NAME	"TEMP" DXX_AUTOSAVE_MINE_EXTENSION
+		strcpy(out.data(), DXX_DEFAULT_AUTOSAVE_MINE_NAME);
+		ext = &out[sizeof(DXX_DEFAULT_AUTOSAVE_MINE_NAME) - sizeof(DXX_AUTOSAVE_MINE_EXTENSION)];
+	}
+	else
+	{
+		ext = strstr(out.data(), DXX_AUTOSAVE_MINE_EXTENSION);
+		if (!ext)
+			return ext;
+	}
+#undef DXX_AUTOSAVE_MINE_EXTENSION
+	cf_assert(i < 10);
+	snprintf(ext + 2, 3, "%u", i);
+	return ext;
+}
+
 static int Timer_save_flag;
+
+}
 int		Autosave_flag;
 
-array<const char *, 10> undo_status;
+std::array<const char *, 10> undo_status;
 
 void init_autosave(void) {
 //    int i;
@@ -66,40 +94,22 @@ void init_autosave(void) {
 }
 
 void close_autosave(void) {
-    char *ext;
-
 	const unsigned t = Autosave_total;
 	cf_assert(t < 10);
 	for (unsigned i = 0; i < t; ++i)
 	{
-
-		char delname[PATH_MAX];
-
-        strcpy ( delname, mine_filename );
-        d_strupr( delname );
-	if ( !strcmp(delname, "*.MIN") ) strcpy(delname, "TEMP.MIN");
-
-        ext = strstr(delname, ".MIN");
-        snprintf(ext + 2, 3, "%d", i);
-
-        remove( delname );
+		mine_filename_type delname;
+		if (set_autosave_name(delname, mine_filename, i))
+			PHYSFS_delete(delname.data());
     }
 }
 
-void autosave_mine(const char *name) {
-    char *ext;
-
+void autosave_mine(const std::array<char, PATH_MAX> &name)
+{
 	if (Autosave_flag) {
-	
-		char savename[PATH_MAX];
-
-	
-	    strcpy ( savename, name );
-	    d_strupr( savename );
-	    if ( !strcmp(savename, "*.MIN") ) strcpy(savename, "TEMP.MIN");
-	
-	    ext = strstr(savename, ".MIN");
-	    snprintf(ext + 2, 3, "%d", Autosave_count);
+		mine_filename_type savename;
+		if (!set_autosave_name(savename, name, Autosave_count))
+			return;
 	
 	    med_save_mine( savename );
 	    Autosave_count++;
@@ -109,27 +119,26 @@ void autosave_mine(const char *name) {
 	        Autosave_numfiles++;
 	    if (Autosave_total < 10)
 	        Autosave_total++;
-	
 	}
-
 }
 
 tm Editor_time_of_day;
 
-static void print_clock()
+namespace {
+
+static void print_clock(grs_canvas &canvas, const grs_font &cv_font)
 {
-	int w, h;
-	gr_set_default_canvas();
-	auto &canvas = *grd_curcanv;
 	gr_set_fontcolor(canvas, CBLACK, CGREY);
-	array<char, 20> message;
+	std::array<char, 20> message;
 	if (!strftime(message.data(), message.size(), "%m-%d %H:%M:%S", &Editor_time_of_day))
 		message[0] = 0;
-	gr_get_string_size(*canvas.cv_font, message.data(), &w, &h, nullptr);
-	const uint8_t color = CGREY;
+	const auto &&[w, h] = gr_get_string_size(cv_font, message.data());
+	const auto color = CGREY;
 	gr_rect(canvas, 700, 0, 799, h + 1, color);
-	gr_string(canvas, *canvas.cv_font, 700, 0, message.data(), w, h);
+	gr_string(canvas, cv_font, 700, 0, message.data(), w, h);
 	gr_set_fontcolor(canvas, CBLACK, CWHITE);
+}
+
 }
 
 void set_editor_time_of_day()
@@ -140,10 +149,12 @@ void set_editor_time_of_day()
 	Editor_time_of_day = *localtime( &ltime );
 }
 
-void TimedAutosave(const char *name) 
+void TimedAutosave(const std::array<char, PATH_MAX> &name)
 {
+	auto &canvas = grd_curscreen->sc_canvas;
+	gr_set_current_canvas(canvas);
 	{
-		print_clock();
+		print_clock(canvas, *canvas.cv_font);
 	}
 	
 

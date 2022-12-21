@@ -60,19 +60,24 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #ifdef __cplusplus
 #include "dxxsconf.h"
 #include "dsx-ns.h"
-#include "compiler-array.h"
+#include <array>
 struct callsign_t;
 
 #define N_PLAYER_GUNS 8
 #define N_PLAYER_SHIP_TEXTURES 32
 
 namespace dcx {
+enum class player_connection_status : uint8_t;
 struct player_ship;
 
 struct player;
 using playernum_t = uint32_t;
 constexpr unsigned MAX_PLAYERS = 8;
-typedef array<playernum_t, MAX_PLAYERS> playernum_array_t;
+template <typename T>
+	using per_player_array = std::array<T, MAX_PLAYERS>;
+using playernum_array_t = per_player_array<playernum_t>;
+template <typename T>
+	using per_team_array = std::array<T, 2>;
 
 extern unsigned N_players;   // Number of players ( >1 means a net game, eh?)
 extern playernum_t Player_num;  // The player number who is on the console.
@@ -84,7 +89,6 @@ namespace dsx {
 struct player_rw;
 struct player_info;
 void player_rw_swap(player_rw *p, int swap);
-int allowed_to_fire_flare(player_info &);
 int allowed_to_fire_missile(const player_info &);
 #if defined(DXX_BUILD_DESCENT_II)
 fix get_omega_energy_consumption(fix delta_charge);

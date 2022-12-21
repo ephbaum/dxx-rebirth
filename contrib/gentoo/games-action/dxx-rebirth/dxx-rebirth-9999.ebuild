@@ -1,21 +1,35 @@
+# Copyright 2017-2020 Rebirth contributors
 # Distributed under the terms of the GNU General Public License v2
+
+# This file is part of the DXX-Rebirth project.
 #
-# After release 0.58.1 and before beta release 0.59.100, upstream
-# combined the source for the Descent 1 and Descent 2 engines into a
-# single tree.  The combined tree builds common code into a static
-# library, which is linked into both games, but not installed.  Users
-# who want both engines benefit from this because they can build the
-# common code once, rather than once per game.  This ebuild supports
-# building one or both engines, depending on USE=d1x and USE=d2x.
+# It is copyright by its individual contributors, as recorded in the
+# project's Git history.  See COPYING.txt at the top level for license
+# terms and a link to the Git history.
 
-EAPI=6
+EAPI=7
+PYTHON_COMPAT=( python3_10 )
 
-inherit eutils scons-utils toolchain-funcs xdg
+inherit desktop eutils python-any-r1 scons-utils toolchain-funcs xdg
 if [[ "$PV" = 9999 ]]; then
 	inherit git-r3
 	EGIT_REPO_URI="https://github.com/dxx-rebirth/dxx-rebirth"
+	# Live ebuilds have blank keywords.
+	KEYWORDS=
 else
-	SRC_URI="https://github.com/dxx-rebirth/dxx-rebirth/archive/$PV.zip -> $PN-$PVR.zip"
+	MY_COMMIT=''
+	S="$WORKDIR/$PN-$MY_COMMIT"
+	SRC_URI="https://codeload.github.com/dxx-rebirth/dxx-rebirth/tar.gz/$MY_COMMIT -> $PN-$PVR.tar.gz"
+	unset MY_COMMIT
+
+	# Other architectures are reported to work, but not tested regularly by
+	# the core team.
+	#
+	# Raspberry Pi support is tested by an outside contributor, and his
+	# fixes are merged into the main source by upstream.
+	#
+	# Cross-compilation to Windows is also supported.
+	KEYWORDS="~amd64 ~x86"
 
 	# Restriction only for use in private overlays.  When this is added to a
 	# public tree, post the sources to a mirror and remove this restriction.
@@ -27,19 +41,18 @@ HOMEPAGE="https://www.dxx-rebirth.com/"
 
 LICENSE="DXX-Rebirth GPL-3"
 SLOT="0"
-# Other architectures are reported to work, but not tested regularly by
-# the core team.
-#
-# Raspberry Pi support is tested by an outside contributor, and his
-# fixes are merged into the main source by upstream.
-#
-# Cross-compilation to Windows is also supported.
-KEYWORDS="amd64 x86"
+
 # Default to building both game engines.  The total size is relatively
 # small.
-IUSE="+d1x +d2x debug editor +flac ipv6 +joystick l10n_de +midi +mp3 +music +opengl opl3-musicpack +png sc55-musicpack sdl2 tracker +vorbis"
+IUSE="+d1x +d2x +data debug editor +flac ipv6 +joystick l10n_de +midi +mp3 +music +opengl opl3-musicpack +png sc55-musicpack sdl2 tracker valgrind +vorbis"
 
-DEPEND="dev-games/physfs[hog,mvl,zip]
+# Game data is stored in HOG files.
+# Game movies are in MVL files.
+# Various add-ons use zip files to bundle their content together.
+#
+# PNG support enables writing screenshots as PNG instead of TGA (for
+# USE=opengl) or PCX (for USE=-opengl).
+DEPEND=">=dev-games/physfs-3[hog,mvl,zip]
 	opengl? (
 		virtual/opengl
 		virtual/glu )
@@ -67,7 +80,7 @@ DXX_RDEPEND_USE_FREEDATA_FRAGMENT='
 '
 # Block <0.59.100 due to file collision.
 #
-# Require game data package.
+# If USE=data, then require a game data package.
 # The build process does not use the game data, nor change how the game
 # is built based on what game data will be used.  At startup, the game
 # will search for both types of game data and use what it finds.  Users
@@ -80,9 +93,11 @@ DXX_RDEPEND_USE_FREEDATA_FRAGMENT='
 DXX_RDEPEND_ENGINE_FRAGMENT='
 	d${ENGINE}x? (
 		!<games-action/d${ENGINE}x-rebirth-0.59.100
-		|| (
-			games-action/descent${ENGINE}-data
-			games-action/descent${ENGINE}-demodata
+		data? (
+			|| (
+				games-action/descent${ENGINE}-data
+				games-action/descent${ENGINE}-demodata
+			)
 		)
 		'"
 		${DXX_RDEPEND_USE_FREEDATA_FRAGMENT//\$\{USE\}/l10n_de}
@@ -94,6 +109,7 @@ DXX_RDEPEND_ENGINE_FRAGMENT='
 
 DXX_DEPEND_USE_SDL_VERSION_FRAGMENT='
 	media-libs/lib${SDL_version}[joystick?,opengl?,sound,video]
+	media-libs/${SDL_version}-image
 	music? ( media-libs/${SDL_version}-mixer )
 '
 DXX_RDEPEND_USE_SDL_VERSION_FRAGMENT='
@@ -114,6 +130,13 @@ RDEPEND="${DEPEND}
 "
 unset DXX_RDEPEND_ENGINE_FRAGMENT
 unset DXX_RDEPEND_USE_SDL_VERSION_FRAGMENT
+# USE=valgrind enables use of a Valgrind header.  A build with valgrind
+# instrumentation can be run without installing Valgrind, so this
+# dependency is only in DEPEND, instead of being in both DEPEND and
+# RDEPEND.
+DEPEND+='
+	valgrind? ( dev-util/valgrind )
+'
 
 # This ebuild builds d1x-rebirth, d2x-rebirth, or both.  Building none
 # would mean this ebuild installs zero files.
@@ -177,13 +200,13 @@ dxx_scons() {
 	)
 	if use editor; then
 		scons_build_profile+=+e
-		mysconsargs+=( 
+		mysconsargs+=( \
 			e_builddir=build/editor/
 			e_editor=1
 		)
 	fi
 	if ! use joystick; then
-		mysconsargs+=(
+		mysconsargs+=( \
 			max_joysticks=0
 		)
 	fi
@@ -193,6 +216,7 @@ dxx_scons() {
 	# named profile would be used.
 	use d1x && mysconsargs+=( d1x_sharepath="/usr/share/games/d1x" d1x="$scons_build_profile,site," )
 	use d2x && mysconsargs+=( d2x_sharepath="/usr/share/games/d2x" d2x="$scons_build_profile,site," )
+	use valgrind && mysconsargs+=( poison=valgrind )
 	escons "${mysconsargs[@]}" "$@"
 }
 
@@ -216,4 +240,17 @@ src_install() {
 		make_desktop_entry "${PROGRAM}" "Descent ${DV} Rebirth" "${PROGRAM}"
 		doicon "${PROGRAM}/${PROGRAM}.xpm"
 	done
+}
+
+pkg_postinst() {
+	xdg_pkg_postinst
+	if ! use data; then
+		elog "$PN requires game data to play."
+		elog "Game data is not included in this package.  To play the game,"
+		elog "emerge the packages required by USE=data or install the game"
+		elog "data by hand."
+		elog
+		elog "Changing USE=data does not change how this package is built,"
+		elog "only its runtime dependencies."
+	fi
 }

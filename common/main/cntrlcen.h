@@ -27,43 +27,63 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #include <physfs.h>
 
-#ifdef __cplusplus
 #include "fwd-object.h"
 #include "pack.h"
+#include "fwd-robot.h"
 #include "fwd-segment.h"
 #include "fwd-window.h"
 
 #include "fwd-partial_range.h"
 
+namespace dcx {
+
 struct control_center_triggers : public prohibit_void_ptr<control_center_triggers>
 {
-	enum {
-		max_links = 10
-	};
-	uint16_t num_links;
-	array<segnum_t, max_links>   seg;
-	array<uint16_t, max_links>   side;
+	static constexpr std::integral_constant<std::size_t, 10> max_links{};
+	uint8_t num_links;
+	std::array<segnum_t, max_links>   seg;
+	std::array<sidenum_t, max_links>  side;
 };
 
+struct v1_control_center_triggers
+{
+	v1_control_center_triggers(PHYSFS_File *);
+	v1_control_center_triggers(const control_center_triggers &);
+	static constexpr std::integral_constant<std::size_t, 10> max_links{};
+	uint16_t num_links;
+	std::array<segnum_t, max_links>   seg;
+	std::array<uint16_t, max_links>   side;
+};
+static_assert(sizeof(v1_control_center_triggers) == (2 + (2 * 10) + (2 * 10)));
 extern control_center_triggers ControlCenterTriggers;
+
+/*
+ * reads 1 control_center_triggers struct from a PHYSFS_File
+ */
+void control_center_triggers_read(control_center_triggers &cct, PHYSFS_File *fp);
+void control_center_triggers_write(const control_center_triggers &cct, PHYSFS_File *fp);
+
+}
 
 #ifdef dsx
 #include "vecmat.h"
+
+namespace dsx {
+
 struct reactor {
 #if defined(DXX_BUILD_DESCENT_II)
-	int model_num;
+	polygon_model_index model_num;
 #endif
 	int n_guns;
 	/* Location of the gun on the reactor model */
-	array<vms_vector, MAX_CONTROLCEN_GUNS> gun_points;
+	std::array<vms_vector, MAX_CONTROLCEN_GUNS> gun_points;
 	/* Orientation of the gun on the reactor model */
-	array<vms_vector, MAX_CONTROLCEN_GUNS> gun_dirs;
+	std::array<vms_vector, MAX_CONTROLCEN_GUNS> gun_dirs;
 };
 
 // fills in arrays gun_points & gun_dirs, returns the number of guns read
 void read_model_guns(const char *filename, reactor &);
 
-namespace dsx {
 #if defined(DXX_BUILD_DESCENT_I)
 constexpr std::integral_constant<unsigned, 1> MAX_REACTORS{};
 constexpr std::integral_constant<unsigned, 1> Num_reactors{};
@@ -71,9 +91,15 @@ constexpr std::integral_constant<unsigned, 1> Num_reactors{};
 constexpr std::integral_constant<unsigned, 7> MAX_REACTORS{};
 #define DEFAULT_CONTROL_CENTER_EXPLOSION_TIME 30    // Note: Usually uses Alan_pavlish_reactor_times, but can be overridden in editor.
 
+struct d_level_shared_control_center_state
+{
+	int Base_control_center_explosion_time;      // how long to blow up on insane
+	int Reactor_strength;
+};
+
+extern d_level_shared_control_center_state LevelSharedControlCenterState;
+
 extern unsigned Num_reactors;
-extern int Base_control_center_explosion_time;      // how long to blow up on insane
-extern int Reactor_strength;
 
 /*
  * reads n reactor structs from a PHYSFS_File
@@ -81,12 +107,12 @@ extern int Reactor_strength;
 void reactor_read_n(PHYSFS_File *fp, partial_range_t<reactor *> r);
 #endif
 
-extern array<reactor, MAX_REACTORS> Reactors;
+extern std::array<reactor, MAX_REACTORS> Reactors;
 
-static inline int get_reactor_model_number(int id)
+static inline polygon_model_index get_reactor_model_number(const uint8_t id)
 {
 #if defined(DXX_BUILD_DESCENT_I)
-	return id;
+	return polygon_model_index{id};
 #elif defined(DXX_BUILD_DESCENT_II)
 	return Reactors[id].model_num;
 #endif
@@ -101,40 +127,13 @@ static inline reactor &get_reactor_definition(int id)
 	return Reactors[id];
 #endif
 }
-}
-
-namespace dcx {
-//@@extern int N_controlcen_guns;
-extern int Control_center_been_hit;
-extern int Control_center_player_been_seen;
-extern int Control_center_next_fire_time;
-extern int Control_center_present;
-extern objnum_t Dead_controlcen_object_num;
-}
-
-namespace dsx {
-// do whatever this thing does in a frame
-void do_controlcen_frame(vmobjptridx_t obj);
 
 // Initialize control center for a level.
 // Call when a new level is started.
-void init_controlcen_for_level();
+void init_controlcen_for_level(const d_robot_info_array &Robot_info);
 void calc_controlcen_gun_point(object &obj);
 
-void do_controlcen_destroyed_stuff(imobjptridx_t objp);
+void do_controlcen_destroyed_stuff(imobjidx_t objp);
 window_event_result do_controlcen_dead_frame();
 }
-#endif
-
-namespace dcx {
-extern fix Countdown_timer;
-extern int Control_center_destroyed, Countdown_seconds_left, Total_countdown_time;
-}
-
-/*
- * reads n control_center_triggers structs from a PHYSFS_File
- */
-void control_center_triggers_read(control_center_triggers *cct, PHYSFS_File *fp);
-void control_center_triggers_write(const control_center_triggers *cct, PHYSFS_File *fp);
-
 #endif

@@ -20,20 +20,13 @@
 #include <cassert>
 #endif
 
-namespace detail
-{
-
-template <typename>
-struct unspecified_pointer_t;
-
-};
-
 namespace dsx {
 
 template <typename T>
 class segment_object_range_t
 {
 	class iterator;
+	class sentinel;
 	const iterator b;
 public:
 	segment_object_range_t(iterator &&o) :
@@ -41,12 +34,12 @@ public:
 	{
 	}
 	const iterator &begin() const { return b; }
-	static iterator end() { return T(object_none, static_cast<typename T::allow_none_construction *>(nullptr)); }
+	static sentinel end() { return {}; }
 	template <typename OF, typename SF>
 		static segment_object_range_t construct(const unique_segment &s, OF &of, SF &sf)
 		{
 			if (s.objects == object_none)
-				return end();
+				return iterator(T(object_none, static_cast<typename T::allow_none_construction *>(nullptr)));
 			auto &&opi = of(s.objects);
 			const object_base &o = opi;
 #if DXX_SEGITER_DEBUG_OBJECT_LINKAGE
@@ -72,13 +65,22 @@ public:
 };
 
 template <typename T>
+class segment_object_range_t<T>::sentinel
+{
+};
+
+template <typename T>
 class segment_object_range_t<T>::iterator :
-	public std::iterator<std::forward_iterator_tag, T, std::ptrdiff_t, typename detail::unspecified_pointer_t<T>, T>,
 	T
 {
 	using T::m_ptr;
 	using T::m_idx;
 public:
+	using iterator_category = std::forward_iterator_tag;
+	using value_type = T;
+	using difference_type = std::ptrdiff_t;
+	using pointer = void;
+	using reference = T;
 	iterator(T &&o) :
 		T(std::move(o))
 	{
@@ -115,18 +117,18 @@ public:
 		}
 		return *this;
 	}
-	bool operator==(const iterator &rhs) const
+	constexpr bool operator==(const iterator &rhs) const
 	{
 		return m_idx == rhs.m_idx;
 	}
-	bool operator!=(const iterator &rhs) const
+	constexpr bool operator==(const sentinel &) const
 	{
-		return !(*this == rhs);
+		return m_idx == object_none;
 	}
 };
 
 template <typename OF, typename SF, typename R = segment_object_range_t<decltype(std::declval<OF &>()(object_first))>>
-__attribute_warn_unused_result
+[[nodiscard]]
 static inline R objects_in(const unique_segment &s, OF &of, SF &sf)
 {
 	return R::construct(s, of, sf);

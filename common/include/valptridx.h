@@ -10,17 +10,11 @@
 #include <string>
 #include <type_traits>
 #include "fwd-valptridx.h"
-#include "compiler-array.h"
 #include "pack.h"
 #include "compiler-poison.h"
 #include "selfiter.h"
 
 #ifdef DXX_CONSTANT_TRUE
-#define DXX_VALPTRIDX_STATIC_CHECK(SUCCESS_CONDITION,FAILURE_FUNCTION,FAILURE_STRING)	\
-		static_cast<void>(DXX_CONSTANT_TRUE(!SUCCESS_CONDITION) &&	\
-			(DXX_ALWAYS_ERROR_FUNCTION(FAILURE_FUNCTION, FAILURE_STRING), 0)	\
-		)	\
-
 #ifdef DXX_HAVE_ATTRIBUTE_WARNING
 /* This causes many warnings because some conversions are not checked for
  * safety.  Eliminating the warnings by changing the call sites to check first
@@ -28,18 +22,12 @@
  */
 //#define DXX_VALPTRIDX_WARN_CALL_NOT_OPTIMIZED_OUT __attribute__((__warning__("call not eliminated")))
 #endif
-#else
-#define DXX_VALPTRIDX_STATIC_CHECK(E,F,S)
 #endif
 
-#define DXX_VALPTRIDX_CHECK(SUCCESS_CONDITION,ERROR,FAILURE_STRING,...)	\
-	( DXX_BEGIN_COMPOUND_STATEMENT {	\
-		const bool dxx_valptridx_check_success_condition = (SUCCESS_CONDITION);	\
-		DXX_VALPTRIDX_STATIC_CHECK(dxx_valptridx_check_success_condition, dxx_trap_##ERROR, FAILURE_STRING);	\
-		static_cast<void>(	\
-			dxx_valptridx_check_success_condition || (ERROR::report(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VA(__VA_ARGS__)), 0)	\
-		);	\
-	} DXX_END_COMPOUND_STATEMENT )
+#define DXX_VALPTRIDX_CHECK(SUCCESS_CONDITION,ERROR,...)	\
+	static_cast<void>(	\
+		static_cast<bool>(SUCCESS_CONDITION) || (ERROR::report(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VA(__VA_ARGS__)), 0)	\
+	)	\
 
 #ifndef DXX_VALPTRIDX_WARN_CALL_NOT_OPTIMIZED_OUT
 #define DXX_VALPTRIDX_WARN_CALL_NOT_OPTIMIZED_OUT
@@ -80,12 +68,12 @@ public:
 template <
 	typename INTEGRAL_TYPE,
 	std::size_t array_size_value,
-	valptridx_untyped_utilities::report_error_style report_const_error_value,
-	valptridx_untyped_utilities::report_error_style report_mutable_error_value
+	valptridx_detail::untyped_utilities::report_error_style report_const_error_value,
+	valptridx_detail::untyped_utilities::report_error_style report_mutable_error_value
 	>
-constexpr std::integral_constant<std::size_t, array_size_value> valptridx_specialized_type_parameters<INTEGRAL_TYPE, array_size_value, report_const_error_value, report_mutable_error_value>::array_size;
+constexpr std::integral_constant<std::size_t, array_size_value> valptridx_detail::specialized_type_parameters<INTEGRAL_TYPE, array_size_value, report_const_error_value, report_mutable_error_value>::array_size;
 
-class valptridx_untyped_utilities::report_error_undefined
+class valptridx_detail::untyped_utilities::report_error_undefined
 {
 public:
 	__attribute_cold
@@ -95,11 +83,14 @@ public:
 	}
 };
 
-class valptridx_untyped_utilities::report_error_trap_terse
+class valptridx_detail::untyped_utilities::report_error_trap_terse
 {
 public:
+	/* Accept and discard any arguments, to encourage the compiler to discard
+	 * as dead any values that exist only as arguments to `report()`.
+	 */
+	[[noreturn]]
 	__attribute_cold
-	__attribute_noreturn
 	DXX_VALPTRIDX_WARN_CALL_NOT_OPTIMIZED_OUT
 	static void report(...)
 	{
@@ -107,24 +98,29 @@ public:
 	}
 };
 
-class valptridx_untyped_utilities::index_mismatch_trap_verbose
+class valptridx_detail::untyped_utilities::index_mismatch_trap_verbose
 {
 public:
+	[[noreturn]]
 	__attribute_cold
-	__attribute_noreturn
 	DXX_VALPTRIDX_WARN_CALL_NOT_OPTIMIZED_OUT
 	static void report(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const void *const array, const unsigned long supplied_index, const void *const expected_pointer, const void *const actual_pointer)
 	{
+		/* Load each of the arguments into storage before executing the trap,
+		 * so that inspection of those locations in the core dump can readily
+		 * retrieve these values, even if the values would otherwise be unused
+		 * and optimized out.
+		 */
 		__asm__ __volatile__("" :: DXX_VALPTRIDX_REPORT_STANDARD_ASM_LOAD_COMMA_R_VARS "rm" (array), "rm" (supplied_index), "rm" (expected_pointer), "rm" (actual_pointer));
 		__builtin_trap();
 	}
 };
 
-class valptridx_untyped_utilities::index_range_trap_verbose
+class valptridx_detail::untyped_utilities::index_range_trap_verbose
 {
 public:
+	[[noreturn]]
 	__attribute_cold
-	__attribute_noreturn
 	DXX_VALPTRIDX_WARN_CALL_NOT_OPTIMIZED_OUT
 	static void report(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const void *const array, const unsigned long supplied_index)
 	{
@@ -133,19 +129,19 @@ public:
 	}
 };
 
-class valptridx_untyped_utilities::null_pointer_trap_verbose
+class valptridx_detail::untyped_utilities::null_pointer_trap_verbose
 {
 public:
+	[[noreturn]]
 	__attribute_cold
-	__attribute_noreturn
 	DXX_VALPTRIDX_WARN_CALL_NOT_OPTIMIZED_OUT
 	static void report(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_N_DEFN_VARS)
 	{
 		__asm__ __volatile__("" :: DXX_VALPTRIDX_REPORT_STANDARD_ASM_LOAD_COMMA_N_VARS);
 		__builtin_trap();
 	}
+	[[noreturn]]
 	__attribute_cold
-	__attribute_noreturn
 	DXX_VALPTRIDX_WARN_CALL_NOT_OPTIMIZED_OUT
 	static void report(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const void *const array)
 	{
@@ -158,10 +154,10 @@ template <typename P>
 class valptridx<P>::index_mismatch_exception :
 	public std::logic_error
 {
-	DXX_INHERIT_CONSTRUCTORS(index_mismatch_exception, logic_error);
+	using std::logic_error::logic_error;
 public:
+	[[noreturn]]
 	__attribute_cold
-	__attribute_noreturn
 	DXX_VALPTRIDX_WARN_CALL_NOT_OPTIMIZED_OUT
 	static void report(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const array_managed_type *, index_type, const_pointer_type, const_pointer_type);
 };
@@ -170,10 +166,10 @@ template <typename P>
 class valptridx<P>::index_range_exception :
 	public std::out_of_range
 {
-	DXX_INHERIT_CONSTRUCTORS(index_range_exception, out_of_range);
+	using std::out_of_range::out_of_range;
 public:
+	[[noreturn]]
 	__attribute_cold
-	__attribute_noreturn
 	DXX_VALPTRIDX_WARN_CALL_NOT_OPTIMIZED_OUT
 	static void report(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const array_managed_type *, long);
 };
@@ -182,14 +178,14 @@ template <typename P>
 class valptridx<P>::null_pointer_exception :
 	public std::logic_error
 {
-	DXX_INHERIT_CONSTRUCTORS(null_pointer_exception, logic_error);
+	using std::logic_error::logic_error;
 public:
+	[[noreturn]]
 	__attribute_cold
-	__attribute_noreturn
 	DXX_VALPTRIDX_WARN_CALL_NOT_OPTIMIZED_OUT
 	static void report(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_N_DEFN_VARS);
+	[[noreturn]]
 	__attribute_cold
-	__attribute_noreturn
 	DXX_VALPTRIDX_WARN_CALL_NOT_OPTIMIZED_OUT
 	static void report(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const array_managed_type *);
 };
@@ -199,30 +195,54 @@ template <typename handle_index_mismatch>
 void valptridx<managed_type>::check_index_match(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const_reference_type r, index_type i, const array_managed_type &a __attribute_unused)
 {
 	const auto pi = &a[i];
-	DXX_VALPTRIDX_CHECK(pi == &r, handle_index_mismatch, "pointer/index mismatch", &a, i, pi, &r);
+	DXX_VALPTRIDX_CHECK(pi == &r, handle_index_mismatch, &a, i, pi, &r);
 }
 
 template <typename managed_type>
 template <typename handle_index_range_error, template <typename> class Compare>
 typename valptridx<managed_type>::index_type valptridx<managed_type>::check_index_range(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const index_type i, const array_managed_type *const a)
 {
-	const std::size_t ss = i;
-	DXX_VALPTRIDX_CHECK(Compare<std::size_t>()(ss, array_size), handle_index_range_error, "invalid index used in array subscript", a, ss);
+	std::size_t si;
+	if constexpr (std::is_enum<index_type>::value)
+		si = static_cast<std::size_t>(i);
+	else
+		si = i;
+	check_index_range_size<handle_index_range_error, Compare>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS si, a);
 	return i;
+}
+
+template <typename managed_type>
+template <typename handle_index_range_error, template <typename> class Compare>
+typename valptridx<managed_type>::index_type valptridx<managed_type>::check_index_range_size(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const std::size_t s, const array_managed_type *const a)
+{
+	DXX_VALPTRIDX_CHECK(Compare<std::size_t>()(s, array_size), handle_index_range_error, a, s);
+	/* This cast will truncate the value to fit in index_type, which is
+	 * normally smaller than std::size_t.  However, truncation is legal
+	 * here, because (1) DXX_VALPTRIDX_CHECK would trap on an index that
+	 * was outside the array size and (2) index_type can represent any
+	 * valid size in the array.  Thus, if DXX_VALPTRIDX_CHECK did not
+	 * trap[1], the truncation cannot change the value of the index.
+	 *
+	 * [1] If valptridx was built without index validation, then no trap
+	 * would be issued even for invalid data.  Validation-disabled builds
+	 * are permitted to exhibit undefined behavior in cases where the
+	 * validation-enabled build would have trapped.
+	 */
+	return static_cast<index_type>(s);
 }
 
 template <typename managed_type>
 template <typename handle_null_pointer>
 void valptridx<managed_type>::check_null_pointer_conversion(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const_pointer_type p)
 {
-	DXX_VALPTRIDX_CHECK(p, handle_null_pointer, "NULL pointer converted");
+	DXX_VALPTRIDX_CHECK(p, handle_null_pointer);
 }
 
 template <typename managed_type>
 template <typename handle_null_pointer>
 void valptridx<managed_type>::check_null_pointer(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const_pointer_type p, const array_managed_type &a __attribute_unused)
 {
-	DXX_VALPTRIDX_CHECK(p, handle_null_pointer, "NULL pointer used", &a);
+	DXX_VALPTRIDX_CHECK(p, handle_null_pointer, &a);
 }
 
 template <typename managed_type>
@@ -236,19 +256,21 @@ template <typename managed_type>
 template <typename handle_index_mismatch, typename handle_index_range_error>
 void valptridx<managed_type>::check_explicit_index_range_ref(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const_reference_type &r, std::size_t i, const array_managed_type &a)
 {
-	check_index_match<handle_index_mismatch>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS r, i, a);
-	check_index_range<handle_index_range_error>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS i, &a);
+	const auto ii = check_index_range_size<handle_index_range_error>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS i, &a);
+	check_index_match<handle_index_mismatch>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS r, ii, a);
 }
 
 template <typename managed_type>
 class valptridx<managed_type>::partial_policy::require_valid
 {
 public:
-	static constexpr std::false_type allow_nullptr{};
+	static constexpr bool allow_nullptr = false;
+	[[nodiscard]]
 	static constexpr std::false_type check_allowed_invalid_index(index_type) { return {}; }
+	[[nodiscard]]
 	static constexpr bool check_nothrow_index(index_type i)
 	{
-		return std::less<std::size_t>()(i, array_size);
+		return std::less<std::size_t>()(static_cast<std::size_t>(i), array_size);
 	}
 };
 
@@ -256,11 +278,13 @@ template <typename managed_type>
 class valptridx<managed_type>::partial_policy::allow_invalid
 {
 public:
-	static constexpr std::true_type allow_nullptr{};
+	static constexpr bool allow_nullptr = true;
+	[[nodiscard]]
 	static constexpr bool check_allowed_invalid_index(index_type i)
 	{
 		return i == static_cast<index_type>(~0);
 	}
+	[[nodiscard]]
 	static constexpr bool check_nothrow_index(index_type i)
 	{
 		return check_allowed_invalid_index(i) || require_valid::check_nothrow_index(i);
@@ -268,10 +292,10 @@ public:
 };
 
 template <typename managed_type>
-constexpr std::false_type valptridx<managed_type>::partial_policy::require_valid::allow_nullptr;
+constexpr bool valptridx<managed_type>::partial_policy::require_valid::allow_nullptr;
 
 template <typename managed_type>
-constexpr std::true_type valptridx<managed_type>::partial_policy::allow_invalid::allow_nullptr;
+constexpr bool valptridx<managed_type>::partial_policy::allow_invalid::allow_nullptr;
 
 template <typename managed_type>
 template <template <typename> class policy>
@@ -314,7 +338,7 @@ class valptridx<managed_type>::im :
 };
 
 template <typename managed_type>
-template <typename policy, unsigned>
+template <typename policy>
 class valptridx<managed_type>::idx :
 	public policy
 {
@@ -335,20 +359,26 @@ public:
 
 	index_type get_unchecked_index() const { return m_idx; }
 
-	template <typename rpolicy, unsigned ru>
-		idx(const idx<rpolicy, ru> &rhs DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_L_DECL_VARS) :
+	/* If moving from allow_invalid to allow_invalid, no check is
+	 * needed.
+	 * If moving from require_valid to anything, no check is needed.
+	 */
+	template <typename rpolicy>
+		requires(policy::allow_nullptr || !rpolicy::allow_nullptr)
+		idx(const idx<rpolicy> &rhs) :
 			m_idx(rhs.get_unchecked_index())
 	{
-		/* If moving from allow_invalid to require_valid, check range.
-		 * If moving from allow_invalid to allow_invalid, no check is
-		 * needed.
-		 * If moving from require_valid to anything, no check is needed.
-		 */
-		if (!(allow_nullptr || !rhs.allow_nullptr))
-			check_index_range<index_range_error_type<array_managed_type>>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS m_idx, nullptr);
 	}
-	template <typename rpolicy, unsigned ru>
-		idx(idx<rpolicy, ru> &&rhs) :
+	template <typename rpolicy>
+		requires(!(policy::allow_nullptr || !rpolicy::allow_nullptr))
+		idx(const idx<rpolicy> &rhs DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_L_DECL_VARS) :
+		/* If moving from allow_invalid to require_valid, check range.
+		 */
+			m_idx(check_index_range<index_range_error_type<array_managed_type>>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS rhs.get_unchecked_index(), nullptr))
+	{
+	}
+	template <typename rpolicy>
+		idx(idx<rpolicy> &&rhs) :
 			m_idx(rhs.get_unchecked_index())
 	{
 		/* Prevent move from allow_invalid into require_valid.  The
@@ -381,6 +411,10 @@ protected:
 		m_idx(i)
 	{
 	}
+	idx(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS typename policy::pointer_type p, array_managed_type &a) :
+		m_idx(check_index_range_size<index_range_error_type<array_managed_type>>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS p - &a.front(), &a))
+	{
+	}
 public:
 	template <integral_type v>
 		constexpr idx(const magic_constant<v> &) :
@@ -388,25 +422,20 @@ public:
 	{
 		static_assert(allow_nullptr || static_cast<std::size_t>(v) < array_size, "invalid magic index not allowed for this policy");
 	}
-	template <typename rpolicy, unsigned ru>
-		bool operator==(const idx<rpolicy, ru> &rhs) const
+	template <typename rpolicy>
+		constexpr bool operator==(const idx<rpolicy> &rhs) const
 		{
 			return m_idx == rhs.get_unchecked_index();
 		}
-	bool operator==(const index_type &i) const
+	constexpr bool operator==(const index_type &i) const
 	{
 		return m_idx == i;
 	}
 	template <integral_type v>
-		bool operator==(const magic_constant<v> &) const
+		constexpr bool operator==(const magic_constant<v> &) const
 		{
 			static_assert(allow_nullptr || static_cast<std::size_t>(v) < array_size, "invalid magic index not allowed for this policy");
 			return m_idx == v;
-		}
-	template <typename R>
-		bool operator!=(const R &rhs) const
-		{
-			return !(*this == rhs);
 		}
 	operator index_type() const
 	{
@@ -416,13 +445,24 @@ protected:
 	index_type m_idx;
 	idx &operator++()
 	{
-		++ m_idx;
+		if constexpr (std::is_enum<index_type>::value)
+			m_idx = static_cast<index_type>(1u + static_cast<typename std::underlying_type<index_type>::type>(m_idx));
+		else
+			++ m_idx;
+		return *this;
+	}
+	idx &operator--()
+	{
+		if constexpr (std::is_enum<index_type>::value)
+			m_idx = static_cast<index_type>(static_cast<typename std::underlying_type<index_type>::type>(m_idx) - 1u);
+		else
+			-- m_idx;
 		return *this;
 	}
 };
 
 template <typename managed_type>
-template <typename policy, unsigned>
+template <typename policy>
 class valptridx<managed_type>::ptr :
 	public policy
 {
@@ -451,9 +491,12 @@ public:
 	pointer_type get_nonnull_pointer(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_N_DECL_VARS) const
 	{
 		/* If !allow_nullptr, assume nullptr was caught at construction.  */
-		if (allow_nullptr)
-			check_null_pointer_conversion<null_pointer_error_type<array_managed_type>>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS m_ptr);
-		return m_ptr;
+		const auto p = m_ptr;
+		if constexpr (allow_nullptr)
+			check_null_pointer_conversion<null_pointer_error_type<array_managed_type>>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS p);
+		else
+			DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_N_VOID_VARS();
+		return p;
 	}
 	reference_type get_checked_reference(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_N_DECL_VARS) const
 	{
@@ -470,7 +513,8 @@ public:
 			m_ptr(nullptr)
 	{
 		static_assert(static_cast<std::size_t>(v) >= array_size, "valid magic index requires an array");
-		static_assert(allow_nullptr || static_cast<std::size_t>(v) < array_size, "invalid magic index not allowed for this policy");
+		if constexpr (!allow_nullptr)
+			static_assert(static_cast<std::size_t>(v) < array_size, "invalid magic index not allowed for this policy");
 	}
 	template <integral_type v>
 		ptr(const magic_constant<v> &, array_managed_type &a) :
@@ -478,15 +522,21 @@ public:
 	{
 		static_assert(static_cast<std::size_t>(v) < array_size, "valid magic index required when using array");
 	}
-	template <typename rpolicy, unsigned ru>
-		ptr(const ptr<rpolicy, ru> &rhs DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_L_DECL_VARS) :
+	template <typename rpolicy>
+		requires(policy::allow_nullptr || !rpolicy::allow_nullptr)
+		ptr(const ptr<rpolicy> &rhs) :
 			m_ptr(rhs.get_unchecked_pointer())
 	{
-		if (!(allow_nullptr || !rhs.allow_nullptr))
-			check_null_pointer_conversion<null_pointer_error_type<array_managed_type>>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS m_ptr);
 	}
-	template <typename rpolicy, unsigned ru>
-		ptr(ptr<rpolicy, ru> &&rhs) :
+	template <typename rpolicy>
+		requires(!(policy::allow_nullptr || !rpolicy::allow_nullptr))
+		ptr(const ptr<rpolicy> &rhs DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_L_DECL_VARS) :
+			m_ptr(rhs.get_unchecked_pointer())
+	{
+		check_null_pointer_conversion<null_pointer_error_type<array_managed_type>>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS m_ptr);
+	}
+	template <typename rpolicy>
+		ptr(ptr<rpolicy> &&rhs) :
 			m_ptr(rhs.get_unchecked_pointer())
 	{
 		/* Prevent move from allow_invalid into require_valid.  The
@@ -501,7 +551,7 @@ public:
 	{
 	}
 	ptr(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS index_type i, array_managed_type &a, const allow_end_construction *) :
-		m_ptr(&a[check_index_range<index_range_error_type<array_managed_type>, std::less_equal>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS i, &a)])
+		m_ptr(std::next(a.begin(), static_cast<std::size_t>(check_index_range<index_range_error_type<array_managed_type>, std::less_equal>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS i, &a))))
 	{
 	}
 	ptr(index_type i, array_managed_type &a, const assume_nothrow_index *) :
@@ -516,7 +566,7 @@ public:
 		 */
 		m_ptr(p)
 	{
-		if (!allow_nullptr)
+		if constexpr (!allow_nullptr)
 			check_null_pointer<null_pointer_error_type<array_managed_type>>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS p, a);
 	}
 	ptr(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS reference_type r, array_managed_type &a) :
@@ -530,8 +580,9 @@ public:
 
 	operator mutable_pointer_type() const { return m_ptr; }	// implicit pointer conversion deprecated
 	operator const_pointer_type() const { return m_ptr; }	// implicit pointer conversion deprecated
-	template <typename rpolicy, unsigned ru>
-		typename std::enable_if<!std::is_same<policy, rpolicy>::value, ptr>::type rebind_policy(ptr<rpolicy, ru> &&rhs) const
+	template <typename rpolicy>
+		requires(!std::is_same<policy, rpolicy>::value)
+		ptr rebind_policy(ptr<rpolicy> &&rhs) const
 	{
 		/* This method could be marked as `static`, but is non-static so
 		 * that callers must possess an instance of the target type.
@@ -572,28 +623,23 @@ public:
 		return *this;
 	}
 	explicit operator bool() const && = delete;
-	bool operator==(std::nullptr_t) const
+	constexpr bool operator==(std::nullptr_t) const
 	{
 		static_assert(allow_nullptr, "nullptr comparison not allowed: value is never null");
 		return m_ptr == nullptr;
 	}
-	bool operator==(const_pointer_type p) const
+	constexpr bool operator==(const_pointer_type p) const
 	{
 		return m_ptr == p;
 	}
-	bool operator==(mutable_pointer_type p) const
+	constexpr bool operator==(mutable_pointer_type p) const
 	{
 		return m_ptr == p;
 	}
-	template <typename rpolicy, unsigned ru>
-		bool operator==(const ptr<rpolicy, ru> &rhs) const
+	template <typename rpolicy>
+		constexpr bool operator==(const ptr<rpolicy> &rhs) const
 		{
 			return *this == rhs.get_unchecked_pointer();
-		}
-	template <typename R>
-		bool operator!=(const R &rhs) const
-		{
-			return !(*this == rhs);
 		}
 	template <typename U>
 		long operator-(U) const = delete;
@@ -612,30 +658,56 @@ protected:
 		++ m_ptr;
 		return *this;
 	}
+	ptr &operator--()
+	{
+		-- m_ptr;
+		return *this;
+	}
 	ptr(const allow_none_construction *) :
 		m_ptr(nullptr)
 	{
 		static_assert(!allow_nullptr, "allow_none_construction used where nullptr was already legal");
 	}
-	template <typename rpolicy, unsigned ru>
-		ptr(ptr<rpolicy, ru> &&rhs, const typename containing_type::rebind_policy *) :
+	template <typename rpolicy>
+		ptr(ptr<rpolicy> &&rhs, const typename containing_type::rebind_policy *) :
 			m_ptr(const_cast<managed_type *>(rhs.get_unchecked_pointer()))
 	{
 		static_assert(allow_nullptr || !rpolicy::allow_nullptr, "cannot rebind from allow_invalid to require_valid");
 	}
 };
 
+#if DXX_VALPTRIDX_ENFORCE_STRICT_PI_SEPARATION
+template <typename T>
+struct strong_typedef : T
+{
+	using T::T;
+	template <typename O>
+		requires(std::is_constructible<T, O &&>::value)
+		strong_typedef(O &&o) :
+			T(std::forward<O>(o))
+	{
+	}
+	strong_typedef() = default;
+	strong_typedef(const strong_typedef &) = default;
+	strong_typedef(strong_typedef &&) = default;
+	strong_typedef &operator=(const strong_typedef &) & = default;
+	strong_typedef &operator=(strong_typedef &&) & = default;
+	strong_typedef &operator=(const strong_typedef &) && = delete;
+	strong_typedef &operator=(strong_typedef &&) && = delete;
+};
+#endif
+
 template <typename managed_type>
 template <typename policy>
 class valptridx<managed_type>::ptridx :
 	public prohibit_void_ptr<ptridx<policy>>,
-	public ptr<policy, 1>,
-	public idx<policy, 1>
+	public ptr<policy>,
+	public idx<policy>
 {
 	using containing_type = valptridx<managed_type>;
 public:
-	typedef ptr<policy, 1> vptr_type;
-	typedef idx<policy, 1> vidx_type;
+	using vptr_type = ptr<policy>;
+	using vidx_type = idx<policy>;
 	using typename vidx_type::array_managed_type;
 	using index_type = typename vidx_type::index_type;
 	using typename vidx_type::integral_type;
@@ -653,15 +725,23 @@ public:
 	 */
 	ptridx(pointer_type p) = delete;
 	template <typename rpolicy>
+		requires(policy::allow_nullptr || !rpolicy::allow_nullptr)
+		ptridx(const ptridx<rpolicy> &rhs) :
+			vptr_type(static_cast<const typename ptridx<rpolicy>::vptr_type &>(rhs)),
+			vidx_type(static_cast<const typename ptridx<rpolicy>::vidx_type &>(rhs))
+	{
+	}
+	template <typename rpolicy>
+		requires(!(policy::allow_nullptr || !rpolicy::allow_nullptr))
 		ptridx(const ptridx<rpolicy> &rhs DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_L_DECL_VARS) :
 			vptr_type(static_cast<const typename ptridx<rpolicy>::vptr_type &>(rhs) DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_L_PASS_VARS),
 			vidx_type(static_cast<const typename ptridx<rpolicy>::vidx_type &>(rhs) DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_L_PASS_VARS)
 	{
 	}
 	template <typename rpolicy>
-		ptridx(ptridx<rpolicy> &&rhs DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_L_DECL_VARS) :
-			vptr_type(static_cast<typename ptridx<rpolicy>::vptr_type &&>(rhs) DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_L_PASS_VARS),
-			vidx_type(static_cast<typename ptridx<rpolicy>::vidx_type &&>(rhs) DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_L_PASS_VARS)
+		ptridx(ptridx<rpolicy> &&rhs) :
+			vptr_type(static_cast<typename ptridx<rpolicy>::vptr_type &&>(rhs)),
+			vidx_type(static_cast<typename ptridx<rpolicy>::vidx_type &&>(rhs))
 	{
 	}
 	template <integral_type v>
@@ -704,7 +784,7 @@ public:
 		 * vptr_type to avoid checking again.
 		 */
 		vptr_type(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS (check_null_pointer<null_pointer_error_type<array_managed_type>>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS p, a), *p), a),
-		vidx_type(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS p - static_cast<pointer_type>(&a.front()), a)
+		vidx_type(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS p, a)
 	{
 	}
 	ptridx(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS pointer_type p, index_type i, array_managed_type &a) :
@@ -713,7 +793,8 @@ public:
 	{
 	}
 	template <typename rpolicy>
-		typename std::enable_if<!std::is_same<policy, rpolicy>::value, ptridx>::type rebind_policy(ptridx<rpolicy> &&rhs) const
+		requires(!std::is_same<policy, rpolicy>::value)
+		ptridx rebind_policy(ptridx<rpolicy> &&rhs) const
 	{
 		return ptridx(std::move(rhs), static_cast<const typename containing_type::rebind_policy *>(nullptr));
 	}
@@ -726,20 +807,21 @@ public:
 		return r;
 	}
 	template <typename rpolicy>
-		bool operator==(const ptridx<rpolicy> &rhs) const
+		constexpr bool operator==(const ptridx<rpolicy> &rhs) const
 		{
 			return vptr_type::operator==(static_cast<const typename ptridx<rpolicy>::vptr_type &>(rhs));
-		}
-	template <typename R>
-		bool operator!=(const R &rhs) const
-		{
-			return !(*this == rhs);
 		}
 protected:
 	ptridx &operator++()
 	{
 		vptr_type::operator++();
 		vidx_type::operator++();
+		return *this;
+	}
+	ptridx &operator--()
+	{
+		vptr_type::operator--();
+		vidx_type::operator--();
 		return *this;
 	}
 	template <typename rpolicy>
@@ -790,7 +872,7 @@ public:
 		m_value(std::move(v)), m_state(initialized)
 	{
 	}
-	__attribute_warn_unused_result
+	[[nodiscard]]
 	explicit operator bool() const
 	{
 		/*
@@ -804,7 +886,7 @@ public:
 		m_state = checked;
 		return true;
 	}
-	__attribute_warn_unused_result
+	[[nodiscard]]
 	guarded_type operator*() const &
 	{
 		/*
@@ -827,10 +909,10 @@ public:
 			 * where operator bool() has not been called.
 			 */
 			if (DXX_CONSTANT_TRUE(m_state == empty))
-				DXX_ALWAYS_ERROR_FUNCTION(guarded_accessed_empty, DXX_VALPTRIDX_GUARDED_OBJECT_NO);
+				DXX_ALWAYS_ERROR_FUNCTION(DXX_VALPTRIDX_GUARDED_OBJECT_NO);
 			/* If the contained object might not exist: */
 			if (DXX_CONSTANT_TRUE(m_state == initialized))
-				DXX_ALWAYS_ERROR_FUNCTION(guarded_accessed_unchecked, DXX_VALPTRIDX_GUARDED_OBJECT_MAYBE);
+				DXX_ALWAYS_ERROR_FUNCTION(DXX_VALPTRIDX_GUARDED_OBJECT_MAYBE);
 		}
 #endif
 		/*
@@ -935,7 +1017,7 @@ protected:
 	template <typename P, typename T, typename A>
 		static guarded<P> check_untrusted_internal(T &&, A &) = delete;
 	template <typename P, typename A>
-		__attribute_warn_unused_result
+		[[nodiscard]]
 		/* C++ does not allow `static operator()()`, so name it
 		 * `call_operator` instead.
 		 */
@@ -944,7 +1026,7 @@ protected:
 			return P(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS i, a);
 		}
 	template <typename P, containing_type::integral_type v, typename A>
-		__attribute_warn_unused_result
+		[[nodiscard]]
 		static P call_operator(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const containing_type::magic_constant<v> &m, A &a)
 		{
 			/*
@@ -966,25 +1048,25 @@ public:
 	basic_ival_member_factory &operator=(const basic_ival_member_factory &) = delete;
 	void *operator &() const = delete;
 	template <typename T>
-		__attribute_warn_unused_result
+		[[nodiscard]]
 		guarded<Pc> check_untrusted(T &&t) const
 		{
 			return this->template check_untrusted_internal<Pc>(static_cast<T &&>(t), get_array());
 		}
 	template <typename T>
-		__attribute_warn_unused_result
+		[[nodiscard]]
 		guarded<Pm> check_untrusted(T &&t)
 		{
 			return this->template check_untrusted_internal<Pm>(static_cast<T &&>(t), get_array());
 		}
 	template <typename T>
-		__attribute_warn_unused_result
+		[[nodiscard]]
 		Pc operator()(T &&t DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_L_DECL_VARS) const
 		{
 			return this->template call_operator<Pc>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS static_cast<T &&>(t), get_array());
 		}
 	template <typename T>
-		__attribute_warn_unused_result
+		[[nodiscard]]
 		Pm operator()(T &&t DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_L_DECL_VARS)
 		{
 			return this->template call_operator<Pm>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS static_cast<T &&>(t), get_array());
@@ -1002,74 +1084,72 @@ protected:
 	template <typename P>
 		using iterator = self_return_iterator<P>;
 	template <typename P, typename policy, typename A>
-		static P call_operator(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const valptridx<managed_type>::idx<policy, 0> i, A &a)
+		static P call_operator(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const typename valptridx<managed_type>::template wrapper<valptridx<managed_type>::idx<policy>> i, A &a)
 		{
 			return P(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS i, a);
 		}
 	template <typename P>
-		__attribute_warn_unused_result
+		[[nodiscard]]
 		static P call_operator(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const typename P::mutable_pointer_type p, typename P::array_managed_type &a)
 		{
 			return P(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS p, a);
 		}
 	/*
-	 * When P is a const type, enable an overload that takes a const
-	 * array.  Otherwise, enable a deleted overload that takes a mutable
-	 * array.  This provides a slightly clearer error when trying to
-	 * pass a const pointer to a mutable factory.
+	 * When P is a const type, require a const array, so that attempts to
+	 * provide a mutable array fail.  This provides a slightly clearer error
+	 * when trying to pass a const pointer to a mutable factory.
 	 */
 	template <typename P>
-		__attribute_warn_unused_result
-		static typename std::enable_if<std::is_same<const array_managed_type, typename P::array_managed_type>::value, P>::type call_operator(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const typename P::const_pointer_type p, const array_managed_type &a)
+		requires(std::is_same<const array_managed_type, typename P::array_managed_type>::value)
+		[[nodiscard]]
+		static P call_operator(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const typename P::const_pointer_type p, const array_managed_type &a)
 		{
 			return P(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS p, a);
 		}
-	template <typename P>
-		static typename std::enable_if<!std::is_same<const array_managed_type, typename P::array_managed_type>::value, P>::type call_operator(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS const typename P::const_pointer_type p, array_managed_type &a) = delete;
 	template <typename P, typename A>
 		static iterator<P> end_internal(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_DEFN_VARS A &a)
 		{
 			return P(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS static_cast<index_type>(a.get_count()), a, static_cast<const allow_end_construction *>(nullptr));
 		}
 public:
-	__attribute_warn_unused_result
+	[[nodiscard]]
 	typename array_base_storage_type::size_type count() const
 	{
 		return get_array().get_count();
 	}
-	__attribute_warn_unused_result
+	[[nodiscard]]
 	typename array_base_storage_type::size_type size() const
 	{
 		return get_array().size();
 	}
 	template <typename T>
-		__attribute_warn_unused_result
+		[[nodiscard]]
 		Pc operator()(T &&t DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_L_DECL_VARS) const
 		{
 			return this->template call_operator<Pc>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS static_cast<T &&>(t), get_array());
 		}
 	template <typename T>
-		__attribute_warn_unused_result
+		[[nodiscard]]
 		Pm operator()(T &&t DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_L_DECL_VARS)
 		{
 			return this->template call_operator<Pm>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS static_cast<T &&>(t), get_array());
 		}
-	__attribute_warn_unused_result
+	[[nodiscard]]
 	iterator<Pc> begin() const
 	{
-		return Pc(valptridx<managed_type>::magic_constant<0>(), get_array());
+		return Pc(valptridx<managed_type>::magic_constant<index_type{}>(), get_array());
 	}
-	__attribute_warn_unused_result
+	[[nodiscard]]
 	iterator<Pm> begin()
 	{
-		return Pm(valptridx<managed_type>::magic_constant<0>(), get_array());
+		return Pm(valptridx<managed_type>::magic_constant<index_type{}>(), get_array());
 	}
-	__attribute_warn_unused_result
+	[[nodiscard]]
 	iterator<Pc> end(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_N_DECL_VARS) const
 	{
 		return this->template end_internal<Pc>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS get_array());
 	}
-	__attribute_warn_unused_result
+	[[nodiscard]]
 	iterator<Pm> end(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_N_DECL_VARS)
 	{
 		return this->template end_internal<Pm>(DXX_VALPTRIDX_REPORT_STANDARD_LEADER_COMMA_R_PASS_VARS get_array());

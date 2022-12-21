@@ -22,10 +22,9 @@
 #include "strutil.h"
 #include "u_mem.h"
 #include "physfs_list.h"
-#include "digi.h"
 
-#include "compiler-make_unique.h"
 #include "partial_range.h"
+#include <memory>
 
 namespace dcx {
 
@@ -127,7 +126,7 @@ void jukebox_unload()
 	JukeboxSongs.unload();
 }
 
-const array<file_extension_t, 5> jukebox_exts{{
+const std::array<file_extension_t, 5> jukebox_exts{{
 	SONG_EXT_HMP,
 	SONG_EXT_MID,
 	SONG_EXT_OGG,
@@ -140,11 +139,11 @@ const array<file_extension_t, 5> jukebox_exts{{
  */
 static std::unique_ptr<FILE, FILE_deleter> open_m3u_from_disk(const char *const cfgpath)
 {
-	array<char, PATH_MAX> absbuf;
+	std::array<char, PATH_MAX> absbuf;
 	return std::unique_ptr<FILE, FILE_deleter>(fopen(
 	// it's a child of Sharepath, build full path
-		(PHYSFSX_exists(cfgpath, 0)
-			? (PHYSFSX_getRealPath(cfgpath, absbuf), absbuf.data())
+		(PHYSFSX_exists(cfgpath, 0) && PHYSFSX_getRealPath(cfgpath, absbuf)
+			? absbuf.data()
 			: cfgpath), "rb")
 	);
 }
@@ -176,7 +175,7 @@ static m3u_bytes read_m3u_bytes_from_disk(const char *const cfgpath)
 	/* Use T=`char*[]` to ensure alignment.  Place pointers before file
 	 * contents to keep the pointer array aligned.
 	 */
-	auto &&list_buf = make_unique<char*[]>(max_songs + 1 + (length / sizeof(char *)));
+	auto &&list_buf = std::make_unique<char*[]>(max_songs + 1 + (length / sizeof(char *)));
 	const auto p = reinterpret_cast<char *>(list_buf.get() + max_songs);
 	p[length] = '\0';	// make sure the last string is terminated
 	return fread(p, length, 1, fp)
@@ -227,10 +226,6 @@ static int read_m3u(void)
 	return 1;
 }
 
-}
-
-namespace dsx {
-
 /* Loads music file names from a given directory or M3U playlist */
 void jukebox_load()
 {
@@ -243,15 +238,6 @@ void jukebox_load()
 		read_m3u();
 	else	// a directory
 	{
-		class PHYSFS_path_deleter
-		{
-		public:
-			void operator()(const char *const p) const noexcept
-			{
-				PHYSFS_removeFromSearchPath(p);
-			}
-		};
-		std::unique_ptr<const char, PHYSFS_path_deleter> new_path;
 		const char *sep = PHYSFS_getDirSeparator();
 		size_t seplen = strlen(sep);
 
@@ -264,14 +250,15 @@ void jukebox_load()
 		}
 
 		const auto p = cfgpath.data();
+		RAIIPHYSFS_LiteralMount new_path;
 		// Read directory using PhysicsFS
 		if (PHYSFS_isDirectory(p))	// find files in relative directory
 			JukeboxSongs.list.reset(PHYSFSX_findFiles(p, jukebox_exts));
 		else
 		{
-			if (PHYSFSX_isNewPath(p))
+			if (!PHYSFS_getMountPoint(p))
 				new_path.reset(p);
-			PHYSFS_addToSearchPath(p, 0);
+			PHYSFS_mount(p, nullptr, 0);
 
 			// as mountpoints are no option (yet), make sure only files originating from GameCfg.CMLevelMusicPath are aded to the list.
 			JukeboxSongs.list.reset(PHYSFSX_findabsoluteFiles("", p, jukebox_exts));
@@ -307,7 +294,7 @@ static void jukebox_hook_next()
 	if (!JukeboxSongs.list || CGameCfg.CMLevelMusicTrack[0] == -1)
 		return;
 
-	if (GameCfg.CMLevelMusicPlayOrder == MUSIC_CM_PLAYORDER_RAND)
+	if (CGameCfg.CMLevelMusicPlayOrder == LevelMusicPlayOrder::Random)
 		CGameCfg.CMLevelMusicTrack[0] = d_rand() % CGameCfg.CMLevelMusicTrack[1]; // simply a random selection - no check if this song has already been played. But that's how I roll!
 	else
 		CGameCfg.CMLevelMusicTrack[0]++;
@@ -317,11 +304,14 @@ static void jukebox_hook_next()
 	jukebox_play();
 }
 
-// Play tracks from Jukebox directory. Play track specified in GameCfg.CMLevelMusicTrack[0] and loop depending on GameCfg.CMLevelMusicPlayOrder
+}
+
+namespace dsx {
+
+// Play tracks from Jukebox directory. Play track specified in GameCfg.CMLevelMusicTrack[0] and loop depending on CGameCfg.CMLevelMusicPlayOrder
 int jukebox_play()
 {
 	const char *music_filename;
-	uint_fast32_t size_full_filename = 0;
 
 	if (!JukeboxSongs.list)
 		return 0;
@@ -334,24 +324,26 @@ int jukebox_play()
 	if (!music_filename)
 		return 0;
 
-	size_t size_music_filename = strlen(music_filename);
+	const size_t size_music_filename = strlen(music_filename);
 	auto &cfgpath = CGameCfg.CMLevelMusicPath;
-	size_t musiclen = strlen(cfgpath.data());
-	size_full_filename = musiclen + size_music_filename + 1;
-	RAIIdmem<char[]> full_filename;
-	CALLOC(full_filename, char[], size_full_filename);
+	const size_t musiclen = strlen(cfgpath.data());
+	{
 	const char *LevelMusicPath;
+	std::unique_ptr<char[]> full_filename;
 	if (musiclen > 4 && !d_stricmp(&cfgpath[musiclen - 4], ".m3u"))	// if it's from an M3U playlist
-		LevelMusicPath = "";
+		LevelMusicPath = music_filename;
 	else											// if it's from a specified path
-		LevelMusicPath = cfgpath.data();
-	snprintf(full_filename.get(), size_full_filename, "%s%s", LevelMusicPath, music_filename);
+	{
+		const std::size_t size_full_filename = musiclen + size_music_filename + 1;
+		full_filename = std::make_unique<char[]>(size_full_filename);
+		LevelMusicPath = full_filename.get();
+		snprintf(full_filename.get(), size_full_filename, "%s%s", cfgpath.data(), music_filename);
+	}
 
-	int played = songs_play_file(full_filename.get(), (GameCfg.CMLevelMusicPlayOrder == MUSIC_CM_PLAYORDER_LEVEL ? 1 : 0), (GameCfg.CMLevelMusicPlayOrder == MUSIC_CM_PLAYORDER_LEVEL ? nullptr : jukebox_hook_next));
-	full_filename.reset();
-	if (!played)
+	if (!songs_play_file(LevelMusicPath, (CGameCfg.CMLevelMusicPlayOrder == LevelMusicPlayOrder::Level ? 1 : 0), (CGameCfg.CMLevelMusicPlayOrder == LevelMusicPlayOrder::Level ? nullptr : jukebox_hook_next)))
 	{
 		return 0;	// whoops, got an error
+	}
 	}
 
 	// Formatting a pretty message

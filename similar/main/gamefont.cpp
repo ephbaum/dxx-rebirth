@@ -29,17 +29,19 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "gr.h"
 #include "dxxerror.h"
 #include <string.h>
-#include "strutil.h"
 #include "args.h"
 #include "physfsx.h"
 #include "gamefont.h"
 #include "mission.h"
+#include "ogl_init.h"
 #include "config.h"
 
 #include "compiler-range_for.h"
 #include "d_enumerate.h"
 
-const array<char[16], 5> Gamefont_filenames_l{{
+namespace {
+
+constexpr std::array<char[16], 5> Gamefont_filenames_l{{
 	"font1-1.fnt", // Font 0
 	"font2-1.fnt", // Font 1
 	"font2-2.fnt", // Font 2
@@ -47,7 +49,7 @@ const array<char[16], 5> Gamefont_filenames_l{{
 	"font3-1.fnt"  // Font 4
 }};
 
-const array<char[16], 5> Gamefont_filenames_h{{
+constexpr std::array<char[16], 5> Gamefont_filenames_h{{
 	"font1-1h.fnt", // Font 0
 	"font2-1h.fnt", // Font 1
 	"font2-2h.fnt", // Font 2
@@ -55,11 +57,15 @@ const array<char[16], 5> Gamefont_filenames_h{{
 	"font3-1h.fnt"  // Font 4
 }};
 
-array<grs_font_ptr, MAX_FONTS> Gamefonts;
-
 static int Gamefont_installed;
+
+}
+
+std::array<grs_font_ptr, MAX_FONTS> Gamefonts;
 font_x_scale_proportion FNTScaleX(1);
 font_y_scale_proportion FNTScaleY(1);
+
+namespace {
 
 //code to allow variable GAME_FONT, added 10/7/99 Matt Mueller - updated 11/18/99 to handle all fonts, not just GFONT_SMALL
 //	take scry into account? how/when?
@@ -75,10 +81,10 @@ struct a_gamefont_conf
 struct gamefont_conf
 {
 	int num,cur;
-	array<a_gamefont_conf, 10> font;
+	std::array<a_gamefont_conf, 10> font;
 };
 
-static array<gamefont_conf, MAX_FONTS> font_conf;
+static std::array<gamefont_conf, MAX_FONTS> font_conf;
 
 static void gamefont_unloadfont(int gf)
 {
@@ -88,29 +94,29 @@ static void gamefont_unloadfont(int gf)
 	}
 }
 
-static void gamefont_loadfont(int gf,int fi)
+static void gamefont_loadfont(grs_canvas &canvas, int gf, int fi)
 {
 	if (PHYSFSX_exists(font_conf[gf].font[fi].f.name,1)){
 		gamefont_unloadfont(gf);
-		Gamefonts[gf] = gr_init_font(*grd_curcanv, font_conf[gf].font[fi].f.name);
+		Gamefonts[gf] = gr_init_font(canvas, font_conf[gf].font[fi].f.name);
 	}else {
 		if (!Gamefonts[gf]){
 			font_conf[gf].cur=-1;
-			Gamefonts[gf] = gr_init_font(*grd_curcanv, Gamefont_filenames_l[gf]);
+			Gamefonts[gf] = gr_init_font(canvas, Gamefont_filenames_l[gf]);
 		}
 		return;
 	}
 	font_conf[gf].cur=fi;
 }
 
+}
+
 void gamefont_choose_game_font(int scrx,int scry){
 	int close=-1,m=-1;
 	if (!Gamefont_installed) return;
 
-	range_for (const auto &&efc, enumerate(font_conf))
+	for (const auto &&[gf, fc] : enumerate(font_conf))
 	{
-		const auto gf = efc.idx;
-		auto &fc = efc.value;
 		for (int i = 0; i < fc.num; ++i)
 			if ((scrx >= fc.font[i].x && close < fc.font[i].x) && (scry >= fc.font[i].y && close < fc.font[i].y))
 			{
@@ -125,7 +131,7 @@ void gamefont_choose_game_font(int scrx,int scry){
 	{
 		// if there's no texture filtering, scale by int
 		auto &f = fc.font[m];
-		if (!CGameCfg.TexFilt)
+		if (CGameCfg.TexFilt == opengl_texture_filter::classic)
 		{
 			FNTScaleX.reset(scrx / f.x);
 			FNTScaleY.reset(scry / f.y);
@@ -148,9 +154,11 @@ void gamefont_choose_game_font(int scrx,int scry){
 			FNTScaleY.reset(FNTScaleX.operator float());
 	}
 #endif
-		gamefont_loadfont(gf,m);
+		gamefont_loadfont(*grd_curcanv, gf, m);
 	}
 }
+
+namespace {
 
 static void addfontconf(int gf, int x, int y, const char *const fn)
 {
@@ -163,7 +171,7 @@ static void addfontconf(int gf, int x, int y, const char *const fn)
 				gamefont_unloadfont(gf);
 			strcpy(font_conf[gf].font[i].f.name,fn);
 			if (i==font_conf[gf].cur)
-				gamefont_loadfont(gf,i);
+				gamefont_loadfont(*grd_curcanv, gf, i);
 			return;
 		}
 	}
@@ -171,6 +179,8 @@ static void addfontconf(int gf, int x, int y, const char *const fn)
 	font_conf[gf].font[font_conf[gf].num].y=y;
 	strcpy(font_conf[gf].font[font_conf[gf].num].f.name,fn);
 	font_conf[gf].num++;
+}
+
 }
 
 namespace dsx {
@@ -181,10 +191,8 @@ void gamefont_init()
 
 	Gamefont_installed = 1;
 
-	range_for (auto &&egf, enumerate(Gamefonts))
+	for (auto &&[i, gf] : enumerate(Gamefonts))
 	{
-		const auto i = egf.idx;
-		auto &gf = egf.value;
 		gf = nullptr;
 
 		if (!CGameArg.GfxSkipHiresFNT)
@@ -201,15 +209,14 @@ void gamefont_init()
 }
 }
 
-
 void gamefont_close()
 {
 	if (!Gamefont_installed) return;
 	Gamefont_installed = 0;
 
-	range_for (auto &&egf, enumerate(Gamefonts))
+	for (auto &&[idx, gf] : enumerate(Gamefonts))
 	{
-		gamefont_unloadfont(egf.idx);
+		(void)gf;
+		gamefont_unloadfont(idx);
 	}
-
 }

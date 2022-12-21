@@ -38,11 +38,12 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "u_mem.h"
 #include "textures.h"
 #include "physfs-serial.h"
-#include "cntrlcen.h"
 #include "segment.h"
 #include "dxxerror.h"
+#include "object.h"
 
 #include "compiler-range_for.h"
+#include "d_levelstate.h"
 #include "partial_range.h"
 
 unsigned Num_effects;
@@ -66,18 +67,22 @@ void reset_special_effects()
 		if (ec.changing_wall_texture != -1)
 			Textures[ec.changing_wall_texture] = ec.vc.frames[ec.frame_count];
 
-		if (ec.changing_object_texture != -1)
-			ObjBitmaps[ec.changing_object_texture] = ec.vc.frames[ec.frame_count];
+		if (const auto changing_object_texture = ec.changing_object_texture; changing_object_texture != object_bitmap_index::None)
+			ObjBitmaps[changing_object_texture] = ec.vc.frames[ec.frame_count];
 
 	}
 }
 
 void do_special_effects()
 {
+	auto &LevelUniqueControlCenterState = LevelUniqueObjectState.ControlCenterState;
 	auto &Effects = LevelUniqueEffectsClipState.Effects;
 	range_for (eclip &ec, partial_range(Effects, Num_effects))
 	{
-		if ((ec.changing_wall_texture == -1) && (ec.changing_object_texture==-1) )
+		const auto vc_frame_time = ec.vc.frame_time;
+		if (!vc_frame_time)
+			continue;
+		if (ec.changing_wall_texture == -1 && ec.changing_object_texture == object_bitmap_index::None)
 			continue;
 
 		if (ec.flags & EF_STOPPED)
@@ -87,7 +92,7 @@ void do_special_effects()
 
 		while (ec.time_left < 0) {
 
-			ec.time_left += ec.vc.frame_time;
+			ec.time_left += vc_frame_time;
 			
 			ec.frame_count++;
 			if (ec.frame_count >= ec.vc.num_frames) {
@@ -95,10 +100,10 @@ void do_special_effects()
 					ec.flags &= ~EF_ONE_SHOT;
 					unique_segment &seg = *vmsegptr(ec.segnum);
 					ec.segnum = segment_none;		//done with this
-					assert(ec.sidenum < 6);
+					assert(seg.sides.valid_index(ec.sidenum));
 					auto &side = seg.sides[ec.sidenum];
-					assert(ec.dest_bm_num != 0 && side.tmap_num2 != 0);
-					side.tmap_num2 = ec.dest_bm_num | (side.tmap_num2 & 0xc000);		//replace with destoyed
+					assert(ec.dest_bm_num != 0 && side.tmap_num2 != texture2_value::None);
+					side.tmap_num2 = build_texture2_value(ec.dest_bm_num, get_texture_rotation_high(side.tmap_num2));		//replace with destroyed
 				}
 
 				ec.frame_count = 0;
@@ -108,22 +113,23 @@ void do_special_effects()
 		if (ec.flags & EF_CRITICAL)
 			continue;
 
-		if (ec.crit_clip!=-1 && Control_center_destroyed) {
+		if (ec.crit_clip!=-1 && LevelUniqueControlCenterState.Control_center_destroyed)
+		{
 			int n = ec.crit_clip;
 
 			if (ec.changing_wall_texture != -1)
 				Textures[ec.changing_wall_texture] = Effects[n].vc.frames[Effects[n].frame_count];
 
-			if (ec.changing_object_texture != -1)
-				ObjBitmaps[ec.changing_object_texture] = Effects[n].vc.frames[Effects[n].frame_count];
+			if (const auto changing_object_texture = ec.changing_object_texture; changing_object_texture != object_bitmap_index::None)
+				ObjBitmaps[changing_object_texture] = Effects[n].vc.frames[Effects[n].frame_count];
 
 		}
 		else	{
 			if (ec.changing_wall_texture != -1)
 				Textures[ec.changing_wall_texture] = ec.vc.frames[ec.frame_count];
 	
-			if (ec.changing_object_texture != -1)
-				ObjBitmaps[ec.changing_object_texture] = ec.vc.frames[ec.frame_count];
+			if (const auto changing_object_texture = ec.changing_object_texture; changing_object_texture != object_bitmap_index::None)
+				ObjBitmaps[changing_object_texture] = ec.vc.frames[ec.frame_count];
 		}
 
 	}
@@ -138,8 +144,8 @@ void restore_effect_bitmap_icons()
 			if (ec.changing_wall_texture != -1)
 				Textures[ec.changing_wall_texture] = ec.vc.frames[0];
 	
-			if (ec.changing_object_texture != -1)
-				ObjBitmaps[ec.changing_object_texture] = ec.vc.frames[0];
+			if (const auto changing_object_texture = ec.changing_object_texture; changing_object_texture != object_bitmap_index::None)
+				ObjBitmaps[changing_object_texture] = ec.vc.frames[0];
 		}
 	}
 }
@@ -160,9 +166,8 @@ void stop_effect(int effect_num)
 	if (ec->changing_wall_texture != -1)
 		Textures[ec->changing_wall_texture] = ec->vc.frames[0];
 	
-	if (ec->changing_object_texture != -1)
-		ObjBitmaps[ec->changing_object_texture] = ec->vc.frames[0];
-
+	if (const auto changing_object_texture = ec->changing_object_texture; changing_object_texture != object_bitmap_index::None)
+		ObjBitmaps[changing_object_texture] = ec->vc.frames[0];
 }
 
 //restart a stopped effect

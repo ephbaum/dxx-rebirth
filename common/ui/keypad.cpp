@@ -31,21 +31,24 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "func.h"
 #include "dxxerror.h"
 
-#include "compiler-make_unique.h"
 #include "compiler-range_for.h"
 #include "d_range.h"
+#include <memory>
 
 namespace dcx {
+namespace {
 
 #define MAX_NUM_PADS 20
 
-static array<std::unique_ptr<UI_GADGET_BUTTON>, 17> Pad;
-static array<std::unique_ptr<UI_KEYPAD>, MAX_NUM_PADS> KeyPad;
+static std::array<std::unique_ptr<UI_GADGET_BUTTON>, 17> Pad;
+static std::array<std::unique_ptr<UI_KEYPAD>, MAX_NUM_PADS> KeyPad;
 static int active_pad;
 
 static int desc_x, desc_y;
 
-static array<int, 17> HotKey, HotKey1;
+static std::array<int, 17> HotKey, HotKey1;
+
+}
 
 int ui_pad_get_current()
 {
@@ -63,14 +66,16 @@ void ui_pad_close()
 	KeyPad = {};
 }
 
+namespace {
+
 typedef PHYSFSX_gets_line_t<100>::line_t keypad_input_line_t;
 
 static keypad_input_line_t::const_iterator find_fake_comma(keypad_input_line_t::const_iterator i, keypad_input_line_t::const_iterator e)
 {
-	auto is_fake_comma = [](char c) {
+	const auto is_fake_comma = [](const char c) {
 		return !c || static_cast<uint8_t>(c) == 179;
 	};
-	return std::find_if(i, e, is_fake_comma);
+	return ranges::find_if(i, e, is_fake_comma);
 }
 
 template <bool append, char eor>
@@ -79,7 +84,7 @@ static keypad_input_line_t::const_iterator set_row(keypad_input_line_t::const_it
 	const auto oe = r.end();
 	auto ob = r.begin();
 	if (append)
-		ob = std::find(ob, oe, 0);
+		ob = ranges::find(ob, oe, 0);
 	auto comma0 = find_fake_comma(i, e);
 	if (comma0 == e)
 		/* Start not found */
@@ -147,9 +152,11 @@ static void set_short_row(keypad_input_line_t::const_iterator i, const keypad_in
 
 static std::unique_ptr<UI_GADGET_BUTTON> ui_create_pad_gadget(UI_DIALOG &dlg, uint_fast32_t x, uint_fast32_t y, uint_fast32_t w, uint_fast32_t h, const grs_font &font)
 {
-	auto r = ui_add_gadget_button(&dlg, x, y, w, h, nullptr, nullptr);
+	auto r = ui_add_gadget_button(dlg, x, y, w, h, nullptr, nullptr);
 	r->canvas->cv_font = &font;
 	return r;
+}
+
 }
 
 void ui_pad_activate(UI_DIALOG &dlg, uint_fast32_t x, uint_fast32_t y)
@@ -270,16 +277,18 @@ void ui_pad_draw(UI_DIALOG *dlg, int x, int y)
 	
 	bw = 56; bh = 30;
 	
-	ui_dialog_set_current_canvas( dlg );
+	ui_dialog_set_current_canvas(*dlg);
 	ui_draw_box_in(*grd_curcanv, x, y, x+(bw * 4)+10 + 200, y+(bh * 5)+45);
 
 	gr_set_default_canvas();
 	auto &canvas = *grd_curcanv;
-	const uint8_t color = CWHITE;
+	const auto color = CWHITE;
 	gr_urect(canvas, desc_x, desc_y, desc_x+ 56*4-1, desc_y+15, color);
 	gr_set_fontcolor(canvas, CBLACK, CWHITE);
 	gr_ustring(canvas, *canvas.cv_font, desc_x, desc_y, KeyPad[active_pad]->description.data());
 }
+
+namespace {
 
 static void ui_pad_set_active( int n )
 {
@@ -290,7 +299,6 @@ static void ui_pad_set_active( int n )
 	range_for (const int i, xrange(17u))
 	{
 		Pad[i]->text = KeyPad[n]->buttontext[i].data();
-		Pad[i]->status = 1;
 		Pad[i]->user_function = NULL;
 		Pad[i]->dim_if_no_function = 1;
 		Pad[i]->hotkey = -1;
@@ -311,6 +319,8 @@ static void ui_pad_set_active( int n )
 	}
 
 	active_pad = n;
+}
+
 }
 
 void ui_pad_goto(int n)
@@ -371,17 +381,18 @@ int ui_pad_read( int n, const char * filename )
 	int linenumber = 0;
 	int keycode, functionnumber;
 
-	auto infile = PHYSFSX_openReadBuffered(filename);
+	auto &&[infile, physfserr] = PHYSFSX_openReadBuffered(filename);
 	if (!infile) {
-		Warning( "Could not find %s\n", filename );
+		Warning("UI pad: failed to open \"%s\": %s\n", filename, PHYSFS_getErrorByCode(physfserr));
 		return 0;
 	}
-	auto &kpn = *(KeyPad[n] = make_unique<UI_KEYPAD>());
+	auto &kpn = *(KeyPad[n] = std::make_unique<UI_KEYPAD>());
 
 	PHYSFSX_gets_line_t<100> buffer;
 	while ( linenumber < 22)
 	{
-		PHYSFSX_fgets( buffer, infile );
+		if (!PHYSFSX_fgets(buffer, infile))
+			break;
 
 		auto &line = buffer.line();
 		const auto lb = line.begin();

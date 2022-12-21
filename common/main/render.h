@@ -25,25 +25,39 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #pragma once
 
+#include "dxxsconf.h"
 #include "3d.h"
-
-#ifdef __cplusplus
 #include <vector>
 #include "objnum.h"
 #include "fwd-object.h"
 #include "fwd-segment.h"
 #include "fwd-vclip.h"
 #include "lighting.h"
+#include "d_array.h"
+
+#if DXX_USE_EDITOR
+namespace dcx {
+	/* When DXX_USE_EDITOR is enabled, this symbol is needed in editor
+	 * code.  When DXX_USE_EDITOR is disabled, this symbol is only
+	 * needed in the file where it is defined.  Therefore, preprocess
+	 * out the extern declaration when !DXX_USE_EDITOR.
+	 */
+extern const enumerated_array<
+	enumerated_array<
+		std::array<segment_relative_vertnum, 2>,
+		6, sidenum_t>,
+	6, sidenum_t> Two_sides_to_edge;
+}
+#endif
 
 #ifdef dsx
 namespace dsx {
 
 struct window_rendered_data
 {
+	window_rendered_data();
 #if defined(DXX_BUILD_DESCENT_II)
-	fix64   time;
-	const object *viewer;
-	int     rear_view;
+	const fix64 time;
 #endif
 	std::vector<objnum_t> rendered_robots;
 };
@@ -73,7 +87,6 @@ void flash_frame();
 
 }
 #endif
-int find_seg_side_face(short x,short y,segnum_t &seg,objnum_t &obj,int &side,int &face);
 
 // these functions change different rendering parameters
 // all return the new value of the parameter
@@ -92,10 +105,8 @@ fix Render_zoom;     // the player's zoom factor
 #ifdef dsx
 namespace dsx {
 #if defined(DXX_BUILD_DESCENT_I)
-constexpr std::integral_constant<fix, 0> Seismic_tremor_magnitude{};
 constexpr std::integral_constant<uint8_t, 0> RenderingType{};
 #elif defined(DXX_BUILD_DESCENT_II)
-extern fix Seismic_tremor_magnitude;
 extern uint8_t RenderingType;
 #endif
 }
@@ -104,6 +115,7 @@ extern uint8_t RenderingType;
 extern fix flash_scale;
 
 #if DXX_USE_EDITOR
+int find_seg_side_face(short x, short y, segnum_t &seg, objnum_t &obj, sidenum_t &side, int &face);
 extern int Render_only_bottom;
 #endif
 
@@ -116,10 +128,10 @@ void render_start_frame(void);
 
 // Given a list of point numbers, rotate any that haven't been rotated
 // this frame
-g3s_codes rotate_list(fvcvertptr &vcvertptr, std::size_t nv, const unsigned *pointnumlist);
+g3s_codes rotate_list(fvcvertptr &vcvertptr, std::size_t nv, const vertnum_t *pointnumlist);
 
 template <std::size_t N>
-static inline g3s_codes rotate_list(fvcvertptr &vcvertptr, const array<unsigned, N> &a)
+static inline g3s_codes rotate_list(fvcvertptr &vcvertptr, const std::array<vertnum_t, N> &a)
 {
 	return rotate_list(vcvertptr, a.size(), &a[0]);
 }
@@ -128,16 +140,6 @@ static inline g3s_codes rotate_list(fvcvertptr &vcvertptr, const array<unsigned,
 namespace dsx {
 void render_frame(grs_canvas &, fix eye_offset, window_rendered_data &);  //draws the world into the current canvas
 void render_mine(grs_canvas &, const vms_vector &, vcsegidx_t start_seg_num, fix eye_offset, window_rendered_data &);
-
-#if defined(DXX_BUILD_DESCENT_II)
-void update_rendered_data(window_rendered_data &window, const object &viewer, int rear_view_flag);
-#endif
-
-static inline void render_frame(grs_canvas &canvas, fix eye_offset)
-{
-	window_rendered_data window;
-	render_frame(canvas, eye_offset, window);
-}
 
 // Render an object.  Calls one of several routines based on type
 void render_object(grs_canvas &, const d_level_unique_light_state &LevelUniqueLightState, vmobjptridx_t obj);
@@ -148,6 +150,4 @@ void draw_object_tmap_rod(grs_canvas &, const d_level_unique_light_state *const 
 void draw_hostage(const d_vclip_array &Vclip, grs_canvas &, const d_level_unique_light_state &, vmobjptridx_t obj);
 void draw_morph_object(grs_canvas &, const d_level_unique_light_state &LevelUniqueLightState, vmobjptridx_t obj);
 }
-#endif
-
 #endif

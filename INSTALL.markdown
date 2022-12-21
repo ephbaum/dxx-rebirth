@@ -7,67 +7,81 @@ The DXX-Rebirth maintainers have no control over the sites linked below.  The ma
 
 ### Prerequisites
 
-* [Python 2.x](https://www.python.org/) to run [scons](https://www.scons.org/), the processor for SConstruct scripts.
-[Python 2.7](https://www.python.org/downloads/release/python-2714/) is recommended.
-As of this writing, **scons** does not support Python 3.x, but has plans to do so.
-* C++ compiler with support for selected C++11 features.  One of:
-    * [gcc](https://gcc.gnu.org/) 4.9.4 or later
-    * [clang](https://clang.llvm.org/) 3.3 or later
+* [Python 3.x](https://www.python.org/) to run [scons](https://www.scons.org/), the processor for SConstruct scripts.
+[Python 3.9](https://www.python.org/downloads/release/python-3912/) is recommended.
+* C++ compiler with support for selected C++20 features.  One of:
+    * [gcc](https://gcc.gnu.org/) 10.3
+    * [clang](https://clang.llvm.org/) 14.0 or later
     * Microsoft Visual Studio is **not** supported at this time.
-	  Support for Microsoft Visual Studio will be added when it
-	  implements sufficient C++11 features for the code to build with
-	  few or no modifications.
+	  Visual Studio 2022 release notes indicate it has sufficient C++ support
+	  that it should be able to compile Rebirth.  However, due to limitations
+	  of the Visual Studio installation environment, the core team does not
+	  use, test, or support Visual Studio.
 * [SDL 1.2](https://www.libsdl.org/).
-SDL 2 is **not** supported at this time.
-SDL 2 support is planned.
-If you would like to help, please post patches that resolve build failures that occur when SDL 2 is activated.
-Patches must not break support for SDL 1.
+SDL 2 is also supported, and will become the default soon.
 * [PhysicsFS](https://icculus.org/physfs/).
-PhysFS 2.x is recommended.
+PhysFS 3.x or later is required.
 
 Optional, but recommended:
 
+* [SDL\_image 1.2](https://www.libsdl.org/projects/SDL_image/).
 * [SDL\_mixer 1.2](https://www.libsdl.org/projects/SDL_mixer/).
-SDL\_mixer 2 is **not** supported at this time.
-* C++ compiler with support for selected C++14 features.  One of:
-    * [gcc](https://gcc.gnu.org/) 4.9.4 or later
-    * [clang](https://clang.llvm.org/) 3.4 or later
+* [libpng](http://www.libpng.org/).
 
-Unless otherwise noted, using the newest release available is recommended.  For example, prefer gcc-5.4 to gcc-4.9, even though both should work.
+Unless otherwise noted, using the newest release available is recommended.  For example, prefer gcc-11.3 to gcc-10.4, even though both should work.
 
 DXX-Rebirth can be built on one system to run on a different system, such as using Linux to build for Windows (a "cross-compiled build").  The sections below specify where to get prerequisites for a build meant to run on the system where it is built (a "native build").
+
+For each prerequisite, its development headers (files ending in **.h**) and its libraries (ending in **.so** for Linux, **.dylib** for Mac OS X, and **.dll** for Windows) must be found by the compiler.  You can do this by placing these files in an existing directory which the compiler will search, or by placing these files in a directory which you instruct the compiler to search.
+
+In general, avoid installing prerequisites to paths which contain embedded spaces.  Although Rebirth quotes paths to handle this, some prerequisites may use `pkg-config` files that do not handle embedded spaces well.
+
+#### Placing files in a directory which you instruct the compiler to search (preferred)
+
+If you choose to install the headers and/or libraries in a new path, you must instruct the build system to search that path.  To do this for development headers, add to the scons command line **"CPPFLAGS=-isystem** _/absolute/path/to/header/directory_**"**.  To do this for libraries, add to the scons command line **"LINKFLAGS=-L** _/absolute/path/to/library/directory_**"**.
+
+#### Adding files to an existing directory which the compiler will search
+
+To find these paths for gcc:
+* Get the compiler's header search path by running **gcc -Wp,-v -S -x c++ /dev/null** and looking at the lines under the label **#include <...> search starts here:**.  Any of these lines will work.  The paths _without_ a compiler version number in them are preferable.  Windows users may need to write **gcc -Wp,-v -S -x c++ nul** instead, due to Windows using a different name for the null device.
+* Get the compiler's library search path by running **gcc -print-search-dirs** and looking at the line labeled **libraries:**.  This line is a list of directories that will be searched.  Any of the directories will work.  Again, prefer directories that are do not have a compile version number in them.
 
 #### Windows
 Where possible, Windows users should try to obtain a compiled package, rather than locally compiling from source.  To build from source, read on.
 
 If you are not sure whether your system is Windows x86 or Windows x64, use the packages for Windows x86.  Systems running Windows x64 support running Windows x86 programs, but Windows x86 systems do not run Windows x64 programs.
 
-* [Python x86 MSI](https://www.python.org/ftp/python/2.7.14/python-2.7.14.msi) |
-[Python x64 MSI](https://www.python.org/ftp/python/2.7.14/python-2.7.14.amd64.msi)
-* [SCons](https://prdownloads.sourceforge.net/scons/scons-2.3.6-setup.exe)
+* [Python x86 installer](https://www.python.org/ftp/python/3.9.12/python-3.9.12.exe) |
+[Python x64 installer](https://www.python.org/ftp/python/3.9.12/python-3.9.12-amd64.exe)
+* [SCons](http://prdownloads.sourceforge.net/scons/scons-4.2.0.zip)
 * C++ compiler
     * mingw-gcc: [Getting Started](http://www.mingw.org/wiki/Getting_Started) |
 	[Direct download](https://sourceforge.net/projects/mingw/files/latest/download)
-    * [clang](https://llvm.org/releases/3.6.2/LLVM-3.6.2-win32.exe)
-	([.sig](https://llvm.org/releases/3.6.2/LLVM-3.6.2-win32.exe.sig))
 * [SDL 1.2 x86 zip](https://www.libsdl.org/release/SDL-1.2.15-win32.zip) |
 [SDL 1.2 x64 zip](https://www.libsdl.org/release/SDL-1.2.15-win32-x64.zip)
 * No published PhysFS package for Windows is known.
 You must [build it](https://hg.icculus.org/icculus/physfs/raw-file/bf155bd2127b/INSTALL.txt)
-from [source](https://icculus.org/physfs/downloads/physfs-2.0.3.tar.bz2).
+from [source](https://icculus.org/physfs/downloads/physfs-3.0.2.tar.bz2).
 You may be able avoid building from source by copying PhysFS DLLs from a
 previous Rebirth release and installing current PhysFS headers.
 However, building from source is recommended to ensure a consistent
 environment.
 
+#### MSYS2/mingw-w64 (Windows alternate method)
+* `pacman -S git ${MINGW_PACKAGE_PREFIX}-{gcc,pkgconf,scons,SDL,SDL_image,SDL_mixer,libpng,physfs}`
+
 #### Linux
 Install the listed prerequisites through your system package manager.
+* Arch PKGBUILD files are in `contrib/arch/`
+* An RPM spec file is in `contrib/rpm/`
+* Gentoo ebuild files are in `contrib/gentoo/`
 
 ##### Arch
 * **pacman -S
  base-devel
  scons
  sdl
+ sdl\_image
  sdl\_mixer
  physfs**
 
@@ -76,6 +90,7 @@ Install the listed prerequisites through your system package manager.
  gcc-c++
  scons
  SDL-devel
+ SDL\_image-devel
  SDL\_mixer-devel
  physfs-devel**
 
@@ -83,6 +98,7 @@ Install the listed prerequisites through your system package manager.
 * **emerge --ask --verbose --noreplace
  dev-util/scons
  media-libs/libsdl
+ media-libs/sdl-image
  media-libs/sdl-mixer
  dev-games/physfs**
 
@@ -91,6 +107,7 @@ Install the listed prerequisites through your system package manager.
  build-essential
  scons
  libsdl1.2-dev
+ libsdl-image1.2-dev
  libsdl-mixer1.2-dev
  libphysfs-dev**
 
@@ -109,13 +126,14 @@ from the Terminal.  This may need to be done after each major OS upgrade as well
 
 DXX-Rebirth can be built from the Terminal (via SCons) without Xcode; to build using Xcode requires Xcode to be installed.
 
+When building for Mac OS X, only SDL 2 is currently supported, as SDL 1.2 has long-standing issues with modern versions of the operating system.  Terminal builds for Mac OS X default to SDL 2, which is equivalent to passing **sdl2=True** as a parameter to the SCons command.
+
 ##### [Homebrew](https://github.com/Homebrew/homebrew/)
-* **brew install
- gcc5
- scons
- sdl
- sdl\_mixer
- physfs**
+The project includes a Brewfile for installing all required dependencies, if you use Homebrew.  You can install them with:
+
+* **brew bundle**
+
+**Note:** Because Homebrew only installs libraries and not frameworks, when building for Mac OS X with Homebrew-provided dependencies, you must provide **macos_add_frameworks=False** as a SCons command parameter in order for the build system to look for libraries rather than frameworks.
 
 ### Building
 Once prerequisites are installed, run **scons** *options* to build.  By default, both D1X-Rebirth and D2X-Rebirth are built.  To build only D1X-Rebirth, run **scons d1x=1**.  To build only D2X-Rebirth, run **scons d2x=1**.
@@ -139,28 +157,28 @@ Packaging scripts should use **builddir** with manually chosen directories.
 
 The build system supports building multiple targets in parallel.  This is primarily useful for developers, but can also be used by packagers to create secondary builds with different features enabled.  To use it, run **scons** *game*=*profile[,profile...]*.  **SConstruct** will search each profile for the known options.  The first match wins.  For example:
 
-        scons dxx=gcc5,e, d2x=gcc49,sdl, \
-            gcc49_CXX=/path/to/gcc-4.9 \
-            gcc5_CXX=/path/to/gcc-5 \
-            e_editor=1 sdl_opengl=0
+        scons dxx=gcc10,e, d2x=gcc11,sdl2, \
+            gcc10_CXX=/path/to/gcc-10 \
+            gcc11_CXX=/path/to/gcc-11 \
+            e_editor=1 sdl2_sdl2=1
 
-This tells **SConstruct** to build both games (**dxx**) with the profiles **gcc5**, **e**, *empty* and also to build D2X-Rebirth (**d2x**) with the profiles **gcc49**, **sdl**, *empty*.  Profiles **gcc49** and **gcc5** define private values for **CXX**, so the default value of **CXX** is ignored.  Profile **e** enables the **editor** option, which builds features used by players who want to create their own levels.  Profile **sdl** sets the **opengl** option to false, which produces a build that uses only the software renderer.  Profile *empty* is the default namespace, so CPPFLAGS, CXXFLAGS, etc. are found when it is searched.  Since these values were not assigned, they are drawn from the corresponding environment variables.
+This tells **SConstruct** to build both games (**dxx**) with the profiles **gcc10**, **e**, *empty* and also to build D2X-Rebirth (**d2x**) with the profiles **gcc11**, **sdl2**, *empty*.  Profiles **gcc10** and **gcc11** define private values for **CXX**, so the default value of **CXX** is ignored.  Profile **e** enables the **editor** option, which builds features used by players who want to create their own levels.  Profile **sdl2** sets the **sdl2** option to true, which produces a build that uses libSDL2 instead of libSDL.  Profile *empty* is the default namespace, so CPPFLAGS, CXXFLAGS, etc. are found when it is searched.  Since these values were not assigned, they are drawn from the corresponding environment variables.
 
 The build system supports specifying a group of closely related targets.  This is mostly redundant on shells with brace expansion support, but can be easier to type.  For example:
 
         scons builddir_prefix=build/ \
-			dxx=gcc5+gcc49,prof1,prof2,prof3,
+			dxx=gcc10+gcc11,prof1,prof2,prof3,
 
 This is equivalent to the shell brace expansion:
 
         scons builddir_prefix=build/ \
-			dxx={gcc5,gcc49},prof1,prof2,prof3,
+			dxx={gcc10,gcc11},prof1,prof2,prof3,
 
 or
 
         scons builddir_prefix=build/ \
-			dxx=gcc5,prof1,prof2,prof3, \
-			dxx=gcc49,prof1,prof2,prof3,
+			dxx=gcc10,prof1,prof2,prof3, \
+			dxx=gcc11,prof1,prof2,prof3,
 
 Profile addition can be stacked: **scons dxx=a+b,c+d,e+f** is equivalent to **scons dxx=a,c,e dxx=a,d,e dxx=b,c,e dxx=b,d,e dxx=a,c,f dxx=a,d,f dxx=b,c,f dxx=b,d,f**.
 
@@ -189,6 +207,24 @@ Linux output with **program\_name** unset:
 
 * *build-directory*/d1x-rebirth/d1x-rebirth*[-editor]*
 * *build-directory*/d2x-rebirth/d2x-rebirth*[-editor]*
+
+##### Compiling with MSYS2
+MSYS2 offers its users three terminal environments: msys2, for building with POSIX compatibility (linking to runtime `/usr/bin/msys-2.0.dll`); and mingw32 and mingw64, for building portable native Windows apps (linking to `C:\WINDOWS\System32\msvcrt.dll`), on i686 and x86_64 respectively.
+* Install [MSYS2](https://www.msys2.org), following the directions on the main page.
+* In either a mingw32 or mingw64 (not msys2) terminal:
+
+      pacman -Syuu  # update MSYS2, as needed
+      pacman -S --needed git ${MINGW_PACKAGE_PREFIX}-{gcc,pkgconf,scons,SDL,SDL_image,SDL_mixer,libpng,physfs}
+        #  ^ substitute SDL2 for SDL if desired
+      git clone https://github.com/dxx-rebirth/dxx-rebirth.git
+      cd dxx-rebirth
+      scons
+        # Or (for example) to build d1x only, with SDL 2, with lower process priority, on all cores:
+      time nice scons -j$(nproc) sdl2=1 d1x=1
+
+* A locally built executable will run anywhere if it's invoked from inside the appropriate mingw32 or mingw64 terminal. To run it instead directly in Windows, either:
+    1. The linked mingw-w64 libraries will need to be added to PATH (See [contrib/msys2](contrib/msys2) for working example batch files); or
+    2. Dependency DLLs from MSYS2 will need to be copied to the same directory as the executable.
 
 #### Installing
 For Windows and Linux, DXX-Rebirth installs only the main game binary.  The binary can be run from anywhere and can be installed by copying the game binary.  The game does not inspect the name of its binary.  You may rename the output after compilation without affecting the game.

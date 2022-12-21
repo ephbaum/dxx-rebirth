@@ -28,8 +28,8 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #include "ui.h"
 
-#ifdef __cplusplus
 #include "fwd-event.h"
+#include "fwd-segment.h"
 
 extern int TextureLights;
 extern int TextureEffects;
@@ -38,12 +38,10 @@ extern int TextureMetals;
 void init_replacements(void);
 void do_replacements(void);
 void do_replacements_all(void);
-int texpage_grab_current(int n);
+int texpage_grab_current(texture1_value n);
 int texpage_goto_first();
 void texpage_init( UI_DIALOG * dlg );
 void texpage_close();
 int texpage_do(const d_event &event);
-
-#endif
 
 #endif

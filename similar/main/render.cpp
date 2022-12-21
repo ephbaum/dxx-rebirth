@@ -30,6 +30,7 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <optional>
 #include "render_state.h"
 #include "inferno.h"
 #include "segment.h"
@@ -39,23 +40,16 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "render.h"
 #include "game.h"
 #include "object.h"
-#include "laser.h"
 #include "textures.h"
-#include "screens.h"
 #include "segpoint.h"
 #include "wall.h"
 #include "texmerge.h"
-#include "physics.h"
 #include "3d.h"
 #include "gameseg.h"
 #include "vclip.h"
 #include "lighting.h"
-#include "cntrlcen.h"
 #include "newdemo.h"
-#include "automap.h"
 #include "endlevel.h"
-#include "key.h"
-#include "newmenu.h"
 #include "u_mem.h"
 #include "piggy.h"
 #include "timer.h"
@@ -66,8 +60,9 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #endif
 #include "args.h"
 
-#include "compiler-integer_sequence.h"
 #include "compiler-range_for.h"
+#include "d_levelstate.h"
+#include "d_enumerate.h"
 #include "d_range.h"
 #include "partial_range.h"
 #include "segiter.h"
@@ -76,6 +71,7 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "editor/editor.h"
 #include "editor/esegment.h"
 #endif
+#include <utility>
 
 using std::min;
 using std::max;
@@ -92,8 +88,6 @@ unsigned Max_linear_depth = 50; // Deepest segment at which linear interpolation
 int	Clear_window_color=-1;
 int	Clear_window=2;	// 1 = Clear whole background window, 2 = clear view portals into rest of world, 0 = no clear
 
-static uint16_t s_current_generation;
-
 // When any render function needs to know what's looking at it, it should 
 // access Viewer members.
 namespace dsx {
@@ -105,14 +99,12 @@ constexpr
 #endif
 fix Render_zoom = 0x9000;					//the player's zoom factor
 
+namespace {
+static uint16_t s_current_generation;
 #ifndef NDEBUG
 static std::bitset<MAX_OBJECTS> object_rendered;
 #endif
-
-#if DXX_USE_EDITOR
-int	Render_only_bottom=0;
-int	Bottom_bitmap_num = 9;
-#endif
+}
 
 namespace dcx {
 
@@ -122,11 +114,16 @@ int Window_clip_left,Window_clip_top,Window_clip_right,Window_clip_bot;
 }
 
 #if DXX_USE_EDITOR
+int	Render_only_bottom=0;
+int	Bottom_bitmap_num = 9;
 int _search_mode = 0;			//true if looking for curseg,side,face
 short _search_x,_search_y;	//pixel we're looking at
-static int found_side,found_face;
+namespace {
+static int found_face;
+static sidenum_t found_side;
 static segnum_t found_seg;
 static objnum_t found_obj;
+}
 #else
 constexpr int _search_mode = 0;
 #endif
@@ -143,17 +140,14 @@ int toggle_outline_mode(void)
 #endif
 
 #ifndef NDEBUG
-#if DXX_USE_OGL
-#define draw_outline(C,a,b)	draw_outline(a,b)
-#endif
-static void draw_outline(grs_canvas &canvas, const unsigned nverts, cg3s_point *const *const pointlist)
+namespace {
+static void draw_outline(const g3_draw_line_context &context, const unsigned nverts, cg3s_point *const *const pointlist)
 {
-	const uint8_t color = BM_XRGB(63, 63, 63);
-
 	const unsigned e = nverts - 1;
 	range_for (const unsigned i, xrange(e))
-		g3_draw_line(canvas, *pointlist[i], *pointlist[i + 1], color);
-	g3_draw_line(canvas, *pointlist[e], *pointlist[0], color);
+		g3_draw_line(context, *pointlist[i], *pointlist[i + 1]);
+	g3_draw_line(context, *pointlist[e], *pointlist[0]);
+}
 }
 #endif
 
@@ -167,10 +161,8 @@ constexpr std::integral_constant<fix, FLASH_CYCLE_RATE> Flash_rate{};
 namespace dsx {
 void flash_frame()
 {
+	auto &LevelUniqueControlCenterState = LevelUniqueObjectState.ControlCenterState;
 	static fixang flash_ang=0;
-
-	if (!Control_center_destroyed && !Seismic_tremor_magnitude)
-		return;
 
 	if (Endlevel_sequence)
 		return;
@@ -180,7 +172,8 @@ void flash_frame()
 
 //	flash_ang += fixmul(FLASH_CYCLE_RATE,FrameTime);
 #if defined(DXX_BUILD_DESCENT_II)
-	if (Seismic_tremor_magnitude) {
+	if (const auto Seismic_tremor_magnitude = LevelUniqueSeismicState.Seismic_tremor_magnitude)
+	{
 		fix	added_flash;
 
 		added_flash = abs(Seismic_tremor_magnitude);
@@ -192,12 +185,13 @@ void flash_frame()
 		flash_scale = (flash_scale + F1_0*3)/4;	//	gets in range 0.5 to 1.0
 	} else
 #endif
+	if (LevelUniqueControlCenterState.Control_center_destroyed)
 	{
 		flash_ang += fixmul(Flash_rate,FrameTime);
 		flash_scale = fix_fastsin(flash_ang);
 		flash_scale = (flash_scale + f1_0)/2;
 #if defined(DXX_BUILD_DESCENT_II)
-		if (Difficulty_level == 0)
+		if (GameUniqueState.Difficulty_level == Difficulty_level_type::_0)
 			flash_scale = (flash_scale+F1_0*3)/4;
 #endif
 	}
@@ -205,10 +199,11 @@ void flash_frame()
 
 }
 
+namespace {
 static inline int is_alphablend_eclip(int eclip_num)
 {
 #if defined(DXX_BUILD_DESCENT_II)
-	if (eclip_num == ECLIP_NUM_FORCE_FIELD)
+	if (eclip_num == ECLIP_NUM_FORCE_FIELD || eclip_num == ECLIP_NUM_FORCE_FIELD2)
 		return 1;
 #endif
 	return eclip_num == ECLIP_NUM_FUELCEN;
@@ -220,12 +215,13 @@ static inline int is_alphablend_eclip(int eclip_num)
 //	they are used for our hideously hacked in headlight system.
 //	vp is a pointer to vertex ids.
 //	tmap1, tmap2 are texture map ids.  tmap2 is the pasty one.
-static void render_face(grs_canvas &canvas, const shared_segment &segp, const unsigned sidenum, const unsigned nv, const array<unsigned, 4> &vp, const unsigned tmap1, const unsigned tmap2, array<g3s_uvl, 4> uvl_copy, const WALL_IS_DOORWAY_result_t wid_flags)
+static void render_face(grs_canvas &canvas, const shared_segment &segp, const sidenum_t sidenum, const unsigned nv, const std::array<vertnum_t, 4> &vp, const texture1_value tmap1, const texture2_value tmap2, std::array<g3s_uvl, 4> uvl_copy, const WALL_IS_DOORWAY_result_t wid_flags)
 {
+	auto &LevelUniqueControlCenterState = LevelUniqueObjectState.ControlCenterState;
 	auto &TmapInfo = LevelUniqueTmapInfoState.TmapInfo;
 	grs_bitmap  *bm;
 
-	array<cg3s_point *, 4> pointlist;
+	std::array<cg3s_point *, 4> pointlist;
 
 	Assert(nv <= pointlist.size());
 
@@ -242,34 +238,33 @@ static void render_face(grs_canvas &canvas, const shared_segment &segp, const un
 #endif
 #elif defined(DXX_BUILD_DESCENT_II)
 	//handle cloaked walls
-	if (wid_flags & WID_CLOAKED_FLAG) {
+	if (wid_flags & WALL_IS_DOORWAY_FLAG::cloaked) {
 		const auto wall_num = segp.shared_segment::sides[sidenum].wall_num;
 		auto &Walls = LevelUniqueWallSubsystemState.Walls;
 		auto &vcwallptr = Walls.vcptr;
-		gr_settransblend(canvas, vcwallptr(wall_num)->cloak_value, GR_BLEND_NORMAL);
+		gr_settransblend(canvas, static_cast<gr_fade_level>(vcwallptr(wall_num)->cloak_value), gr_blend::normal);
 		const uint8_t color = BM_XRGB(0, 0, 0);
 		// set to black (matters for s3)
 
 		g3_draw_poly(canvas, nv, pointlist, color);    // draw as flat poly
-		gr_settransblend(canvas, GR_FADE_OFF, GR_BLEND_NORMAL);
+		gr_settransblend(canvas, GR_FADE_OFF, gr_blend::normal);
 
 		return;
 	}
 #endif
 
-	if (tmap1 >= NumTextures) {
-		Int3();
-	}
-
 #if DXX_USE_OGL
 	grs_bitmap *bm2 = nullptr;
 	if (!CGameArg.DbgUseOldTextureMerge)
 	{
-		PIGGY_PAGE_IN(Textures[tmap1]);
-		bm = &GameBitmaps[Textures[tmap1].index];
-		if (tmap2){
-			PIGGY_PAGE_IN(Textures[tmap2&0x3FFF]);
-			bm2 = &GameBitmaps[Textures[tmap2&0x3FFF].index];
+		auto &texture1 = Textures[get_texture_index(tmap1)];
+		PIGGY_PAGE_IN(texture1);
+		bm = &GameBitmaps[texture1.index];
+		if (tmap2 != texture2_value::None)
+		{
+			const auto texture2 = Textures[get_texture_index(tmap2)];
+			PIGGY_PAGE_IN(texture2);
+			bm2 = &GameBitmaps[texture2.index];
 			if (bm2->get_flag_mask(BM_FLAG_SUPER_TRANSPARENT))
 			{
 				bm2 = nullptr;
@@ -278,21 +273,26 @@ static void render_face(grs_canvas &canvas, const shared_segment &segp, const un
 		}
 	}else
 #endif
-
 		// New code for overlapping textures...
-		if (tmap2 != 0) {
+		if (tmap2 != texture2_value::None)
+		{
 			bm = &texmerge_get_cached_bitmap( tmap1, tmap2 );
 		} else {
-			bm = &GameBitmaps[Textures[tmap1].index];
-			PIGGY_PAGE_IN(Textures[tmap1]);
+			auto &texture1 = Textures[get_texture_index(tmap1)];
+			bm = &GameBitmaps[texture1.index];
+			PIGGY_PAGE_IN(texture1);
 		}
 
 	assert(!bm->get_flag_mask(BM_FLAG_PAGED_OUT));
 
-	array<g3s_lrgb, 4>		dyn_light;
-	const auto seismic_tremor_magnitude = Seismic_tremor_magnitude;
-	const auto control_center_destroyed = Control_center_destroyed;
-	const auto need_flashing_lights = (control_center_destroyed | seismic_tremor_magnitude);	//make lights flash
+	std::array<g3s_lrgb, 4>		dyn_light;
+#if defined(DXX_BUILD_DESCENT_I)
+	const auto Seismic_tremor_magnitude = 0;
+#elif defined(DXX_BUILD_DESCENT_II)
+	const auto Seismic_tremor_magnitude = LevelUniqueSeismicState.Seismic_tremor_magnitude;
+#endif
+	const auto control_center_destroyed = LevelUniqueControlCenterState.Control_center_destroyed;
+	const auto need_flashing_lights = (control_center_destroyed | Seismic_tremor_magnitude);	//make lights flash
 	auto &Dynamic_light = LevelUniqueLightState.Dynamic_light;
 	//set light values for each vertex & build pointlist
 	range_for (const uint_fast32_t i, xrange(nv))
@@ -318,7 +318,7 @@ static void render_face(grs_canvas &canvas, const shared_segment &segp, const un
 		if (need_flashing_lights)	//make lights flash
 		{
 			dli.g = dli.b = fixmul(flash_scale, uvli.l);
-			dli.r = (!seismic_tremor_magnitude && PlayerCfg.DynLightColor)
+			dli.r = (!Seismic_tremor_magnitude && PlayerCfg.DynLightColor)
 				? fixmul(std::max(static_cast<double>(flash_scale), f0_5 * 1.5), uvli.l) // let the mine glow red a little
 				: dli.g;
 		}
@@ -343,52 +343,59 @@ static void render_face(grs_canvas &canvas, const shared_segment &segp, const un
 	}
 
 	bool alpha = false;
-	if (PlayerCfg.AlphaBlendEClips && is_alphablend_eclip(TmapInfo[tmap1].eclip_num)) // set nice transparency/blending for some special effects (if we do more, we should maybe use switch here)
+	if (PlayerCfg.AlphaBlendEClips && is_alphablend_eclip(TmapInfo[get_texture_index(tmap1)].eclip_num)) // set nice transparency/blending for some special effects (if we do more, we should maybe use switch here)
 	{
 		alpha = true;
-		gr_settransblend(canvas, GR_FADE_OFF, GR_BLEND_ADDITIVE_C);
+		gr_settransblend(canvas, GR_FADE_OFF, gr_blend::additive_c);
 	}
 
 #if DXX_USE_EDITOR
-	if ((Render_only_bottom) && (sidenum == WBOTTOM))
+	if (Render_only_bottom && sidenum == sidenum_t::WBOTTOM)
 		g3_draw_tmap(canvas, nv, pointlist, uvl_copy, dyn_light, GameBitmaps[Textures[Bottom_bitmap_num].index]);
 	else
 #endif
 
 #if DXX_USE_OGL
 		if (bm2){
-			g3_draw_tmap_2(canvas, nv, pointlist, uvl_copy, dyn_light, *bm, *bm2, ((tmap2 & 0xC000) >> 14) & 3);
+			g3_draw_tmap_2(canvas, nv, pointlist, uvl_copy, dyn_light, *bm, *bm2, get_texture_rotation_low(tmap2));
 		}else
 #endif
 			g3_draw_tmap(canvas, nv, pointlist, uvl_copy, dyn_light, *bm);
 
 	if (alpha)
-		gr_settransblend(canvas, GR_FADE_OFF, GR_BLEND_NORMAL); // revert any transparency / blending setting back to normal
+		gr_settransblend(canvas, GR_FADE_OFF, gr_blend::normal); // revert any transparency / blending setting back to normal
 
 #ifndef NDEBUG
-	if (Outline_mode) draw_outline(canvas, nv, &pointlist[0]);
+	if (Outline_mode)
+	{
+		const uint8_t color = BM_XRGB(63, 63, 63);
+		g3_draw_line_context context{canvas, color};
+		draw_outline(context, nv, &pointlist[0]);
+	}
 #endif
 }
 }
+}
 
+namespace {
 // ----------------------------------------------------------------------------
 //	Only called if editor active.
 //	Used to determine which face was clicked on.
-static void check_face(grs_canvas &canvas, const vmsegidx_t segnum, const unsigned sidenum, const unsigned facenum, const unsigned nv, const array<unsigned, 4> &vp, const unsigned tmap1, const unsigned tmap2, const array<g3s_uvl, 4> &uvl_copy)
+static void check_face(grs_canvas &canvas, const vmsegidx_t segnum, const sidenum_t sidenum, const unsigned facenum, const unsigned nv, const std::array<vertnum_t, 4> &vp, const texture1_value tmap1, const texture2_value tmap2, const std::array<g3s_uvl, 4> &uvl_copy)
 {
 #if DXX_USE_EDITOR
 	if (_search_mode) {
-		array<g3s_lrgb, 4> dyn_light{};
-		array<cg3s_point *, 4> pointlist;
+		std::array<g3s_lrgb, 4> dyn_light{};
+		std::array<cg3s_point *, 4> pointlist;
 #if DXX_USE_OGL
 		(void)tmap1;
 		(void)tmap2;
 #else
 		grs_bitmap *bm;
-		if (tmap2 > 0 )
+		if (tmap2 != texture2_value::None)
 			bm = &texmerge_get_cached_bitmap( tmap1, tmap2 );
 		else
-			bm = &GameBitmaps[Textures[tmap1].index];
+			bm = &GameBitmaps[Textures[get_texture_index(tmap1)].index];
 #endif
 		range_for (const uint_fast32_t i, xrange(nv))
 		{
@@ -439,10 +446,10 @@ static void check_face(grs_canvas &canvas, const vmsegidx_t segnum, const unsign
 }
 
 template <std::size_t... N>
-static inline void check_render_face(grs_canvas &canvas, index_sequence<N...>, const vcsegptridx_t segnum, const unsigned sidenum, const unsigned facenum, const array<unsigned, 4> &ovp, const unsigned tmap1, const unsigned tmap2, const array<uvl, 4> &uvlp, const WALL_IS_DOORWAY_result_t wid_flags, const std::size_t nv)
+static inline void check_render_face(grs_canvas &canvas, std::index_sequence<N...>, const vcsegptridx_t segnum, const sidenum_t sidenum, const unsigned facenum, const std::array<vertnum_t, 4> &ovp, const texture1_value tmap1, const texture2_value tmap2, const std::array<uvl, 4> &uvlp, const WALL_IS_DOORWAY_result_t wid_flags, const std::size_t nv)
 {
-	const array<unsigned, 4> vp{{ovp[N]...}};
-	const array<g3s_uvl, 4> uvl_copy{{
+	const std::array<vertnum_t, 4> vp{{ovp[N]...}};
+	const std::array<g3s_uvl, 4> uvl_copy{{
 		{uvlp[N].u, uvlp[N].v, uvlp[N].l}...
 	}};
 	render_face(canvas, segnum, sidenum, nv, vp, tmap1, tmap2, uvl_copy, wid_flags);
@@ -450,7 +457,7 @@ static inline void check_render_face(grs_canvas &canvas, index_sequence<N...>, c
 }
 
 template <std::size_t N0, std::size_t N1, std::size_t N2, std::size_t N3>
-static inline void check_render_face(grs_canvas &canvas, index_sequence<N0, N1, N2, N3> is, const vcsegptridx_t segnum, const unsigned sidenum, const unsigned facenum, const array<unsigned, 4> &vp, const unsigned tmap1, const unsigned tmap2, const array<uvl, 4> &uvlp, const WALL_IS_DOORWAY_result_t wid_flags)
+static inline void check_render_face(grs_canvas &canvas, std::index_sequence<N0, N1, N2, N3> is, const vcsegptridx_t segnum, const sidenum_t sidenum, const unsigned facenum, const std::array<vertnum_t, 4> &vp, const texture1_value tmap1, const texture2_value tmap2, const std::array<uvl, 4> &uvlp, const WALL_IS_DOORWAY_result_t wid_flags)
 {
 	check_render_face(canvas, is, segnum, sidenum, facenum, vp, tmap1, tmap2, uvlp, wid_flags, 4);
 }
@@ -459,24 +466,26 @@ static inline void check_render_face(grs_canvas &canvas, index_sequence<N0, N1, 
  * are default constructed, gcc zero initializes all members.
  */
 template <std::size_t N0, std::size_t N1, std::size_t N2>
-static inline void check_render_face(grs_canvas &canvas, index_sequence<N0, N1, N2>, const vcsegptridx_t segnum, const unsigned sidenum, const unsigned facenum, const array<unsigned, 4> &vp, const unsigned tmap1, const unsigned tmap2, const array<uvl, 4> &uvlp, const WALL_IS_DOORWAY_result_t wid_flags)
+static inline void check_render_face(grs_canvas &canvas, std::index_sequence<N0, N1, N2>, const vcsegptridx_t segnum, const sidenum_t sidenum, const unsigned facenum, const std::array<vertnum_t, 4> &vp, const texture1_value tmap1, const texture2_value tmap2, const std::array<uvl, 4> &uvlp, const WALL_IS_DOORWAY_result_t wid_flags)
 {
-	check_render_face(canvas, index_sequence<N0, N1, N2, 3>(), segnum, sidenum, facenum, vp, tmap1, tmap2, uvlp, wid_flags, 3);
+	check_render_face(canvas, std::index_sequence<N0, N1, N2, 3>(), segnum, sidenum, facenum, vp, tmap1, tmap2, uvlp, wid_flags, 3);
 }
 
 constexpr std::integral_constant<fix, (F1_0/4)> Tulate_min_dot{};
 //--unused-- fix	Tulate_min_ratio = (2*F1_0);
 constexpr std::integral_constant<fix, (F1_0*15/16)> Min_n0_n1_dot{};
+}
 
 // -----------------------------------------------------------------------------------
 //	Render a side.
 //	Check for normal facing.  If so, render faces on side dictated by sidep->type.
 namespace dsx {
-static void render_side(fvcvertptr &vcvertptr, grs_canvas &canvas, const vcsegptridx_t segp, const unsigned sidenum, const WALL_IS_DOORWAY_result_t wid_flags, const vms_vector &Viewer_eye)
+namespace {
+static void render_side(fvcvertptr &vcvertptr, grs_canvas &canvas, const vcsegptridx_t segp, const sidenum_t sidenum, const WALL_IS_DOORWAY_result_t wid_flags, const vms_vector &Viewer_eye)
 {
 	fix		min_dot, max_dot;
 
-	if (!(wid_flags & WID_RENDER_FLAG))		//if (WALL_IS_DOORWAY(segp, sidenum) == WID_NO_WALL)
+	if (!(wid_flags & WALL_IS_DOORWAY_FLAG::render))		//if (WALL_IS_DOORWAY(segp, sidenum) == WID_NO_WALL)
 		return;
 
 	const auto vertnum_list = get_side_verts(segp,sidenum);
@@ -485,7 +494,7 @@ static void render_side(fvcvertptr &vcvertptr, grs_canvas &canvas, const vcsegpt
 	//	deal with it, get the dot product.
 	const auto &sside = segp->shared_segment::sides[sidenum];
 	const unsigned which_vertnum =
-		(sside.get_type() == SIDE_IS_TRI_13)
+		(sside.get_type() == side_type::tri_13)
 			? 1
 			: 0;
 	const auto tvec = vm_vec_normalized_quick(vm_vec_sub(Viewer_eye, vcvertptr(vertnum_list[which_vertnum])));
@@ -493,10 +502,10 @@ static void render_side(fvcvertptr &vcvertptr, grs_canvas &canvas, const vcsegpt
 	const auto v_dot_n0 = vm_vec_dot(tvec, normals[0]);
 	//	========== Mark: Here is the change...beginning here: ==========
 
-	index_sequence<0, 1, 2, 3> is_quad;
+	std::index_sequence<0, 1, 2, 3> is_quad;
 	const auto &uside = segp->unique_segment::sides[sidenum];
-	if (sside.get_type() == SIDE_IS_QUAD) {
-
+	if (sside.get_type() == side_type::quad)
+	{
 		if (v_dot_n0 >= 0) {
 			check_render_face(canvas, is_quad, segp, sidenum, 0, vertnum_list, uside.tmap_num, uside.tmap_num2, uside.uvls, wid_flags);
 		}
@@ -529,24 +538,27 @@ static void render_side(fvcvertptr &vcvertptr, grs_canvas &canvas, const vcsegpt
 			check_render_face(canvas, is_quad, segp, sidenum, 0, vertnum_list, uside.tmap_num, uside.tmap_num2, uside.uvls, wid_flags);
 		} else {
 im_so_ashamed: ;
-			if (sside.get_type() == SIDE_IS_TRI_02) {
+			if (sside.get_type() == side_type::tri_02)
+			{
 				if (v_dot_n0 >= 0) {
-					check_render_face(canvas, index_sequence<0, 1, 2>(), segp, sidenum, 0, vertnum_list, uside.tmap_num, uside.tmap_num2, uside.uvls, wid_flags);
+					check_render_face(canvas, std::index_sequence<0, 1, 2>(), segp, sidenum, 0, vertnum_list, uside.tmap_num, uside.tmap_num2, uside.uvls, wid_flags);
 				}
 
 				if (v_dot_n1 >= 0) {
 					// want to render from vertices 0, 2, 3 on side
-					check_render_face(canvas, index_sequence<0, 2, 3>(), segp, sidenum, 1, vertnum_list, uside.tmap_num, uside.tmap_num2, uside.uvls, wid_flags);
+					check_render_face(canvas, std::index_sequence<0, 2, 3>(), segp, sidenum, 1, vertnum_list, uside.tmap_num, uside.tmap_num2, uside.uvls, wid_flags);
 				}
-			} else if (sside.get_type() ==  SIDE_IS_TRI_13) {
+			}
+			else if (sside.get_type() == side_type::tri_13)
+			{
 				if (v_dot_n1 >= 0) {
 					// rendering 1,2,3, so just skip 0
-					check_render_face(canvas, index_sequence<1, 2, 3>(), segp, sidenum, 1, vertnum_list, uside.tmap_num, uside.tmap_num2, uside.uvls, wid_flags);
+					check_render_face(canvas, std::index_sequence<1, 2, 3>(), segp, sidenum, 1, vertnum_list, uside.tmap_num, uside.tmap_num2, uside.uvls, wid_flags);
 				}
 
 				if (v_dot_n0 >= 0) {
 					// want to render from vertices 0,1,3
-					check_render_face(canvas, index_sequence<0, 1, 3>(), segp, sidenum, 0, vertnum_list, uside.tmap_num, uside.tmap_num2, uside.uvls, wid_flags);
+					check_render_face(canvas, std::index_sequence<0, 1, 3>(), segp, sidenum, 0, vertnum_list, uside.tmap_num, uside.tmap_num2, uside.uvls, wid_flags);
 				}
 
 			} else
@@ -643,7 +655,7 @@ static void do_render_object(grs_canvas &canvas, const d_level_unique_light_stat
 	//	Added by MK on 09/07/94 (at about 5:28 pm, CDT, on a beautiful, sunny late summer day!) so
 	//	that the guided missile system will know what objects to look at.
 	//	I didn't know we had guided missiles before the release of D1. --MK
-	if (obj->type == OBJ_ROBOT)
+	if (obj->type == OBJ_ROBOT && obj->ctype.ai_info.ail.player_awareness_type == player_awareness_type_t::PA_NONE && (obj.get_unchecked_index() & 3) == (d_tick_count & 3))
 		window.rendered_robots.emplace_back(obj);
 
 	if ((count++ > MAX_OBJECTS) || (obj->next == obj)) {
@@ -675,7 +687,7 @@ static void do_render_object(grs_canvas &canvas, const d_level_unique_light_stat
 	{
 		const auto &&o = obj.absolute_sibling(n);
 		Assert(o->type == OBJ_FIREBALL);
-		Assert(o->control_type == CT_EXPLOSION);
+		assert(o->control_source == object::control_type::explosion);
 		Assert(o->flags & OF_ATTACHED);
 		n = o->ctype.expl_info.next_attach;
 
@@ -689,6 +701,7 @@ static void do_render_object(grs_canvas &canvas, const d_level_unique_light_stat
 	#endif
 
 
+}
 }
 }
 
@@ -705,7 +718,7 @@ void render_start_frame()
 }
 
 //Given a lit of point numbers, rotate any that haven't been rotated this frame
-g3s_codes rotate_list(fvcvertptr &vcvertptr, const std::size_t nv, const unsigned *const pointnumlist)
+g3s_codes rotate_list(fvcvertptr &vcvertptr, const std::size_t nv, const vertnum_t *const pointnumlist)
 {
 	g3s_codes cc;
 	const auto current_generation = s_current_generation;
@@ -738,35 +751,38 @@ g3s_codes rotate_list(fvcvertptr &vcvertptr, const std::size_t nv, const unsigne
 
 }
 
+namespace {
 //Given a lit of point numbers, project any that haven't been projected
-static void project_list(const array<unsigned, 8> &pointnumlist)
+static void project_list(const std::array<vertnum_t, 8> &pointnumlist)
 {
 	range_for (const auto pnum, pointnumlist)
 	{
 		auto &p = Segment_points[pnum];
-		if (!(p.p3_flags & PF_PROJECTED))
+		if (!(p.p3_flags & projection_flag::projected))
 			g3_project_point(p);
 	}
+}
 }
 
 
 // -----------------------------------------------------------------------------------
 #if !DXX_USE_OGL
 namespace dsx {
-static void render_segment(const vms_vector &Viewer_eye, grs_canvas &canvas, const vcsegptridx_t seg)
+namespace {
+static void render_segment(fvcvertptr &vcvertptr, fvcwallptr &vcwallptr, const vms_vector &Viewer_eye, grs_canvas &canvas, const vcsegptridx_t seg)
 {
-	if (!rotate_list(vcvertptr, seg->verts).uand)
+	if (rotate_list(vcvertptr, seg->verts).uand == clipping_code::None)
 	{		//all off screen?
 
 #if defined(DXX_BUILD_DESCENT_II)
 		if (Viewer->type != OBJ_ROBOT)
 #endif
 		{
-		Automap_visited[seg]=1;
+			LevelUniqueAutomapState.Automap_visited[seg] = 1;
 		}
 
-		range_for (const uint_fast32_t sn, xrange(MAX_SIDES_PER_SEGMENT))
-			render_side(vcvertptr, canvas, seg, sn, WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, seg, seg, sn), Viewer_eye);
+		for (const auto sn : MAX_SIDES_PER_SEGMENT)
+			render_side(vcvertptr, canvas, seg, sn, WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, seg, sn), Viewer_eye);
 	}
 
 	//draw any objects that happen to be in this segment
@@ -775,33 +791,34 @@ static void render_segment(const vms_vector &Viewer_eye, grs_canvas &canvas, con
 	//object_sort_segment_objects( seg );
 }
 }
+}
 #endif
 
 #if DXX_USE_EDITOR
 #ifndef NDEBUG
 
+namespace {
 constexpr fix CROSS_WIDTH = i2f(8);
 constexpr fix CROSS_HEIGHT = i2f(8);
 
 //draw outline for curside
-static void outline_seg_side(grs_canvas &canvas, const shared_segment &seg, const unsigned _side, const unsigned edge, const unsigned vert)
+static void outline_seg_side(grs_canvas &canvas, const shared_segment &seg, const sidenum_t _side, const side_relative_vertnum edge, const side_relative_vertnum vert)
 {
 	auto &verts = seg.verts;
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
-	if (!rotate_list(vcvertptr, verts).uand)
+	if (rotate_list(vcvertptr, verts).uand == clipping_code::None)
 	{		//all off screen?
-		g3s_point *pnt;
-
 		//render curedge of curside of curseg in green
 
 		const uint8_t color = BM_XRGB(0, 63, 0);
 		auto &sv = Side_to_verts[_side];
-		g3_draw_line(canvas, Segment_points[verts[sv[edge]]], Segment_points[verts[sv[(edge + 1)%4]]], color);
+		g3_draw_line(g3_draw_line_context{canvas, color}, Segment_points[verts[sv[edge]]], Segment_points[verts[sv[next_side_vertex(edge)]]]);
 
 		//draw a little cross at the current vert
 
-		pnt = &Segment_points[verts[Side_to_verts[_side][vert]]];
+		const auto pnt = &Segment_points[verts[sv[vert]]];
 
 		g3_project_point(*pnt);		//make sure projected
 
@@ -814,52 +831,106 @@ static void outline_seg_side(grs_canvas &canvas, const shared_segment &seg, cons
 		gr_line(canvas, pnt->p3_sx, pnt->p3_sy + CROSS_HEIGHT, pnt->p3_sx - CROSS_WIDTH, pnt->p3_sy, color);
 	}
 }
+}
 
 #endif
 #endif
 
-static ubyte code_window_point(fix x,fix y,const rect &w)
+namespace dcx {
+
+namespace {
+
+static clipping_code code_window_point(const fix x, const fix y, const rect &w)
 {
-	ubyte code=0;
+	clipping_code code{};
+	if (x <= w.left)
+		code |= clipping_code::off_left;
+	if (x >= w.right)
+		code |= clipping_code::off_right;
 
-	if (x <= w.left)  code |= 1;
-	if (x >= w.right) code |= 2;
-
-	if (y <= w.top) code |= 4;
-	if (y >= w.bot) code |= 8;
+	if (y <= w.top)
+		code |= clipping_code::off_top;
+	if (y >= w.bot)
+		code |= clipping_code::off_bot;
 
 	return code;
 }
 
+}
+
 //Given two sides of segment, tell the two verts which form the 
 //edge between them
-constexpr array<
-	array<
-		array<int_fast8_t, 2>,
-		6>,
-	6> Two_sides_to_edge = {{
-	{{  {{edge_none,edge_none}},	 {{3,7}},	 {{edge_none,edge_none}},	 {{2,6}},	 {{6,7}},	 {{2,3}}	}},
-	{{  {{3,7}},	 {{edge_none,edge_none}},	 {{0,4}},	 {{edge_none,edge_none}},	 {{4,7}},	 {{0,3}}	}},
-	{{  {{edge_none,edge_none}},	 {{0,4}},	 {{edge_none,edge_none}},	 {{1,5}},	 {{4,5}},	 {{0,1}}	}},
-	{{  {{2,6}},	 {{edge_none,edge_none}},	 {{1,5}},	 {{edge_none,edge_none}},	 {{5,6}},	 {{1,2}}	}},
-	{{  {{6,7}},	 {{4,7}},	 {{4,5}},	 {{5,6}},	 {{edge_none,edge_none}},	 {{edge_none,edge_none}}	}},
-	{{  {{2,3}},	 {{0,3}},	 {{0,1}},	 {{1,2}},	 {{edge_none,edge_none}},	 {{edge_none,edge_none}}	}}
-}};
+constexpr enumerated_array<
+	enumerated_array<
+		std::array<segment_relative_vertnum, 2>,
+		6, sidenum_t>,
+	6, sidenum_t> Two_sides_to_edge = {{{
+	{{{
+		{{segment_relative_vertnum{0xff}, segment_relative_vertnum{0xff}}},
+		{{segment_relative_vertnum::_3, segment_relative_vertnum::_7}},
+		{{segment_relative_vertnum{0xff}, segment_relative_vertnum{0xff}}},
+		{{segment_relative_vertnum::_2, segment_relative_vertnum::_6}},
+		{{segment_relative_vertnum::_6, segment_relative_vertnum::_7}},
+		{{segment_relative_vertnum::_2, segment_relative_vertnum::_3}}
+	}}},
+	{{{
+		{{segment_relative_vertnum::_3, segment_relative_vertnum::_7}},
+		{{segment_relative_vertnum{0xff}, segment_relative_vertnum{0xff}}},
+		{{segment_relative_vertnum::_0, segment_relative_vertnum::_4}},
+		{{segment_relative_vertnum{0xff}, segment_relative_vertnum{0xff}}},
+		{{segment_relative_vertnum::_4, segment_relative_vertnum::_7}},
+		{{segment_relative_vertnum::_0, segment_relative_vertnum::_3}}
+	}}},
+	{{{
+		{{segment_relative_vertnum{0xff}, segment_relative_vertnum{0xff}}},
+		{{segment_relative_vertnum::_0, segment_relative_vertnum::_4}},
+		{{segment_relative_vertnum{0xff}, segment_relative_vertnum{0xff}}},
+		{{segment_relative_vertnum::_1, segment_relative_vertnum::_5}},
+		{{segment_relative_vertnum::_4, segment_relative_vertnum::_5}},
+		{{segment_relative_vertnum::_0, segment_relative_vertnum::_1}}
+	}}},
+	{{{
+		{{segment_relative_vertnum::_2, segment_relative_vertnum::_6}},
+		{{segment_relative_vertnum{0xff}, segment_relative_vertnum{0xff}}},
+		{{segment_relative_vertnum::_1, segment_relative_vertnum::_5}},
+		{{segment_relative_vertnum{0xff}, segment_relative_vertnum{0xff}}},
+		{{segment_relative_vertnum::_5, segment_relative_vertnum::_6}},
+		{{segment_relative_vertnum::_1, segment_relative_vertnum::_2}}
+	}}},
+	{{{
+		{{segment_relative_vertnum::_6, segment_relative_vertnum::_7}},
+		{{segment_relative_vertnum::_4, segment_relative_vertnum::_7}},
+		{{segment_relative_vertnum::_4, segment_relative_vertnum::_5}},
+		{{segment_relative_vertnum::_5, segment_relative_vertnum::_6}},
+		{{segment_relative_vertnum{0xff}, segment_relative_vertnum{0xff}}},
+		{{segment_relative_vertnum{0xff}, segment_relative_vertnum{0xff}}}
+	}}},
+	{{{
+		{{segment_relative_vertnum::_2, segment_relative_vertnum::_3}},
+		{{segment_relative_vertnum::_0, segment_relative_vertnum::_3}},
+		{{segment_relative_vertnum::_0, segment_relative_vertnum::_1}},
+		{{segment_relative_vertnum::_1, segment_relative_vertnum::_2}},
+		{{segment_relative_vertnum{0xff}, segment_relative_vertnum{0xff}}},
+		{{segment_relative_vertnum{0xff}, segment_relative_vertnum{0xff}}}
+	}}}
+}}};
+
+namespace {
 
 //given an edge specified by two verts, give the two sides on that edge
-constexpr array<
-	array<
-		array<int_fast8_t, 2>,
+constexpr std::array<
+	std::array<
+		std::array<sidenum_t, 2>,
 		8>,
 	8> Edge_to_sides = {{
-	{{  {{side_none,side_none}},	 {{2,5}},	 {{side_none,side_none}},	 {{1,5}},	 {{1,2}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{side_none,side_none}}	}},
-	{{  {{2,5}},	 {{side_none,side_none}},	 {{3,5}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{2,3}},	 {{side_none,side_none}},	 {{side_none,side_none}}	}},
-	{{  {{side_none,side_none}},	 {{3,5}},	 {{side_none,side_none}},	 {{0,5}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{0,3}},	 {{side_none,side_none}}	}},
-	{{  {{1,5}},	 {{side_none,side_none}},	 {{0,5}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{0,1}}	}},
-	{{  {{1,2}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{2,4}},	 {{side_none,side_none}},	 {{1,4}}	}},
-	{{  {{side_none,side_none}},	 {{2,3}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{2,4}},	 {{side_none,side_none}},	 {{3,4}},	 {{side_none,side_none}}	}},
-	{{  {{side_none,side_none}},	 {{side_none,side_none}},	 {{0,3}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{3,4}},	 {{side_none,side_none}},	 {{0,4}}	}},
-	{{  {{side_none,side_none}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{0,1}},	 {{1,4}},	 {{side_none,side_none}},	 {{0,4}},	 {{side_none,side_none}}	}},
+	{{  {{side_none,side_none}},	 {{sidenum_t::WRIGHT,sidenum_t::WFRONT}},	 {{side_none,side_none}},	 {{sidenum_t::WTOP,sidenum_t::WFRONT}},	 {{sidenum_t::WTOP,sidenum_t::WRIGHT}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{side_none,side_none}}	}},
+	{{  {{sidenum_t::WRIGHT,sidenum_t::WFRONT}},	 {{side_none,side_none}},	 {{sidenum_t::WBOTTOM,sidenum_t::WFRONT}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{sidenum_t::WRIGHT,sidenum_t::WBOTTOM}},	 {{side_none,side_none}},	 {{side_none,side_none}}	}},
+	{{  {{side_none,side_none}},	 {{sidenum_t::WBOTTOM,sidenum_t::WFRONT}},	 {{side_none,side_none}},	 {{sidenum_t::WLEFT,sidenum_t::WFRONT}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{sidenum_t::WLEFT,sidenum_t::WBOTTOM}},	 {{side_none,side_none}}	}},
+	{{  {{sidenum_t::WTOP,sidenum_t::WFRONT}},	 {{side_none,side_none}},	 {{sidenum_t::WLEFT,sidenum_t::WFRONT}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{sidenum_t::WLEFT,sidenum_t::WTOP}}	}},
+	{{  {{sidenum_t::WTOP,sidenum_t::WRIGHT}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{sidenum_t::WRIGHT,sidenum_t::WBACK}},	 {{side_none,side_none}},	 {{sidenum_t::WTOP,sidenum_t::WBACK}}	}},
+	{{  {{side_none,side_none}},	 {{sidenum_t::WRIGHT,sidenum_t::WBOTTOM}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{sidenum_t::WRIGHT,sidenum_t::WBACK}},	 {{side_none,side_none}},	 {{sidenum_t::WBOTTOM,sidenum_t::WBACK}},	 {{side_none,side_none}}	}},
+	{{  {{side_none,side_none}},	 {{side_none,side_none}},	 {{sidenum_t::WLEFT,sidenum_t::WBOTTOM}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{sidenum_t::WBOTTOM,sidenum_t::WBACK}},	 {{side_none,side_none}},	 {{sidenum_t::WLEFT,sidenum_t::WBACK}}	}},
+	{{  {{side_none,side_none}},	 {{side_none,side_none}},	 {{side_none,side_none}},	 {{sidenum_t::WLEFT,sidenum_t::WTOP}},	 {{sidenum_t::WTOP,sidenum_t::WBACK}},	 {{side_none,side_none}},	 {{sidenum_t::WLEFT,sidenum_t::WBACK}},	 {{side_none,side_none}}	}},
 }};
 
 //@@//perform simple check on tables
@@ -880,14 +951,9 @@ constexpr array<
 //@@
 //@@}
 
-
 //given an edge, tell what side is on that edge
-__attribute_warn_unused_result
-static int find_seg_side(const shared_segment &seg, const array<unsigned, 2> &verts, const unsigned notside)
+static std::optional<sidenum_t> find_seg_side(const shared_segment &seg, const std::array<vertnum_t, 2> &verts, const sidenum_t notside)
 {
-	if (notside >= MAX_SIDES_PER_SEGMENT)
-		throw std::logic_error("invalid notside");
-
 	const auto v0 = verts[0];
 	const auto v1 = verts[1];
 
@@ -910,7 +976,7 @@ static int find_seg_side(const shared_segment &seg, const array<unsigned, 2> &ve
 				break;
 		}
 		if (++i == e)
-			return side_none;
+			return {};
 	}
 
 	const auto &eptr = Edge_to_sides[std::distance(b, iv0)][std::distance(b, iv1)];
@@ -922,20 +988,19 @@ static int find_seg_side(const shared_segment &seg, const array<unsigned, 2> &ve
 
 	if (side0 != notside) {
 		Assert(side1==notside);
-		return side0;
+		return static_cast<sidenum_t>(side0);
 	}
 	else {
 		Assert(side0==notside);
-		return side1;
+		return static_cast<sidenum_t>(side1);
 	}
-
 }
 
-__attribute_warn_unused_result
-static bool compare_child(fvcvertptr &vcvertptr, const vms_vector &Viewer_eye, const shared_segment &seg, const shared_segment &cseg, const sidenum_fast_t edgeside)
+[[nodiscard]]
+static bool compare_child(fvcvertptr &vcvertptr, const vms_vector &Viewer_eye, const shared_segment &seg, const shared_segment &cseg, const sidenum_t edgeside)
 {
 	const auto &cside = cseg.sides[edgeside];
-	const auto &sv = Side_to_verts[edgeside][cside.get_type() == SIDE_IS_TRI_13 ? 1 : 0];
+	const auto &sv = Side_to_verts[edgeside][cside.get_type() == side_type::tri_13 ? side_relative_vertnum::_1 : side_relative_vertnum::_0];
 	const auto &temp = vm_vec_sub(Viewer_eye, vcvertptr(seg.verts[sv]));
 	const auto &cnormal = cside.normals;
 	return vm_vec_dot(cnormal[0], temp) < 0 || vm_vec_dot(cnormal[1], temp) < 0;
@@ -943,8 +1008,8 @@ static bool compare_child(fvcvertptr &vcvertptr, const vms_vector &Viewer_eye, c
 
 //see if the order matters for these two children.
 //returns 0 if order doesn't matter, 1 if c0 before c1, -1 if c1 before c0
-__attribute_warn_unused_result
-static bool compare_children(fvcvertptr &vcvertptr, const vms_vector &Viewer_eye, const vcsegptridx_t seg, const sidenum_fast_t s0, const sidenum_fast_t s1)
+[[nodiscard]]
+static bool compare_children(fvcvertptr &vcvertptr, const vms_vector &Viewer_eye, const vcsegptridx_t seg, const sidenum_t s0, const sidenum_t s1)
 {
 	Assert(s0 != side_none && s1 != side_none);
 
@@ -953,33 +1018,33 @@ static bool compare_children(fvcvertptr &vcvertptr, const vms_vector &Viewer_eye
 	if (Side_opposite[s0] == s1)
 		return false;
 	//find normals of adjoining sides
-	const array<unsigned, 2> edge_verts = {
-		{seg->verts[Two_sides_to_edge[s0][s1][0]], seg->verts[Two_sides_to_edge[s0][s1][1]]}
+	const shared_segment &sseg = seg;
+	auto &edge = Two_sides_to_edge[s0][s1];
+	const std::array<vertnum_t, 2> edge_verts = {
+		{sseg.verts[edge[0]], sseg.verts[edge[1]]}
 	};
-	if (edge_verts[0] == -1 || edge_verts[1] == -1)
-		throw std::logic_error("invalid edge vert");
-	const auto &&seg0 = seg.absolute_sibling(seg->children[s0]);
+	const auto &&seg0 = seg.absolute_sibling(sseg.children[s0]);
 	const auto edgeside0 = find_seg_side(seg0, edge_verts, find_connect_side(seg, seg0));
-	if (edgeside0 == side_none)
+	if (!edgeside0)
 		return false;
-	const auto r0 = compare_child(vcvertptr, Viewer_eye, seg, seg0, edgeside0);
+	const auto r0 = compare_child(vcvertptr, Viewer_eye, seg, seg0, *edgeside0);
 	if (!r0)
 		return r0;
-	const auto &&seg1 = seg.absolute_sibling(seg->children[s1]);
+	const auto &&seg1 = seg.absolute_sibling(sseg.children[s1]);
 	const auto edgeside1 = find_seg_side(seg1, edge_verts, find_connect_side(seg, seg1));
-	if (edgeside1 == side_none)
+	if (!edgeside1)
 		return false;
-	return !compare_child(vcvertptr, Viewer_eye, seg, seg1, edgeside1);
+	return !compare_child(vcvertptr, Viewer_eye, seg, seg1, *edgeside1);
 }
 
 //short the children of segment to render in the correct order
 //returns non-zero if swaps were made
-typedef array<sidenum_fast_t, MAX_SIDES_PER_SEGMENT> sort_child_array_t;
-static void sort_seg_children(fvcvertptr &vcvertptr, const vms_vector &Viewer_eye, const vcsegptridx_t seg, const partial_range_t<sort_child_array_t::iterator> &r)
+using sort_child_array_t = per_side_array<sidenum_t>;
+static void sort_seg_children(fvcvertptr &vcvertptr, const vms_vector &Viewer_eye, const vcsegptridx_t seg, const ranges::subrange<sort_child_array_t::iterator> &r)
 {
 	//for each child,  compare with other children and see if order matters
 	//if order matters, fix if wrong
-	auto predicate = [&vcvertptr, &Viewer_eye, seg](const sidenum_fast_t a, const sidenum_fast_t b)
+	auto predicate = [&vcvertptr, &Viewer_eye, seg](const sidenum_t a, const sidenum_t b)
 	{
 		return compare_children(vcvertptr, Viewer_eye, seg, a, b);
 	};
@@ -995,8 +1060,6 @@ static void add_obj_to_seglist(render_state_t &rstate, objnum_t objnum, segnum_t
 	o.emplace_back(render_state_t::per_segment_state_t::distant_object{objnum});
 }
 
-namespace {
-
 using visited_twobit_array_t = visited_segment_mask_t<2>;
 
 class render_compare_context_t
@@ -1009,7 +1072,7 @@ class render_compare_context_t
 		const object *objp;
 #endif
 	};
-	typedef array<element, MAX_OBJECTS> array_t;
+	using array_t = std::array<element, MAX_OBJECTS>;
 	array_t m_array;
 public:
 	array_t::reference operator[](std::size_t i) { return m_array[i]; }
@@ -1033,11 +1096,13 @@ public:
 //compare function for object sort. 
 bool render_compare_context_t::operator()(const distant_object &a, const distant_object &b) const
 {
-	const auto delta_dist_squared = (*this)[a.objnum].dist_squared - (*this)[b.objnum].dist_squared;
+	auto &doa = operator[](a.objnum);
+	auto &dob = operator[](b.objnum);
+	const auto delta_dist_squared = doa.dist_squared - dob.dist_squared;
 
 #if defined(DXX_BUILD_DESCENT_II)
-	const auto obj_a = (*this)[a.objnum].objp;
-	const auto obj_b = (*this)[b.objnum].objp;
+	const auto obj_a = doa.objp;
+	const auto obj_b = dob.objp;
 
 	auto abs_delta_dist_squared = std::abs(delta_dist_squared);
 	fix combined_size = obj_a->size + obj_b->size;
@@ -1070,8 +1135,6 @@ bool render_compare_context_t::operator()(const distant_object &a, const distant
 	return delta_dist_squared > 0;	//return distance
 }
 
-}
-
 static void sort_segment_object_list(fvcobjptr &vcobjptr, const vms_vector &Viewer_eye, render_state_t::per_segment_state_t &segstate)
 {
 	render_compare_context_t context(vcobjptr, Viewer_eye, segstate);
@@ -1079,14 +1142,20 @@ static void sort_segment_object_list(fvcobjptr &vcobjptr, const vms_vector &View
 	std::sort(v.begin(), v.end(), std::cref(context));
 }
 
+}
+
+}
+
 namespace dsx {
+namespace {
 
 static void build_object_lists(object_array &Objects, fvcsegptr &vcsegptr, const vms_vector &Viewer_eye, render_state_t &rstate)
 {
 	const auto viewer = Viewer;
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Vertices = LevelSharedVertexState.get_vertices();
-	auto &vcvertptr = Vertices.vcptr;
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
+	auto &vcvertptr = Vertices.vcptr;
 	auto &vcwallptr = Walls.vcptr;
 	const auto N_render_segs = rstate.N_render_segs;
 	range_for (const unsigned nn, xrange(N_render_segs))
@@ -1120,23 +1189,22 @@ static void build_object_lists(object_array &Objects, fvcsegptr &vcsegptr, const
 #if defined(DXX_BUILD_DESCENT_I)
 					did_migrate = 0;
 #endif
-					const uint_fast32_t sidemask = get_seg_masks(vcvertptr, obj->pos, vcsegptr(new_segnum), obj->size).sidemask;
-	
-					if (sidemask) {
-						int sn,sf;
-
-						for (sn=0,sf=1;sn<6;sn++,sf<<=1)
+					if (const auto sidemask = get_seg_masks(vcvertptr, obj->pos, vcsegptr(new_segnum), obj->size).sidemask; sidemask != sidemask_t{})
+					{
+						for (const auto sn : MAX_SIDES_PER_SEGMENT)
+						{
+							const auto sf = build_sidemask(sn);
 							if (sidemask & sf)
 							{
 #if defined(DXX_BUILD_DESCENT_I)
-								const auto &&seg = vcsegptr(obj->segnum);
+								const cscusegment &&seg = vcsegptr(obj->segnum);
 #elif defined(DXX_BUILD_DESCENT_II)
-								const auto &&seg = vcsegptr(new_segnum);
+								const cscusegment &&seg = vcsegptr(new_segnum);
 #endif
 		
-								if (WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, seg, seg, sn) & WID_FLY_FLAG)
+								if (WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, seg, sn) & WALL_IS_DOORWAY_FLAG::fly)
 								{		//can explosion migrate through
-									int child = seg->children[sn];
+									const auto child = seg.s.children[sn];
 									int checknp;
 		
 									for (checknp=list_pos;checknp--;)
@@ -1151,8 +1219,8 @@ static void build_object_lists(object_array &Objects, fvcsegptr &vcsegptr, const
 								if (sidemask <= sf)
 									break;
 							}
+						}
 					}
-	
 				} while (did_migrate);
 				add_obj_to_seglist(rstate, obj, new_segnum);
 			}
@@ -1166,6 +1234,7 @@ static void build_object_lists(object_array &Objects, fvcsegptr &vcsegptr, const
 			sort_segment_object_list(Objects.vcptr, Viewer_eye, rstate.render_seg_map[segnum]);
 		}
 	}
+}
 }
 }
 
@@ -1195,6 +1264,14 @@ void render_frame(grs_canvas &canvas, fix eye_offset, window_rendered_data &wind
 	start_lighting_frame(*Viewer);		//this is for ugly light-smoothing hack
   
 	g3_start_frame(canvas);
+
+#if DXX_USE_STEREOSCOPIC_RENDER
+#if DXX_USE_OGL
+	// select stereo viewport/transform/buffer per left/right eye
+	if (VR_stereo != StereoFormat::None && eye_offset)
+		ogl_stereo_frame(eye_offset < 0, VR_eye_offset);
+#endif
+#endif
 
 	auto Viewer_eye = Viewer->pos;
 
@@ -1236,19 +1313,20 @@ void render_frame(grs_canvas &canvas, fix eye_offset, window_rendered_data &wind
 	// -- Moved from here by MK, 05/17/95, wrong if multiple renders/frame! FrameCount++;		//we have rendered a frame
 }
 
+window_rendered_data::window_rendered_data()
 #if defined(DXX_BUILD_DESCENT_II)
-void update_rendered_data(window_rendered_data &window, const object &viewer, int rear_view_flag)
-{
-	window.time = timer_query();
-	window.viewer = &viewer;
-	window.rear_view = rear_view_flag;
-}
+	: time(timer_query())
 #endif
+{
+}
 
+namespace {
 //build a list of segments to be rendered
 //fills in Render_list & N_render_segs
 static void build_segment_list(render_state_t &rstate, const vms_vector &Viewer_eye, visited_twobit_array_t &visited, unsigned &first_terminal_seg, const vcsegidx_t start_seg_num)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	int	lcnt,scnt,ecnt;
 	int	l;
 
@@ -1273,7 +1351,6 @@ static void build_segment_list(render_state_t &rstate, const vms_vector &Viewer_
 
 	//build list
 
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
 	auto &vcwallptr = Walls.vcptr;
@@ -1295,47 +1372,51 @@ static void build_segment_list(render_state_t &rstate, const vms_vector &Viewer_
 			processed = true;
 
 			const auto &&seg = vcsegptridx(segnum);
-			const auto uor = rotate_list(vcvertptr, seg->verts).uor & CC_BEHIND;
+			const auto uor = rotate_list(vcvertptr, seg->verts).uor & clipping_code::behind;
 
 			//look at all sides of this segment.
 			//tricky code to look at sides in correct order follows
 
 			sort_child_array_t child_list;		//list of ordered sides to process
-			uint_fast32_t n_children = 0;							//how many sides in child_list
-			for (uint_fast32_t c = 0;c < MAX_SIDES_PER_SEGMENT;c++) {		//build list of sides
-				const auto wid = WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, seg, seg, c);
-				if (wid & WID_RENDPAST_FLAG)
+			const auto child_begin = child_list.begin();
+			auto child_iter = child_begin;
+			for (const auto &&[c, sv] : enumerate(Side_to_verts))
+			{		//build list of sides
+				const auto wid = WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, seg, c);
+				if (wid & WALL_IS_DOORWAY_FLAG::rendpast)
 				{
-					if (auto codes_and = uor)
+					if (uor != clipping_code::None)
 					{
-						range_for (const auto i, Side_to_verts[c])
+						auto codes_and = uor;
+						range_for (const auto i, sv)
 							codes_and &= Segment_points[seg->verts[i]].p3_codes;
-						if (codes_and)
+						if (codes_and != clipping_code::None)
 							continue;
 					}
-					child_list[n_children++] = c;
+					*child_iter++ = c;
 				}
 			}
-			if (!n_children)
+			if (child_iter == child_begin)
 				continue;
 
 			//now order the sides in some magical way
-			const auto &&child_range = partial_range(child_list, n_children);
+			const auto &&child_range = ranges::subrange(child_begin, child_iter);
 			sort_seg_children(vcvertptr, Viewer_eye, seg, child_range);
 			project_list(seg->verts);
 			range_for (const auto siden, child_range)
 			{
-				const auto ch = seg->children[siden];
+				const auto ch = seg->shared_segment::children[siden];
 				{
 					{
 						short min_x=32767,max_x=-32767,min_y=32767,max_y=-32767;
 						int no_proj_flag=0;	//a point wasn't projected
-						uint8_t codes_and_3d = 0xff, codes_and_2d = codes_and_3d;
+						clipping_code codes_and_3d{0xff};
+						auto codes_and_2d = codes_and_3d;
 						range_for (const auto i, Side_to_verts[siden])
 						{
 							g3s_point *pnt = &Segment_points[seg->verts[i]];
 
-							if (! (pnt->p3_flags&PF_PROJECTED)) {no_proj_flag=1; break;}
+							if (! (pnt->p3_flags&projection_flag::projected)) {no_proj_flag=1; break;}
 
 							const int16_t _x = f2i(pnt->p3_sx), _y = f2i(pnt->p3_sy);
 
@@ -1347,7 +1428,7 @@ static void build_segment_list(render_state_t &rstate, const vms_vector &Viewer_
 							codes_and_3d &= pnt->p3_codes;
 							codes_and_2d &= code_window_point(_x,_y,check_w);
 						}
-						if (no_proj_flag || (!codes_and_3d && !codes_and_2d)) {	//maybe add this segment
+						if (no_proj_flag || (codes_and_3d == clipping_code::None && codes_and_2d == clipping_code::None)) {	//maybe add this segment
 							auto rp = rstate.render_pos[ch];
 							rect nw;
 
@@ -1413,13 +1494,22 @@ done_list:
 	rstate.N_render_segs = lcnt;
 
 }
+}
 
 //renders onto current canvas
 void render_mine(grs_canvas &canvas, const vms_vector &Viewer_eye, const vcsegidx_t start_seg_num, const fix eye_offset, window_rendered_data &window)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vmobjptridx = Objects.vmptridx;
+#if DXX_USE_OGL
 	auto &TmapInfo = LevelUniqueTmapInfoState.TmapInfo;
+#else
+	auto &vcvertptr = Vertices.vcptr;
+	auto &Walls = LevelUniqueWallSubsystemState.Walls;
+	auto &vcwallptr = Walls.vcptr;
+#endif
 	using std::advance;
 	render_state_t rstate;
 	#ifndef NDEBUG
@@ -1455,7 +1545,7 @@ void render_mine(grs_canvas &canvas, const vms_vector &Viewer_eye, const vcsegid
 		build_object_lists(Objects, vcsegptr, Viewer_eye, rstate);
 
 	if (eye_offset<=0) // Do for left eye or zero.
-		set_dynamic_light(rstate);
+		set_dynamic_light(LevelSharedRobotInfoState.Robot_info, rstate);
 
 	if (reversed_render_range.empty())
 		/* Impossible, but later code has undefined behavior if this
@@ -1504,7 +1594,7 @@ void render_mine(grs_canvas &canvas, const vms_vector &Viewer_eye, const vcsegid
 				Window_clip_bot   = rw.bot;
 			}
 
-			render_segment(Viewer_eye, *grd_curcanv, vcsegptridx(segnum));
+			render_segment(vcvertptr, vcwallptr, Viewer_eye, *grd_curcanv, vcsegptridx(segnum));
 			visited[segnum]=3;
 			if (srsm.objects.empty())
 				continue;
@@ -1517,7 +1607,7 @@ void render_mine(grs_canvas &canvas, const vms_vector &Viewer_eye, const vcsegid
 
 			{
 				//int n_expl_objs=0,expl_objs[5],i;
-				const auto save_linear_depth = exchange(Max_linear_depth, Max_linear_depth_objects);
+				const auto save_linear_depth = std::exchange(Max_linear_depth, Max_linear_depth_objects);
 				range_for (auto &v, srsm.objects)
 				{
 					do_render_object(canvas, LevelUniqueLightState, vmobjptridx(v.objnum), window);	// note link to above else
@@ -1532,7 +1622,6 @@ void render_mine(grs_canvas &canvas, const vms_vector &Viewer_eye, const vcsegid
         // GL_DEPTH_TEST helps to sort everything in view but we should make sure translucent sprites are rendered after geometry to prevent them to turn walls invisible (if rendered BEFORE geometry but still in FRONT of it).
         // If walls use blending, they should be rendered along with objects (in same pass) to prevent some ugly clipping.
 
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
 	auto &vcwallptr = Walls.vcptr;
@@ -1556,22 +1645,22 @@ void render_mine(grs_canvas &canvas, const vms_vector &Viewer_eye, const vcsegid
 			{
 				const auto &&seg = vcsegptridx(segnum);
 				Assert(segnum!=segment_none && segnum<=Highest_segment_index);
-				if (!rotate_list(vcvertptr, seg->verts).uand)
+				if (rotate_list(vcvertptr, seg->verts).uand == clipping_code::None)
 				{		//all off screen?
 
 					if (Viewer->type!=OBJ_ROBOT)
-						Automap_visited[segnum]=1;
+						LevelUniqueAutomapState.Automap_visited[segnum] = 1;
 
-					range_for (const uint_fast32_t sn, xrange(MAX_SIDES_PER_SEGMENT))
+					for (const auto sn : MAX_SIDES_PER_SEGMENT)
 					{
-						const auto wid = WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, seg, seg, sn);
+						const auto wid = WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, seg, sn);
 						if (wid == WID_TRANSPARENT_WALL || wid == WID_TRANSILLUSORY_WALL
 #if defined(DXX_BUILD_DESCENT_II)
-							|| (wid & WID_CLOAKED_FLAG)
+							|| (wid & WALL_IS_DOORWAY_FLAG::cloaked)
 #endif
 							)
 						{
-							if (PlayerCfg.AlphaBlendEClips && is_alphablend_eclip(TmapInfo[seg->unique_segment::sides[sn].tmap_num].eclip_num)) // Do NOT render geometry with blending textures. Since we've not rendered any objects, yet, they would disappear behind them.
+							if (PlayerCfg.AlphaBlendEClips && is_alphablend_eclip(TmapInfo[get_texture_index(seg->unique_segment::sides[sn].tmap_num)].eclip_num)) // Do NOT render geometry with blending textures. Since we've not rendered any objects, yet, they would disappear behind them.
                                                                 continue;
 							glAlphaFunc(GL_GEQUAL,0.8); // prevent ugly outlines if an object (which is rendered later) is shown behind a grate, door, etc. if texture filtering is enabled. These sides are rendered later again with normal AlphaFunc
 							render_side(vcvertptr, canvas, seg, sn, wid, Viewer_eye);
@@ -1605,18 +1694,18 @@ void render_mine(grs_canvas &canvas, const vms_vector &Viewer_eye, const vcsegid
 			{
 				const auto &&seg = vcsegptridx(segnum);
 				Assert(segnum!=segment_none && segnum<=Highest_segment_index);
-				if (!rotate_list(vcvertptr, seg->verts).uand)
+				if (rotate_list(vcvertptr, seg->verts).uand == clipping_code::None)
 				{		//all off screen?
 
 					if (Viewer->type!=OBJ_ROBOT)
-						Automap_visited[segnum]=1;
+						LevelUniqueAutomapState.Automap_visited[segnum] = 1;
 
-					range_for (const uint_fast32_t sn, xrange(MAX_SIDES_PER_SEGMENT))
+					for (const auto sn : MAX_SIDES_PER_SEGMENT)
 					{
-						const auto wid = WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, seg, seg, sn);
+						const auto wid = WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, seg, sn);
 						if (wid == WID_TRANSPARENT_WALL || wid == WID_TRANSILLUSORY_WALL
 #if defined(DXX_BUILD_DESCENT_II)
-							|| (wid & WID_CLOAKED_FLAG)
+							|| (wid & WALL_IS_DOORWAY_FLAG::cloaked)
 #endif
 							)
 						{
@@ -1667,7 +1756,7 @@ void draw_hostage(const d_vclip_array &Vclip, grs_canvas &canvas, const d_level_
 //finds what segment is at a given x&y -  seg,side,face are filled in
 //works on last frame rendered. returns true if found
 //if seg<0, then an object was found, and the object number is -seg-1
-int find_seg_side_face(short x,short y,segnum_t &seg,objnum_t &obj,int &side,int &face)
+int find_seg_side_face(short x, short y, segnum_t &seg, objnum_t &obj, sidenum_t &side, int &face)
 {
 	_search_mode = -1;
 
@@ -1676,7 +1765,10 @@ int find_seg_side_face(short x,short y,segnum_t &seg,objnum_t &obj,int &side,int
 	found_seg = segment_none;
 	found_obj = object_none;
 
-	render_frame(*(render_3d_in_big_window ? LargeView.ev_canv : Canv_editor_game), 0);
+	{
+		window_rendered_data window;
+		render_frame(*(render_3d_in_big_window ? LargeView.ev_canv : Canv_editor_game), 0, window);
+	}
 
 	_search_mode = 0;
 

@@ -32,75 +32,87 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #ifdef __cplusplus
 #include "dxxsconf.h"
 #include "dsx-ns.h"
-#include "compiler-array.h"
 #include "objnum.h"
 #include "pack.h"
 #include "fwd-valptridx.h"
 #include "fwd-weapon.h"
 
-
 #ifdef dsx
+#include <array>
+
+namespace dcx {
+
+enum class laser_level : uint8_t
+{
+	_1,
+	_2,
+	_3,
+	_4,
+	/* if DXX_BUILD_DESCENT_II */
+	_5,
+	_6,
+	/* endif */
+};
+
+}
+
 namespace dsx {
 
-enum laser_level_t : uint8_t
+static inline laser_level &operator+=(laser_level &a, const laser_level b)
 {
-	LASER_LEVEL_1,
-	LASER_LEVEL_2,
-	LASER_LEVEL_3,
-	LASER_LEVEL_4,
-#if defined(DXX_BUILD_DESCENT_II)
-	LASER_LEVEL_5,
-	LASER_LEVEL_6,
-#endif
-};
+	return (a = static_cast<laser_level>(static_cast<uint8_t>(a) + static_cast<uint8_t>(b)));
+}
 
-class stored_laser_level
+static inline laser_level &operator-=(laser_level &a, const laser_level b)
 {
-	laser_level_t m_level;
-public:
-	stored_laser_level() = default;
-	constexpr stored_laser_level(const laser_level_t l) :
-		m_level(l)
-	{
-	}
-	constexpr explicit stored_laser_level(uint8_t i) :
-		m_level(static_cast<laser_level_t>(i))
-	{
-	}
-	operator laser_level_t() const
-	{
-		return m_level;
-	}
-	/* Assume no overflow/underflow.
-	 * This was never checked when it was a simple ubyte.
-	 */
-	stored_laser_level &operator+=(uint8_t i)
-	{
-		m_level = static_cast<laser_level_t>(static_cast<uint8_t>(m_level) + i);
-		return *this;
-	}
-	stored_laser_level &operator-=(uint8_t i)
-	{
-		m_level = static_cast<laser_level_t>(static_cast<uint8_t>(m_level) - i);
-		return *this;
-	}
-	stored_laser_level &operator++()
-	{
-		return *this += 1;
-	}
-	stored_laser_level &operator--()
-	{
-		return *this -= 1;
-	}
-};
+	return (a = static_cast<laser_level>(static_cast<uint8_t>(a) - static_cast<uint8_t>(b)));
+}
+
+static inline laser_level &operator++(laser_level &a)
+{
+	return (a = static_cast<laser_level>(static_cast<uint8_t>(a) + 1u));
+}
+
+static inline laser_level &operator--(laser_level &a)
+{
+	return (a = static_cast<laser_level>(static_cast<uint8_t>(a) - 1u));
+}
 
 struct weapon_info : prohibit_void_ptr<weapon_info>
 {
-	sbyte   render_type;        // How to draw 0=laser, 1=blob, 2=object
+	enum class render_type : uint8_t
+	{
+		laser,
+		blob,
+		polymodel,
+		vclip,
+		None = 0xff,
+	};
+	// Flag: set if this object is matter (as opposed to energy)
+	enum class matter_flag : uint8_t
+	{
+		energy,
+		matter,
+	};
+	//	Flag: set if this object bounces off walls
+	enum class bounce_type : uint8_t
+	{
+		never,
+		always,
+		twice,
+	};
+	enum class persistence_flag : uint8_t
+	{
+		terminate_on_impact,
+		persistent,
+	};
+	render_type render;        // How to draw 0=laser, 1=blob, 2=object
+	matter_flag matter;
+	bounce_type bounce;
+	persistence_flag persistent;         // 0 = dies when it hits something, 1 = continues (eg, fusion cannon)
 #if defined(DXX_BUILD_DESCENT_I)
-	sbyte	model_num;					// Model num if rendertype==2.
-	sbyte	model_num_inner;			// Model num of inner part if rendertype==2.
-	sbyte   persistent;         // 0 = dies when it hits something, 1 = continues (eg, fusion cannon)
+	polygon_model_index	model_num;		// Model num if rendertype==2.
+	polygon_model_index	model_num_inner;// Model num of inner part if rendertype==2.
 
 	sbyte   flash_vclip;        // What vclip to use for muzzle flash
 	short   flash_sound;        // What sound to play when fired
@@ -114,8 +126,6 @@ struct weapon_info : prohibit_void_ptr<weapon_info>
 
 	sbyte   weapon_vclip;       // Vclip to render for the weapon, itself.
 	sbyte   destroyable;        // If !0, this weapon can be destroyed by another weapon.
-	sbyte   matter;             // Flag: set if this object is matter (as opposed to energy)
-	sbyte	bounce;						//	Flag: set if this object bounces off walls
 
 	sbyte   homing_flag;        // Set if this weapon can home in on a target.
 	sbyte	dum1, dum2, dum3;
@@ -128,8 +138,8 @@ struct weapon_info : prohibit_void_ptr<weapon_info>
 	fix blob_size;              // Size of blob if blob type
 	fix flash_size;             // How big to draw the flash
 	fix impact_size;            // How big of an impact
-	array<fix, NDL> strength;          // How much damage it can inflict
-	array<fix, NDL> speed;             // How fast it can move, difficulty level based.
+	enumerated_array<fix, NDL, Difficulty_level_type> strength;          // How much damage it can inflict
+	enumerated_array<fix, NDL, Difficulty_level_type> speed;             // How fast it can move, difficulty level based.
 	fix mass;                   // How much mass it has
 	fix drag;                   // How much drag it has
 	fix thrust;                 // How much thrust it has
@@ -141,9 +151,8 @@ struct weapon_info : prohibit_void_ptr<weapon_info>
 // damage_force was a real mess.  Wasn't Difficulty_level based, and was being applied instead of weapon's actual strength.  Now use 2*strength instead. --MK, 01/19/95
 	bitmap_index    picture;    // a picture of the weapon for the cockpit
 #elif defined(DXX_BUILD_DESCENT_II)
-	sbyte   persistent;         // 0 = dies when it hits something, 1 = continues (eg, fusion cannon)
-	short   model_num;          // Model num if rendertype==2.
-	short   model_num_inner;    // Model num of inner part if rendertype==2.
+	polygon_model_index   model_num;          // Model num if rendertype==2.
+	polygon_model_index   model_num_inner;    // Model num of inner part if rendertype==2.
 
 	sbyte   flash_vclip;        // What vclip to use for muzzle flash
 	sbyte   robot_hit_vclip;    // What vclip for impact with robot
@@ -158,8 +167,6 @@ struct weapon_info : prohibit_void_ptr<weapon_info>
 	short   wall_hit_sound;     // What sound for impact with wall
 
 	sbyte   destroyable;        // If !0, this weapon can be destroyed by another weapon.
-	sbyte   matter;             // Flag: set if this object is matter (as opposed to energy)
-	sbyte   bounce;             // 1==always bounces, 2=bounces twice
 	sbyte   homing_flag;        // Set if this weapon can home in on a target.
 
 	ubyte   speedvar;           // allowed variance in speed below average, /128: 64 = 50% meaning if speed = 100, can be 50..100
@@ -183,8 +190,8 @@ struct weapon_info : prohibit_void_ptr<weapon_info>
 	fix blob_size;              // Size of blob if blob type
 	fix flash_size;             // How big to draw the flash
 	fix impact_size;            // How big of an impact
-	array<fix, NDL> strength;          // How much damage it can inflict
-	array<fix, NDL> speed;             // How fast it can move, difficulty level based.
+	enumerated_array<fix, NDL, Difficulty_level_type> strength;          // How much damage it can inflict
+	enumerated_array<fix, NDL, Difficulty_level_type> speed;             // How fast it can move, difficulty level based.
 	fix mass;                   // How much mass it has
 	fix drag;                   // How much drag it has
 	fix thrust;                 // How much thrust it has
@@ -233,7 +240,7 @@ enum secondary_weapon_index_t : uint8_t
 };
 
 struct player_info;
-void delayed_autoselect(player_info &);
+void delayed_autoselect(player_info &, const control_info &Controls);
 
 }
 
@@ -273,8 +280,7 @@ public:
 namespace dsx {
 //return which bomb will be dropped next time the bomb key is pressed
 #if defined(DXX_BUILD_DESCENT_I)
-
-static constexpr int which_bomb()
+static constexpr secondary_weapon_index_t which_bomb(const player_info &)
 {
 	return PROXIMITY_INDEX;
 }
@@ -295,7 +301,8 @@ static constexpr unsigned vulcan_ammo_scale(const unsigned v)
 	return (v * 0xcc180u) >> 16;
 }
 #elif defined(DXX_BUILD_DESCENT_II)
-int which_bomb(void);
+secondary_weapon_index_t which_bomb(player_info &player_info);
+secondary_weapon_index_t which_bomb(const player_info &player_info);
 
 static constexpr int weapon_index_uses_vulcan_ammo(const unsigned id)
 {

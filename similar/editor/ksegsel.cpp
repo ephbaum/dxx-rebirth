@@ -26,7 +26,6 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include <utility>
 #include <string.h>
 
-#include "inferno.h"
 #include "editor/editor.h"
 #include "editor/esegment.h"
 #include "editor/medmisc.h"
@@ -35,10 +34,10 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "compiler-range_for.h"
 #include "d_range.h"
 
-__attribute_warn_unused_result
-static vmsegptridx_t get_any_attached_segment(const vmsegptridx_t curseg_num, const uint_fast32_t skipside)
+[[nodiscard]]
+static vmsegptridx_t get_any_attached_segment(const vmsegptridx_t curseg_num, const sidenum_t skipside)
 {
-	range_for (const uint_fast32_t s, xrange(MAX_SIDES_PER_SEGMENT))
+	for (const auto s : MAX_SIDES_PER_SEGMENT)
 	{
 		if (unlikely(s == skipside))
 			continue;
@@ -49,8 +48,8 @@ static vmsegptridx_t get_any_attached_segment(const vmsegptridx_t curseg_num, co
 	return curseg_num;
 }
 
-__attribute_warn_unused_result
-static vmsegptridx_t get_previous_segment(const vmsegptridx_t curseg_num, const uint_fast32_t curside)
+[[nodiscard]]
+static vmsegptridx_t get_previous_segment(const vmsegptridx_t curseg_num, const sidenum_t curside)
 {
 	const auto side_child = curseg_num->children[Side_opposite[curside]];
 	if (IS_CHILD(side_child))
@@ -63,20 +62,20 @@ static vmsegptridx_t get_previous_segment(const vmsegptridx_t curseg_num, const 
 // Select previous segment.
 //	If there is a connection on the side opposite to the current side, then choose that segment.
 // If there is no connecting segment on the opposite face, try any segment.
-__attribute_warn_unused_result
-static std::pair<vmsegptridx_t, uint_fast32_t> get_previous_segment_side(const vmsegptridx_t curseg_num, const uint_fast32_t curside)
+[[nodiscard]]
+static std::pair<vmsegptridx_t, sidenum_t> get_previous_segment_side(const vmsegptridx_t curseg_num, const sidenum_t curside)
 {
 	const auto &newseg_num = get_previous_segment(curseg_num, curside);
 	// Now make Curside point at the segment we just left (unless we couldn't leave it).
-	return {newseg_num, newseg_num == curseg_num ? curside : find_connect_side(curseg_num, newseg_num)};
+	return {newseg_num, newseg_num == curseg_num ? static_cast<sidenum_t>(curside) : find_connect_side(curseg_num, newseg_num)};
 }
 
 // --------------------------------------------------------------------------------------
 // Select next segment.
 //	If there is a connection on the current side, then choose that segment.
 // If there is no connecting segment on the current side, try any segment.
-__attribute_warn_unused_result
-static std::pair<vmsegptridx_t, uint_fast32_t> get_next_segment_side(const vmsegptridx_t curseg_num, uint_fast32_t curside)
+[[nodiscard]]
+static std::pair<vmsegptridx_t, sidenum_t> get_next_segment_side(const vmsegptridx_t curseg_num, sidenum_t curside)
 {
 	const auto side_child = curseg_num->children[curside];
 	if (IS_CHILD(side_child))
@@ -86,7 +85,7 @@ static std::pair<vmsegptridx_t, uint_fast32_t> get_next_segment_side(const vmseg
 		const auto newside = Side_opposite[find_connect_side(curseg_num, newseg_num)];
 		// If there is nothing attached on the side opposite to what we came in (*newside), pick any other side
 		if (!IS_CHILD(newseg_num->children[newside]))
-			range_for (const uint_fast32_t s, xrange(MAX_SIDES_PER_SEGMENT))
+			for (const auto s : MAX_SIDES_PER_SEGMENT)
 			{
 				const auto cseg = newseg_num->children[s];
 				if (cseg != curseg_num && IS_CHILD(cseg))
@@ -104,6 +103,8 @@ static std::pair<vmsegptridx_t, uint_fast32_t> get_next_segment_side(const vmseg
 // ---------- select current segment ----------
 int SelectCurrentSegForward()
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	const auto p = get_next_segment_side(Cursegp,Curside);
 	const auto &newseg_num = p.first;
 
@@ -115,7 +116,6 @@ int SelectCurrentSegForward()
 		Update_flags |= UF_ED_STATE_CHANGED;
 		if (Lock_view_to_cursegp)
 		{
-			auto &Vertices = LevelSharedVertexState.get_vertices();
 			auto &vcvertptr = Vertices.vcptr;
 			set_view_target_from_segment(vcvertptr, Cursegp);
 		}
@@ -130,13 +130,14 @@ int SelectCurrentSegForward()
 // -------------------------------------------------------------------------------------
 int SelectCurrentSegBackward()
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	const auto &p = get_previous_segment_side(Cursegp,Curside);
 	Cursegp = p.first;
 	Curside = p.second;
 
 	if (Lock_view_to_cursegp)
 	{
-		auto &Vertices = LevelSharedVertexState.get_vertices();
 		auto &vcvertptr = Vertices.vcptr;
 		set_view_target_from_segment(vcvertptr, Cursegp);
 	}
@@ -151,8 +152,23 @@ int SelectCurrentSegBackward()
 // ---------- select next/previous side on current segment ----------
 int SelectNextSide()
 {
-	if (++Curside >= MAX_SIDES_PER_SEGMENT)
-		Curside = 0;
+	sidenum_t s;
+	switch (const auto cs = Curside)
+	{
+		case sidenum_t::WLEFT:
+		case sidenum_t::WTOP:
+		case sidenum_t::WRIGHT:
+		case sidenum_t::WBOTTOM:
+		case sidenum_t::WBACK:
+			s = static_cast<sidenum_t>(static_cast<unsigned>(cs) + 1);
+			break;
+		case sidenum_t::WFRONT:
+			s = sidenum_t::WLEFT;
+			break;
+		default:
+			return 0;
+	}
+	Curside = s;
 	Update_flags |= UF_ED_STATE_CHANGED;
 	mine_changed = 1;
 	return 1;
@@ -160,8 +176,23 @@ int SelectNextSide()
 
 int SelectPrevSide()
 {
-	if (--Curside < 0)
-		Curside = MAX_SIDES_PER_SEGMENT-1;
+	sidenum_t s;
+	switch (const auto cs = Curside)
+	{
+		case sidenum_t::WLEFT:
+			s = sidenum_t::WFRONT;
+			break;
+		case sidenum_t::WTOP:
+		case sidenum_t::WRIGHT:
+		case sidenum_t::WBOTTOM:
+		case sidenum_t::WBACK:
+		case sidenum_t::WFRONT:
+			s = static_cast<sidenum_t>(static_cast<unsigned>(cs) - 1);
+			break;
+		default:
+			return 0;
+	}
+	Curside = s;
 	Update_flags |= UF_ED_STATE_CHANGED;
 	mine_changed = 1;
 	return 1;
@@ -184,7 +215,7 @@ int CopySegToMarked()
 
 int SelectBottom()
 {
-	Curside = WBOTTOM;
+	Curside = sidenum_t::WBOTTOM;
 	Update_flags |= UF_ED_STATE_CHANGED;
 	mine_changed = 1;
 	return 1;
@@ -192,7 +223,7 @@ int SelectBottom()
 
 int SelectFront()
 {
-	Curside = WFRONT;
+	Curside = sidenum_t::WFRONT;
 	Update_flags |= UF_ED_STATE_CHANGED;
 	mine_changed = 1;
 	return 1;
@@ -200,7 +231,7 @@ int SelectFront()
 
 int SelectTop()
 {
-	Curside = WTOP;
+	Curside = sidenum_t::WTOP;
 	Update_flags |= UF_ED_STATE_CHANGED;
 	mine_changed = 1;
 	return 1;
@@ -208,7 +239,7 @@ int SelectTop()
 
 int SelectBack()
 {
-	Curside = WBACK;
+	Curside = sidenum_t::WBACK;
 	Update_flags |= UF_ED_STATE_CHANGED;
 	mine_changed = 1;
 	return 1;
@@ -216,7 +247,7 @@ int SelectBack()
 
 int SelectLeft()
 {
-	Curside = WLEFT;
+	Curside = sidenum_t::WLEFT;
 	Update_flags |= UF_ED_STATE_CHANGED;
 	mine_changed = 1;
 	return 1;
@@ -224,7 +255,7 @@ int SelectLeft()
 
 int SelectRight()
 {
-	Curside = WRIGHT;
+	Curside = sidenum_t::WRIGHT;
 	Update_flags |= UF_ED_STATE_CHANGED;
 	mine_changed = 1;
 	return 1;

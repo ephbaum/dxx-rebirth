@@ -34,25 +34,27 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "editor/esegment.h"
 #include "editor/medmisc.h"
 #include "dxxerror.h"
-#include "gamemine.h"
 #include "physfsx.h"
 #include "gameseg.h"
 #include "bm.h"				// For MAX_TEXTURES.
 #include "textures.h"
 #include "hash.h"
-#include "fuelcen.h"
 #include "kdefs.h"
 #include "fwd-wall.h"
 #include "medwall.h"
-#include "dxxsconf.h"
 #include "compiler-range_for.h"
+#include "d_bitset.h"
 #include "d_enumerate.h"
-#include "d_range.h"
+#include "d_levelstate.h"
+#include "d_zip.h"
 #include "partial_range.h"
 #include "segiter.h"
 
+namespace {
+
 static void validate_selected_segments(void);
 
+#if 0
 struct group_top_fileinfo {
 	int     fileinfo_version;
 	int     fileinfo_sizeof;
@@ -88,11 +90,14 @@ struct group_editor {
 	int     Groupsegp;
 	int     Groupside;
 } group_editor;
+#endif
 
-array<group, MAX_GROUPS+1> GroupList;
-array<segment *, MAX_GROUPS+1> Groupsegp;
-array<int, MAX_GROUPS+1> Groupside;
-array<int, MAX_GROUPS+1> Group_orientation;
+}
+
+std::array<group, MAX_GROUPS+1> GroupList;
+std::array<segment *, MAX_GROUPS+1> Groupsegp;
+std::array<sidenum_t, MAX_GROUPS+1> Groupside;
+std::array<int, MAX_GROUPS+1> Group_orientation;
 int		current_group=-1;
 unsigned num_groups;
 
@@ -302,6 +307,7 @@ unsigned num_groups;
 // -- 
 // -- }
 
+namespace {
 
 // ------------------------------------------------------------------------------------------------
 //	Rotate a group about a point.
@@ -316,7 +322,7 @@ unsigned num_groups;
 //	Return value:
 //		0	group rotated
 //		1	unable to rotate group
-static void med_create_group_rotation_matrix(vms_matrix &result_mat, int delta_flag, const vcsegptr_t first_seg, int first_side, const vcsegptr_t base_seg, int base_side, const vms_matrix &orient_matrix, int orientation)
+static void med_create_group_rotation_matrix(vms_matrix &result_mat, const unsigned delta_flag, const shared_segment &first_seg, const sidenum_t first_side, const shared_segment &base_seg, const sidenum_t base_side, const vms_matrix &orient_matrix, const int orientation)
 {
 	vms_matrix	rotmat2,rotmat,rotmat3,rotmat4;
 	vms_angvec	pbh = {0,0,0};
@@ -357,7 +363,7 @@ static void med_create_group_rotation_matrix(vms_matrix &result_mat, int delta_f
 	result_mat = rotmat2;
 }
 
-static inline vms_matrix med_create_group_rotation_matrix(int delta_flag, const vcsegptr_t first_seg, int first_side, const vcsegptr_t base_seg, int base_side, const vms_matrix &orient_matrix, int orientation)
+static inline vms_matrix med_create_group_rotation_matrix(const unsigned delta_flag, const shared_segment &first_seg, const sidenum_t first_side, const shared_segment &base_seg, const sidenum_t base_side, const vms_matrix &orient_matrix, const int orientation)
 {
 	vms_matrix result_mat;
 	return med_create_group_rotation_matrix(result_mat, delta_flag, first_seg, first_side, base_seg, base_side, orient_matrix, orientation), result_mat;
@@ -365,25 +371,25 @@ static inline vms_matrix med_create_group_rotation_matrix(int delta_flag, const 
 
 // -----------------------------------------------------------------------------------------
 // Rotate all vertices and objects in group.
-static void med_rotate_group(const vms_matrix &rotmat, group::segment_array_type_t &group_seglist, const vcsegptr_t first_seg, int first_side)
+static void med_rotate_group(const vms_matrix &rotmat, group::segment_array_type_t &group_seglist, const shared_segment &first_seg, const sidenum_t first_side)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
-	auto &vmobjptridx = Objects.vmptridx;
-	array<int8_t, MAX_VERTICES> vertex_list;
 	auto &Vertices = LevelSharedVertexState.get_vertices();
+	auto &vmobjptridx = Objects.vmptridx;
 	auto &vcvertptr = Vertices.vcptr;
 	auto &vmvertptridx = Vertices.vmptridx;
 	const auto &&rotate_center = compute_center_point_on_side(vcvertptr, first_seg, first_side);
 
 	//	Create list of points to rotate.
-	vertex_list = {};
+	enumerated_bitset<MAX_VERTICES, vertnum_t> vertex_list{};
 
 	range_for (const auto &gs, group_seglist)
 	{
 		auto &sp = *vmsegptr(gs);
 
 		range_for (const auto v, sp.verts)
-			vertex_list[v] = 1;
+			vertex_list[v] = true;
 
 		//	Rotate center of all objects in group.
 		range_for (const auto objp, objects_in(sp, vmobjptridx, vcsegptr))
@@ -410,11 +416,11 @@ static void cgl_aux(const vmsegptridx_t segp, group::segment_array_type_t &segli
 		if (ignore_list->contains(segp))
 			return;
 
-	if (!visited[segp]) {
-		visited[segp] = true;
+	if (auto &&v = visited[segp]; !v) {
+		v = true;
 		seglistp.emplace_back(segp);
 
-		range_for (const auto c, segp->children)
+		for (const auto c : segp->shared_segment::children)
 			if (IS_CHILD(c))
 				cgl_aux(segp.absolute_sibling(c), seglistp, ignore_list, visited);
 	}
@@ -433,25 +439,25 @@ static void create_group_list(const vmsegptridx_t segp, group::segment_array_typ
 #define MXV MAX_VERTICES
 
 // ------------------------------------------------------------------------------------------------
-static void duplicate_group(array<uint8_t, MAX_VERTICES> &vertex_ids, group::segment_array_type_t &segments)
+static void duplicate_group(enumerated_array<uint8_t, MAX_VERTICES, vertnum_t> &vertex_ids, group::segment_array_type_t &segments)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vmobjptridx = Objects.vmptridx;
 	group::segment_array_type_t new_segments;
-	array<int, MAX_VERTICES> new_vertex_ids;		// If new_vertex_ids[v] != -1, then vertex v has been remapped to new_vertex_ids[v]
+	enumerated_array<vertnum_t, MAX_VERTICES, vertnum_t> new_vertex_ids;		// If new_vertex_ids[v] != -1, then vertex v has been remapped to new_vertex_ids[v]
+	constexpr vertnum_t undefined_vertex_id{UINT32_MAX};
 
 	//	duplicate vertices
-	new_vertex_ids.fill(-1);
+	new_vertex_ids.fill(undefined_vertex_id);
 
 	//	duplicate vertices
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptridx = Vertices.vcptridx;
 	range_for (auto &&v, vcvertptridx)
 	{
-		if (vertex_ids[v])
-		{
-			new_vertex_ids[v] = med_create_duplicate_vertex(*v);
-		}
+		if (const vertnum_t vn{v}; vertex_ids[vn])
+			new_vertex_ids[vn] = med_create_duplicate_vertex(*v);
 	}
 
 	//	duplicate segments
@@ -473,7 +479,7 @@ static void duplicate_group(array<uint8_t, MAX_VERTICES> &vertex_ids, group::seg
 	//	and correct its vertex numbers by translating through new_vertex_ids
 	range_for(const auto &gs, new_segments)
 	{
-		auto &sp = *vmsegptr(gs);
+		shared_segment &sp = vmsegptr(gs);
 		range_for (auto &seg, sp.children)
 		{
 			if (IS_CHILD(seg)) {
@@ -493,9 +499,8 @@ static void duplicate_group(array<uint8_t, MAX_VERTICES> &vertex_ids, group::seg
 		//	Now fixup vertex ids
 		range_for (auto &v, sp.verts)
 		{
-			if (vertex_ids[v]) {
-				v = new_vertex_ids[v];
-			}
+			if (const vertnum_t vn{v}; vertex_ids[vn])
+				v = new_vertex_ids[vn];
 		}
 	}	// end for (s=0...
 
@@ -506,7 +511,7 @@ static void duplicate_group(array<uint8_t, MAX_VERTICES> &vertex_ids, group::seg
 	vertex_ids = {};
 
 	range_for (auto &v, new_vertex_ids)
-		if (v != -1)
+		if (v != undefined_vertex_id)
 			vertex_ids[v] = 1;
 }
 
@@ -527,14 +532,16 @@ static int in_group(segnum_t segnum, int group_num)
 //	The group is copied so group_seg:group_side is incident upon base_seg:base_side.
 //	group_seg and its vertices are bashed to coincide with base_seg.
 //	If any vertex of base_seg is contained in a segment that is reachable from group_seg, then errror.
-static int med_copy_group(int delta_flag, const vmsegptridx_t base_seg, int base_side, vcsegptr_t group_seg, int group_side, const vms_matrix &orient_matrix)
+static int med_copy_group(const unsigned delta_flag, const vmsegptridx_t base_seg, const sidenum_t base_side, vcsegptr_t group_seg, const sidenum_t group_side, const vms_matrix &orient_matrix)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vmobjptridx = Objects.vmptridx;
 	int 			x;
 	int			new_current_group;
 
-	if (IS_CHILD(base_seg->children[base_side])) {
+	if (IS_CHILD(base_seg->shared_segment::children[base_side])) {
 		editor_status("Error -- unable to copy group, base_seg:base_side must be free.");
 		return 1;
 	}
@@ -557,13 +564,13 @@ static int med_copy_group(int delta_flag, const vmsegptridx_t base_seg, int base
 	auto gb = GroupList[current_group].segments.begin();
 	auto ge = GroupList[current_group].segments.end();
 	auto gp = Groupsegp[current_group];
-	auto gi = std::find_if(gb, ge, [gp](const segnum_t segnum){ return vcsegptr(segnum) == gp; });
+	const auto &&gi = ranges::find_if(gb, ge, [gp](const segnum_t segnum) { return vcsegptr(segnum) == gp; });
 	int gs_index = (gi == ge) ? 0 : std::distance(gb, gi);
 
 	GroupList[new_current_group] = GroupList[current_group];
 
 	//	Make a list of all vertices in group.
-	array<uint8_t, MAX_VERTICES> in_vertex_list{};
+	enumerated_array<uint8_t, MAX_VERTICES, vertnum_t> in_vertex_list{};
 	if (group_seg == &New_segment)
 		range_for (auto &v, group_seg->verts)
 			in_vertex_list[v] = 1;
@@ -589,25 +596,24 @@ static int med_copy_group(int delta_flag, const vmsegptridx_t base_seg, int base
 
 	range_for(const auto &gs, GroupList[new_current_group].segments)
 	{
-		auto &s = *vmsegptr(gs);
+		shared_segment &s = *vmsegptr(gs);
 		s.group = new_current_group;
-		s.special = SEGMENT_IS_NOTHING;
-		s.matcen_num = -1;
+		s.special = segment_special::nothing;
+		s.matcen_num = materialization_center_number::None;
 	}
 
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
 	// Breaking connections between segments in the current group and segments not in the group.
 	range_for(const auto &gs, GroupList[new_current_group].segments)
 	{
 		const auto &&segp = base_seg.absolute_sibling(gs);
-		range_for (const auto &&es, enumerate(segp->children))
-			if (IS_CHILD(es.value))
+		for (auto &&[sidenum, child_segnum] : enumerate(segp->shared_segment::children))
+			if (IS_CHILD(child_segnum))
 			{
-				if (!in_group(es.value, new_current_group))
+				if (!in_group(child_segnum, new_current_group))
 				{
-					es.value = segment_none;
-					validate_segment_side(vcvertptr, segp, es.idx);					// we have converted a connection to a side so validate the segment
+					child_segnum = segment_none;
+					validate_segment_side(vcvertptr, segp, sidenum);					// we have converted a connection to a side so validate the segment
 				}
 			}
 	}
@@ -667,9 +673,11 @@ static int med_copy_group(int delta_flag, const vmsegptridx_t base_seg, int base
 //	The group is moved so group_seg:group_side is incident upon base_seg:base_side.
 //	group_seg and its vertices are bashed to coincide with base_seg.
 //	If any vertex of base_seg is contained in a segment that is reachable from group_seg, then errror.
-static int med_move_group(int delta_flag, const vmsegptridx_t base_seg, int base_side, const vmsegptridx_t group_seg, int group_side, const vms_matrix &orient_matrix, int orientation)
+static int med_move_group(int delta_flag, const vmsegptridx_t base_seg, const sidenum_t base_side, const vmsegptridx_t group_seg, const sidenum_t group_side, const vms_matrix &orient_matrix, int orientation)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vmobjptridx = Objects.vmptridx;
 	if (IS_CHILD(base_seg->children[base_side]))
 		if (base_seg->children[base_side] != group_seg) {
@@ -686,8 +694,8 @@ static int med_move_group(int delta_flag, const vmsegptridx_t base_seg, int base
 //					return 1;
 //				}
 
-	array<uint8_t, MAX_VERTICES> in_vertex_list{};
-	array<int8_t, MAX_VERTICES> out_vertex_list{};
+	enumerated_array<uint8_t, MAX_VERTICES, vertnum_t> in_vertex_list{};
+	enumerated_array<int8_t, MAX_VERTICES, vertnum_t> out_vertex_list{};
 
 	//	Make a list of all vertices in group.
 	range_for(const auto &gs, GroupList[current_group].segments)
@@ -708,7 +716,6 @@ static int med_move_group(int delta_flag, const vmsegptridx_t base_seg, int base
 	// create an extra copy of the vertex so we can just move the ones in the in list.
 	//	Can't use Highest_vertex_index as loop termination because it gets increased by med_create_duplicate_vertex.
 
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
 	auto &vmvertptridx = Vertices.vmptridx;
 	range_for (auto &&v, vmvertptridx)
@@ -735,24 +742,24 @@ static int med_move_group(int delta_flag, const vmsegptridx_t base_seg, int base
 	range_for(const auto &gs, GroupList[current_group].segments)
 		{
 		const auto &&segp = base_seg.absolute_sibling(gs);
-		range_for (const auto &&es0, enumerate(segp->children))
-			if (IS_CHILD(es0.value))
+		for (const auto &&[idx0, value0] : enumerate(segp->children))
+			if (IS_CHILD(value0))
 				{
-				const auto &&csegp = base_seg.absolute_sibling(es0.value);
+				const auto &&csegp = base_seg.absolute_sibling(value0);
 				if (csegp->group != current_group)
 					{
-					range_for (const auto &&es1, enumerate(csegp->children))
-						if (IS_CHILD(es1.value))
+					for (const auto &&[idx1, value1] : enumerate(csegp->children))
+						if (IS_CHILD(value1))
 							{
-							auto &dsegp = *vmsegptr(es1.value);
+							auto &dsegp = *vmsegptr(value1);
 							if (dsegp.group == current_group)
 								{
-								es1.value = segment_none;
-								validate_segment_side(vcvertptr, csegp, es1.idx);					// we have converted a connection to a side so validate the segment
+								value1 = segment_none;
+								validate_segment_side(vcvertptr, csegp, static_cast<sidenum_t>(idx1));					// we have converted a connection to a side so validate the segment
 								}
 							}
-					es0.value = segment_none;
-					validate_segment_side(vcvertptr, segp, es0.idx);					// we have converted a connection to a side so validate the segment
+					value0 = segment_none;
+					validate_segment_side(vcvertptr, segp, static_cast<sidenum_t>(idx0));					// we have converted a connection to a side so validate the segment
 					}
 				}
 		}
@@ -803,14 +810,15 @@ static int med_move_group(int delta_flag, const vmsegptridx_t base_seg, int base
 //	-----------------------------------------------------------------------------
 static segnum_t place_new_segment_in_world(void)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	const auto &&segnum = Segments.vmptridx(get_free_segment_number(Segments));
 	auto &seg = *segnum;
 	seg = New_segment;
 
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
-	range_for (const unsigned v, xrange(MAX_VERTICES_PER_SEGMENT))
-		seg.verts[v] = med_create_duplicate_vertex(vcvertptr(New_segment.verts[v]));
+	for (auto &&[w, r] : zip(seg.verts, New_segment.verts))
+		w = med_create_duplicate_vertex(vcvertptr(r));
 
 	return segnum;
 
@@ -820,6 +828,8 @@ static segnum_t place_new_segment_in_world(void)
 //	Attach segment in the new-fangled way, which is by using the CopyGroup code.
 static int AttachSegmentNewAng(const vms_angvec &pbh)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	GroupList[current_group].segments.clear();
 	const auto newseg = place_new_segment_in_world();
 	GroupList[current_group].segments.emplace_back(newseg);
@@ -839,7 +849,6 @@ static int AttachSegmentNewAng(const vms_angvec &pbh)
 
 		if (Lock_view_to_cursegp)
 		{
-			auto &Vertices = LevelSharedVertexState.get_vertices();
 			auto &vcvertptr = Vertices.vcptr;
 			set_view_target_from_segment(vcvertptr, Cursegp);
 		}
@@ -850,6 +859,8 @@ static int AttachSegmentNewAng(const vms_angvec &pbh)
 	}
 
 	return 1;
+}
+
 }
 
 int AttachSegmentNew(void)
@@ -865,13 +876,16 @@ int AttachSegmentNew(void)
 
 }
 
+namespace {
 //	-----------------------------------------------------------------------------
 void validate_selected_segments(void)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
 	range_for (const auto &gs, GroupList[current_group].segments)
 		validate_segment(vcvertptr, vmsegptridx(gs));
+}
 }
 
 // =====================================================================================
@@ -899,13 +913,11 @@ void add_segment_to_group(segnum_t segment_num, int group_num)
 //	-----------------------------------------------------------------------------
 int rotate_segment_new(const vms_angvec &pbh)
 {
-	int			newseg_side;
 	vms_matrix	tm1;
 	group::segment_array_type_t selected_segs_save;
-	int			child_save;
 	int			current_group_save;
 
-        if (!IS_CHILD(Cursegp->children[static_cast<int>(Side_opposite[Curside])]))
+        if (!IS_CHILD(Cursegp->children[Side_opposite[Curside]]))
 		// -- I don't understand this, MK, 01/25/94: if (Cursegp->children[Curside] != group_seg-Segments)
 		{
 			editor_status("Error -- unable to rotate group, Cursegp:Side_opposite[Curside] cannot be free.");
@@ -919,11 +931,11 @@ int rotate_segment_new(const vms_angvec &pbh)
 	selected_segs_save = GroupList[current_group].segments;
 	GroupList[ROT_GROUP].segments.clear();
 	const auto newseg = Cursegp;
-	newseg_side = Side_opposite[Curside];
+	const auto newseg_side = Side_opposite[Curside];
 
 	// Create list of segments to rotate.
 	//	Sever connection between first seg to rotate and its connection on Side_opposite[Curside].
-	child_save = Cursegp->children[newseg_side];	// save connection we are about to sever
+	const auto child_save = Cursegp->children[newseg_side];	// save connection we are about to sever
 	Cursegp->children[newseg_side] = segment_none;			// sever connection
 	create_group_list(Cursegp, GroupList[ROT_GROUP].segments, NULL);       // create list of segments in group
 	Cursegp->children[newseg_side] = child_save;	// restore severed connection
@@ -966,6 +978,8 @@ int rotate_segment_new(const vms_angvec &pbh)
 //	Attach segment in the new-fangled way, which is by using the CopyGroup code.
 int RotateSegmentNew(vms_angvec *pbh)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	int	rval;
 
 	autosave_mine(mine_filename);
@@ -974,7 +988,6 @@ int RotateSegmentNew(vms_angvec *pbh)
 
 	if (Lock_view_to_cursegp)
 	{
-		auto &Vertices = LevelSharedVertexState.get_vertices();
 		auto &vcvertptr = Vertices.vcptr;
 		set_view_target_from_segment(vcvertptr, Cursegp);
 	}
@@ -987,7 +1000,7 @@ int RotateSegmentNew(vms_angvec *pbh)
 }
 
 #if 0
-static array<d_fname, MAX_TEXTURES> current_tmap_list;
+static std::array<d_fname, MAX_TEXTURES> current_tmap_list;
 
 // -----------------------------------------------------------------------------
 // Save mine will:
@@ -1107,14 +1120,14 @@ static int med_save_group( const char *filename, const group::vertex_array_type_
 	group_fileinfo.texture_offset    =   texture_offset;
 	
 	// Write the fileinfo
-	PHYSFSX_fseek(  SaveFile, 0, SEEK_SET );  // Move to TOF
+	PHYSFS_seek(SaveFile, 0);  // Move to TOF
 	PHYSFS_write( SaveFile, &group_fileinfo, sizeof(group_fileinfo), 1);
 
 	//==================== CLOSE THE FILE =============================
 	return 0;
 }
 
-static array<d_fname, MAX_TEXTURES> old_tmap_list;
+static std::array<d_fname, MAX_TEXTURES> old_tmap_list;
 // static short tmap_xlate_table[MAX_TEXTURES]; // ZICO - FIXME
 
 // -----------------------------------------------------------------------------
@@ -1124,14 +1137,13 @@ static int med_load_group( const char *filename, group::vertex_array_type_t &ver
 {
 	int vertnum;
 	char ErrorMessage[200];
-	short tmap_xlate;
         int     translate=0;
 	char 	*temptr;
 	segment tseg;
-	auto LoadFile = PHYSFSX_openReadBuffered(filename);
+	auto &&[LoadFile, physfserr] = PHYSFSX_openReadBuffered(filename);
 	if (!LoadFile)
 	{
-		snprintf(ErrorMessage, sizeof(ErrorMessage), "ERROR: Unable to open %s\n", filename);
+		snprintf(ErrorMessage, sizeof(ErrorMessage), "ERROR: Failed to open %s\n%s\n", filename, PHYSFS_getErrorByCode(physfserr));
 		ui_messagebox( -2, -2, 1, ErrorMessage, "Ok" );
 		return 1;
 	}
@@ -1156,7 +1168,7 @@ static int med_load_group( const char *filename, group::vertex_array_type_t &ver
 
 	// Read in group_top_fileinfo to get size of saved fileinfo.
 
-	if (PHYSFSX_fseek( LoadFile, 0, SEEK_SET ))
+	if (!PHYSFS_seek(LoadFile, 0))
 		Error( "Error seeking to 0 in group.c" );
 
 	if (PHYSFS_read( LoadFile, &group_top_fileinfo, sizeof(group_top_fileinfo),1 )!=1)
@@ -1180,7 +1192,7 @@ static int med_load_group( const char *filename, group::vertex_array_type_t &ver
 
 	// Now, Read in the fileinfo
 
-	if (PHYSFSX_fseek( LoadFile, 0, SEEK_SET ))
+	if (!PHYSFS_seek(LoadFile, 0))
 		Error( "Error seeking to 0b in group.c" );
 
 	if (PHYSFS_read( LoadFile, &group_fileinfo, group_top_fileinfo.fileinfo_sizeof,1 )!=1)
@@ -1194,7 +1206,7 @@ static int med_load_group( const char *filename, group::vertex_array_type_t &ver
 
 	if (group_fileinfo.header_offset > -1 )
 	{
-		if (PHYSFSX_fseek( LoadFile,group_fileinfo.header_offset, SEEK_SET ))
+		if (!PHYSFS_seek(LoadFile, group_fileinfo.header_offset))
 			Error( "Error seeking to header_offset in group.c" );
 
 		if (PHYSFS_read( LoadFile, &group_header, group_fileinfo.header_size,1 )!=1)
@@ -1212,7 +1224,7 @@ static int med_load_group( const char *filename, group::vertex_array_type_t &ver
 
 	if (group_fileinfo.editor_offset > -1 )
 	{
-		if (PHYSFSX_fseek( LoadFile,group_fileinfo.editor_offset, SEEK_SET ))
+		if (!PHYSFS_seek(LoadFile, group_fileinfo.editor_offset))
 			Error( "Error seeking to editor_offset in group.c" );
 
 		if (PHYSFS_read( LoadFile, &group_editor, group_fileinfo.editor_size,1 )!=1)
@@ -1224,7 +1236,7 @@ static int med_load_group( const char *filename, group::vertex_array_type_t &ver
 
 	if ( (group_fileinfo.vertex_offset > -1) && (group_fileinfo.vertex_howmany > 0))
 	{
-		if (PHYSFSX_fseek( LoadFile,group_fileinfo.vertex_offset, SEEK_SET ))
+		if (!PHYSFS_seek(LoadFile, group_fileinfo.vertex_offset))
 			Error( "Error seeking to vertex_offset in group.c" );
 
 		vertex_ids.clear();
@@ -1242,7 +1254,7 @@ static int med_load_group( const char *filename, group::vertex_array_type_t &ver
 
 	if ( (group_fileinfo.segment_offset > -1) && (group_fileinfo.segment_howmany > 0))
 	{
-		if (PHYSFSX_fseek( LoadFile,group_fileinfo.segment_offset, SEEK_SET ))
+		if (!PHYSFS_seek(LoadFile, group_fileinfo.segment_offset))
 			Error( "Error seeking to segment_offset in group.c" );
 
 		segment_ids.clear();
@@ -1271,7 +1283,7 @@ static int med_load_group( const char *filename, group::vertex_array_type_t &ver
 				}
 
 			// Fix children and walls.
-			for (unsigned j = 0; j < MAX_SIDES_PER_SEGMENT; ++j)
+			for (const auto j : MAX_SIDES_PER_SEGMENT)
 			{
 				auto &seg = Segments[gs];
 				shared_segment &useg = seg;
@@ -1285,12 +1297,11 @@ static int med_load_group( const char *filename, group::vertex_array_type_t &ver
 				//Translate textures.
 				if (translate == 1) {
 					int	temp;
-					tmap_xlate = useg.sides[j].tmap_num;
-					useg.sides[j].tmap_num = tmap_xlate_table[tmap_xlate];
+					useg.sides[j].tmap_num = tmap_xlate_table[useg.sides[j].tmap_num];
 					temp = useg.sides[j].tmap_num2;
-					tmap_xlate = temp & 0x3fff;			// strip off orientation bits
-					if (tmap_xlate != 0)
-						useg.sides[j].tmap_num2 = (temp & (~0x3fff)) | tmap_xlate_table[tmap_xlate];  // mask on original orientation bits
+					// strip off orientation bits
+					if (const auto tmap_xlate = get_texture_index(temp); tmap_xlate != 0)
+						useg.sides[j].tmap_num2 = build_texture2_value(tmap_xlate_table[tmap_xlate], get_texture_rotation_high(temp));  // mask on original orientation bits
 					}
 				}
 			}
@@ -1300,12 +1311,12 @@ static int med_load_group( const char *filename, group::vertex_array_type_t &ver
 
 	if ( (group_fileinfo.texture_offset > -1) && (group_fileinfo.texture_howmany > 0))
 	{
-		if (PHYSFSX_fseek( LoadFile, group_fileinfo.texture_offset, SEEK_SET ))
+		if (!PHYSFS_seek(LoadFile, group_fileinfo.texture_offset))
 			Error( "Error seeking to texture_offset in gamemine.c" );
 
 		range_for (auto &i, partial_range(old_tmap_list, group_fileinfo.texture_howmany))
 		{
-			array<char, FILENAME_LEN> a;
+			std::array<char, FILENAME_LEN> a;
 			if (PHYSFS_read(LoadFile, a.data(), std::min(static_cast<size_t>(group_fileinfo.texture_sizeof), a.size()), 1) != 1)
 				Error( "Error reading old_tmap_list[i] in gamemine.c" );
 			i.copy_if(a);
@@ -1411,7 +1422,7 @@ int SaveGroup()
  		return 0;
 		}
 
-	array<int8_t, MAX_VERTICES> vertex_list{};
+	std::array<int8_t, MAX_VERTICES> vertex_list{};
 
 	//	Make a list of all vertices in group.
 	range_for (const auto &gs, GroupList[current_group].segments)
@@ -1515,6 +1526,8 @@ int GroupSegment( void )
 
 int Degroup( void )
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	int i;
 
 //	GroupList[current_group].num_segments = 0;
@@ -1545,7 +1558,6 @@ int Degroup( void )
 
    if (Lock_view_to_cursegp)
 	{
-		auto &Vertices = LevelSharedVertexState.get_vertices();
 		auto &vcvertptr = Vertices.vcptr;
        set_view_target_from_segment(vcvertptr, Cursegp);
 	}
@@ -1777,6 +1789,8 @@ int CreateGroup(void)
 // Deletes current group.
 int DeleteGroup( void )
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	int i;
 
 	autosave_mine(mine_filename);
@@ -1807,7 +1821,6 @@ int DeleteGroup( void )
 	undo_status[Autosave_count] = "Delete Group UNDONE.";
    if (Lock_view_to_cursegp)
 	{
-		auto &Vertices = LevelSharedVertexState.get_vertices();
 		auto &vcvertptr = Vertices.vcptr;
        set_view_target_from_segment(vcvertptr, Cursegp);
 	}

@@ -22,12 +22,12 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
  *
  */
 
+#include <span>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "gr.h"
-#include "grdef.h"
 #include "u_mem.h"
 #include "pcx.h"
 #include "physfsx.h"
@@ -35,16 +35,26 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #include "dxxsconf.h"
 #include "dsx-ns.h"
-#include "compiler-lengthof.h"
+#include "compiler-poison.h"
 #include "compiler-range_for.h"
+#include "d_range.h"
 #include "partial_range.h"
+#include "console.h"
+
+#if DXX_USE_SDLIMAGE
+#include "physfsrwops.h"
+#include <SDL_image.h>
+#endif
 
 namespace dcx {
 
+namespace {
+
 #if !DXX_USE_OGL && DXX_USE_SCREENSHOT_FORMAT_LEGACY
+[[nodiscard]]
 static int pcx_encode_byte(ubyte byt, ubyte cnt, PHYSFS_File *fid);
-static int pcx_encode_line(const uint8_t *inBuff, uint_fast32_t inLen, PHYSFS_File *fp);
-#endif
+[[nodiscard]]
+static int pcx_encode_line(std::span<const uint8_t> in, PHYSFS_File *fp);
 
 /* PCX Header data type */
 struct PCXHeader
@@ -65,34 +75,80 @@ struct PCXHeader
 	short   BytesPerLine;
 	ubyte   filler[60];
 } __pack__;
+#endif
 
 #define PCXHEADER_SIZE 128
 
-/*
- * reads n PCXHeader structs from a PHYSFS_File
- */
-static int PCXHeader_read_n(PCXHeader *ph, int n, PHYSFS_File *fp)
+#if DXX_USE_SDLIMAGE
+static pcx_result pcx_read_bitmap(const char *const filename, grs_main_bitmap &bmp, palette_array_t &palette, RWops_ptr rw)
 {
-	int i;
-
-	for (i = 0; i < n; i++) {
-		ph->Manufacturer = PHYSFSX_readByte(fp);
-		ph->Version = PHYSFSX_readByte(fp);
-		ph->Encoding = PHYSFSX_readByte(fp);
-		ph->BitsPerPixel = PHYSFSX_readByte(fp);
-		ph->Xmin = PHYSFSX_readShort(fp);
-		ph->Ymin = PHYSFSX_readShort(fp);
-		ph->Xmax = PHYSFSX_readShort(fp);
-		ph->Ymax = PHYSFSX_readShort(fp);
-		ph->Hdpi = PHYSFSX_readShort(fp);
-		ph->Vdpi = PHYSFSX_readShort(fp);
-		PHYSFS_read(fp, &ph->ColorMap, 16*3, 1);
-		ph->Reserved = PHYSFSX_readByte(fp);
-		ph->Nplanes = PHYSFSX_readByte(fp);
-		ph->BytesPerLine = PHYSFSX_readShort(fp);
-		PHYSFS_read(fp, &ph->filler, 60, 1);
+	RAII_SDL_Surface surface(IMG_LoadPCX_RW(rw.get()));
+	if (!surface.surface)
+	{
+		con_printf(CON_NORMAL, "%s:%u: failed to create surface from \"%s\"", __FILE__, __LINE__, filename);
+		return pcx_result::ERROR_OPENING;
 	}
-	return i;
+	const auto &s = *surface.surface.get();
+	const auto fmt = s.format;
+	if (!fmt || fmt->BitsPerPixel != 8)
+		return pcx_result::ERROR_WRONG_VERSION;
+	const auto fpal = fmt->palette;
+	if (!fpal || fpal->ncolors != palette.size())
+		return pcx_result::ERROR_NO_PALETTE;
+	const unsigned xsize = s.w;
+	const unsigned ysize = s.h;
+	if (xsize > 3840)
+		return pcx_result::ERROR_MEMORY;
+	if (ysize > 2400)
+		return pcx_result::ERROR_MEMORY;
+	DXX_CHECK_MEM_IS_DEFINED(std::span(static_cast<const std::byte *>(s.pixels), xsize * ysize));
+	gr_init_bitmap_alloc(bmp, bm_mode::linear, 0, 0, xsize, ysize, xsize);
+	std::copy_n(reinterpret_cast<const uint8_t *>(s.pixels), xsize * ysize, &bmp.get_bitmap_data()[0]);
+	{
+		const auto a = [](const SDL_Color &c) {
+			return rgb_t{
+				static_cast<uint8_t>(c.r >> 2),
+				static_cast<uint8_t>(c.g >> 2),
+				static_cast<uint8_t>(c.b >> 2)
+			};
+		};
+		std::transform(fpal->colors, fpal->colors + palette.size(), palette.begin(), a);
+	}
+	return pcx_result::SUCCESS;
+}
+#endif
+
+static pcx_result pcx_read_blank(grs_main_bitmap &bmp, palette_array_t &palette)
+{
+	constexpr unsigned xsize = 640;
+	constexpr unsigned ysize = 480;
+	gr_init_bitmap_alloc(bmp, bm_mode::linear, 0, 0, xsize, ysize, xsize);
+	auto &bitmap_data = *reinterpret_cast<uint8_t (*)[ysize][xsize]>(bmp.get_bitmap_data());
+	constexpr uint8_t border = 1;
+	constexpr uint8_t body = 0;
+	std::fill(&bitmap_data[0][0], &bitmap_data[2][0], border);
+	std::fill(&bitmap_data[2][0], &bitmap_data[ysize - 2][0], body);
+	std::fill(&bitmap_data[ysize - 2][0], &bitmap_data[ysize][0], border);
+	for (auto &&y : xrange(2u, ysize - 2))
+	{
+		bitmap_data[y][0] = border;
+		bitmap_data[y][1] = border;
+		bitmap_data[y][xsize - 2] = border;
+		bitmap_data[y][xsize - 1] = border;
+	}
+	palette = {};
+	palette[border] = {63, 63, 63};
+	return pcx_result::SUCCESS;
+}
+
+#if !DXX_USE_SDLIMAGE
+static pcx_result pcx_support_not_compiled(const char *const filename, grs_main_bitmap &bmp, palette_array_t &palette)
+{
+	con_printf(CON_NORMAL, "%s:%u: PCX support disabled at compile time; cannot read file \"%s\"", __FILE__, __LINE__, filename);
+	pcx_read_blank(bmp, palette);
+}
+#endif
+
 }
 
 }
@@ -100,90 +156,63 @@ static int PCXHeader_read_n(PCXHeader *ph, int n, PHYSFS_File *fp)
 #if defined(DXX_BUILD_DESCENT_I)
 namespace dsx {
 
-int bald_guy_load(const char *const filename, grs_bitmap *const bmp, palette_array_t &palette)
+namespace {
+
+#if DXX_USE_SDLIMAGE
+static std::pair<std::unique_ptr<uint8_t[]>, std::size_t> load_physfs_blob(const char *const filename)
 {
-	PCXHeader header;
-	int i, count, fsize;
-	ubyte data, c, xor_value;
-	unsigned int row, xsize;
-	unsigned int col, ysize;
-	
-	auto PCXfile = PHYSFSX_openReadBuffered(filename);
-	if ( !PCXfile )
-		return PCX_ERROR_OPENING;
-	
-	PHYSFSX_fseek(PCXfile, -1, SEEK_END);
-	fsize = PHYSFS_tell(PCXfile);
-	PHYSFS_read(PCXfile, &xor_value, 1, 1);
-	xor_value--;
-	PHYSFSX_fseek(PCXfile, 0, SEEK_SET);
-	
-	RAIIdmem<uint8_t[]> bguy_data, bguy_data1;
-	MALLOC(bguy_data, uint8_t[], fsize);
-	MALLOC(bguy_data1, uint8_t[], fsize);
-	
-	PHYSFS_read(PCXfile, bguy_data1, 1, fsize);
-	
-	for (i = 0; i < fsize; i++) {
-		c = bguy_data1[fsize - i - 1] ^ xor_value;
-		bguy_data[i] = c;
-		xor_value--;
+	auto &&[file, physfserr] = PHYSFSX_openReadBuffered(filename);
+	if (!file)
+	{
+		con_printf(CON_VERBOSE, "%s:%u: failed to open \"%s\": %s", __FILE__, __LINE__, filename, PHYSFS_getErrorByCode(physfserr));
+		return {};
 	}
-	PCXfile.reset();
-	auto p = bguy_data.get();
-	memcpy( &header, p, sizeof(PCXHeader) );
-	p += sizeof(PCXHeader);
-	
-	// Is it a 256 color PCX file?
-	if ((header.Manufacturer != 10)||(header.Encoding != 1)||(header.Nplanes != 1)||(header.BitsPerPixel != 8)||(header.Version != 5))	{
-		return PCX_ERROR_WRONG_VERSION;
+	const std::size_t fsize = PHYSFS_fileLength(file);
+	if (fsize > 0x100000)
+	{
+		con_printf(CON_VERBOSE, "%s:%u: file too large \"%s\"", __FILE__, __LINE__, filename);
+		return {};
 	}
-	header.Xmin= INTEL_SHORT(header.Xmin);
-	header.Xmax = INTEL_SHORT(header.Xmax);
-	header.Ymin = INTEL_SHORT(header.Ymin);
-	header.Ymax = INTEL_SHORT(header.Ymax);
-	
-	// Find the size of the image
-	xsize = header.Xmax - header.Xmin + 1;
-	ysize = header.Ymax - header.Ymin + 1;
-	
-	if ( bmp->bm_data == NULL )	{
-		*bmp = {};
-		MALLOC(bmp->bm_mdata, unsigned char, xsize * ysize );
-		if ( bmp->bm_data == NULL )	{
-			return PCX_ERROR_MEMORY;
-		}
-		bmp->bm_w = bmp->bm_rowsize = xsize;
-		bmp->bm_h = ysize;
-		bmp->set_type(bm_mode::linear);
+	auto encoded_buffer = std::make_unique<uint8_t[]>(fsize);
+	if (PHYSFS_read(file, encoded_buffer.get(), 1, fsize) < fsize)
+	{
+		con_printf(CON_VERBOSE, "%s:%u: failed to read \"%s\"", __FILE__, __LINE__, filename);
+		return {};
 	}
-	
-	for (row=0; row< ysize ; row++)      {
-		auto pixdata = &bmp->get_bitmap_data()[bmp->bm_rowsize*row];
-			for (col=0; col< xsize ; )      {
-				data = *p;
-				p++;
-				if ((data & 0xC0) == 0xC0)     {
-					count =  data & 0x3F;
-					data = *p;
-					p++;
-					memset( pixdata, data, count );
-					pixdata += count;
-					col += count;
-				} else {
-					*pixdata++ = data;
-					col++;
-				}
-			}
-	}
-	
-	
-	// Read the extended palette at the end of PCX file
-	// Read in a character which should be 12 to be extended palette file
-	
-	p++;
-	copy_diminish_palette(palette, p);
-	return PCX_ERROR_NONE;
+	return {std::move(encoded_buffer), fsize};
+}
+
+static std::pair<std::unique_ptr<uint8_t[]>, std::size_t> load_decoded_physfs_blob(const char *const filename)
+{
+	auto encoded_blob = load_physfs_blob(filename);
+	auto &&[encoded_buffer, fsize] = encoded_blob;
+	if (!encoded_buffer)
+		return encoded_blob;
+	const std::size_t data_size = fsize - 1;
+	auto &&transform_predicate = [xor_value = encoded_buffer[data_size]](uint8_t c) mutable {
+		return c ^ --xor_value;
+	};
+	auto &&decoded_buffer = std::make_unique<uint8_t[]>(data_size);
+	const auto b = encoded_buffer.get();
+	std::transform(std::make_reverse_iterator(std::next(b, data_size)), std::make_reverse_iterator(b), decoded_buffer.get(), transform_predicate);
+	return {std::move(decoded_buffer), data_size};
+}
+#endif
+
+}
+
+pcx_result bald_guy_load(const char *const filename, grs_main_bitmap &bmp, palette_array_t &palette)
+{
+#if DXX_USE_SDLIMAGE
+	const auto &&[bguy_data, data_size] = load_decoded_physfs_blob(filename);
+	if (!bguy_data)
+		return pcx_result::ERROR_OPENING;
+
+	RWops_ptr rw(SDL_RWFromConstMem(bguy_data.get(), data_size));
+	return pcx_read_bitmap(filename, bmp, palette, std::move(rw));
+#else
+	return pcx_support_not_compiled(filename, bmp, palette);
+#endif
 }
 
 }
@@ -191,115 +220,36 @@ int bald_guy_load(const char *const filename, grs_bitmap *const bmp, palette_arr
 
 namespace dcx {
 
-struct PCX_PHYSFS_file
+pcx_result pcx_read_bitmap(const char *const filename, grs_main_bitmap &bmp, palette_array_t &palette)
 {
-	RAIIPHYSFS_File PCXfile;
-};
-
-static int pcx_read_bitmap_file(struct PCX_PHYSFS_file *const pcxphysfs, grs_main_bitmap &bmp, bm_mode bitmap_type, palette_array_t &palette);
-
-int pcx_read_bitmap(const char *const filename, grs_main_bitmap &bmp, palette_array_t &palette)
-{
-	int result;
-	PCX_PHYSFS_file pcxphysfs{PHYSFSX_openReadBuffered(filename)};
-	if (!pcxphysfs.PCXfile)
-		return PCX_ERROR_OPENING;
-	result = pcx_read_bitmap_file(&pcxphysfs, bmp, bm_mode::linear, palette);
-	return result;
-}
-
-static int PCX_PHYSFS_read(struct PCX_PHYSFS_file *pcxphysfs, ubyte *data, unsigned size)
-{
-	return PHYSFS_read(pcxphysfs->PCXfile, data, size, sizeof(*data));
-}
-
-static int pcx_read_bitmap_file(struct PCX_PHYSFS_file *const pcxphysfs, grs_main_bitmap &bmp, const bm_mode bitmap_type, palette_array_t &palette)
-{
-	PCXHeader header;
-	int i, row, col, count, xsize, ysize;
-	ubyte data;
-
-	// read 128 char PCX header
-	if (PCXHeader_read_n( &header, 1, pcxphysfs->PCXfile )!=1) {
-		return PCX_ERROR_NO_HEADER;
-	}
-
-	// Is it a 256 color PCX file?
-	if ((header.Manufacturer != 10)||(header.Encoding != 1)||(header.Nplanes != 1)||(header.BitsPerPixel != 8)||(header.Version != 5))	{
-		return PCX_ERROR_WRONG_VERSION;
-	}
-
-	// Find the size of the image
-	xsize = header.Xmax - header.Xmin + 1;
-	ysize = header.Ymax - header.Ymin + 1;
-
-	if ( bitmap_type == bm_mode::linear )	{
-		if ( bmp.bm_data == NULL )	{
-			gr_init_bitmap_alloc(bmp, bitmap_type, 0, 0, xsize, ysize, xsize);
-		}
-	}
-
-	if (bmp.get_type() == bm_mode::linear)
+#if DXX_USE_SDLIMAGE
+	/* Try to enable buffering on the PHYSFS file.  On Windows,
+	 * unbuffered access to the file causes SDL_image to be slow enough
+	 * for users to detect the latency and report it as an issue.  On
+	 * Linux, unbuffered access is still fast.
+	 */
+	auto &&[rw, physfserr] = PHYSFSRWOPS_openReadBuffered(filename, 1024 * 1024);
+	if (!rw)
 	{
-		for (row=0; row< ysize ; row++)      {
-			auto pixdata = &bmp.get_bitmap_data()[bmp.bm_rowsize*row];
-			for (col=0; col< xsize ; )      {
-				if (PCX_PHYSFS_read(pcxphysfs, &data, 1) != 1)	{
-					return PCX_ERROR_READING;
-				}
-				if ((data & 0xC0) == 0xC0)     {
-					count =  data & 0x3F;
-					if (PCX_PHYSFS_read(pcxphysfs, &data, 1) != 1)	{
-						return PCX_ERROR_READING;
-					}
-					memset( pixdata, data, count );
-					pixdata += count;
-					col += count;
-				} else {
-					*pixdata++ = data;
-					col++;
-				}
-			}
-		}
-	} else {
-		for (row=0; row< ysize ; row++)      {
-			for (col=0; col< xsize ; )      {
-				if (PCX_PHYSFS_read(pcxphysfs, &data, 1) != 1)	{
-					return PCX_ERROR_READING;
-				}
-				if ((data & 0xC0) == 0xC0)     {
-					count =  data & 0x3F;
-					if (PCX_PHYSFS_read(pcxphysfs, &data, 1) != 1)	{
-						return PCX_ERROR_READING;
-					}
-					for (i=0;i<count;i++)
-						gr_bm_pixel(*grd_curcanv, bmp, col+i, row, data);
-					col += count;
-				} else {
-					gr_bm_pixel(*grd_curcanv, bmp, col, row, data);
-					col++;
-				}
-			}
-		}
+		con_printf(CON_NORMAL, "%s:%u: failed to open \"%s\": %s", __FILE__, __LINE__, filename, PHYSFS_getErrorByCode(physfserr));
+		return pcx_result::ERROR_OPENING;
 	}
+	return pcx_read_bitmap(filename, bmp, palette, std::move(rw));
+#else
+	return pcx_support_not_compiled(filename, bmp, palette);
+#endif
+}
 
-	// Read the extended palette at the end of PCX file
-		// Read in a character which should be 12 to be extended palette file
-		if (PCX_PHYSFS_read(pcxphysfs, &data, 1) == 1)	{
-			if ( data == 12 )	{
-				if (PCX_PHYSFS_read(pcxphysfs, reinterpret_cast<ubyte *>(&palette[0]), palette.size() * sizeof(palette[0])) != 1)	{
-					return PCX_ERROR_READING;
-				}
-				diminish_palette(palette);
-			}
-		} else {
-			return PCX_ERROR_NO_PALETTE;
-		}
-	return PCX_ERROR_NONE;
+pcx_result pcx_read_bitmap_or_default(const char *const filename, grs_main_bitmap &bmp, palette_array_t &palette)
+{
+	const auto r = pcx_read_bitmap(filename, bmp, palette);
+	if (r != pcx_result::SUCCESS)
+		pcx_read_blank(bmp, palette);
+	return r;
 }
 
 #if !DXX_USE_OGL && DXX_USE_SCREENSHOT_FORMAT_LEGACY
-int pcx_write_bitmap(PHYSFS_File *const PCXfile, const grs_bitmap *const bmp, palette_array_t &palette)
+unsigned pcx_write_bitmap(PHYSFS_File *const PCXfile, const grs_bitmap *const bmp, palette_array_t &palette)
 {
 	int retval;
 	ubyte data;
@@ -316,7 +266,7 @@ int pcx_write_bitmap(PHYSFS_File *const PCXfile, const grs_bitmap *const bmp, pa
 
 	if (PHYSFS_write(PCXfile, &header, PCXHEADER_SIZE, 1) != 1)
 	{
-		return PCX_ERROR_WRITING;
+		return 1;
 	}
 
 	{
@@ -326,9 +276,9 @@ int pcx_write_bitmap(PHYSFS_File *const PCXfile, const grs_bitmap *const bmp, pa
 		const auto e = &bm_data[bm_rowsize * bmp->bm_h];
 		for (auto i = &bm_data[0]; i != e; i += bm_rowsize)
 		{
-			if (!pcx_encode_line(i, bm_w, PCXfile))
+			if (!pcx_encode_line(std::span{i, bm_w}, PCXfile))
 			{
-			return PCX_ERROR_WRITING;
+				return 1;
 			}
 		}
 	}
@@ -337,28 +287,29 @@ int pcx_write_bitmap(PHYSFS_File *const PCXfile, const grs_bitmap *const bmp, pa
 	data = 12;
 	if (PHYSFS_write(PCXfile, &data, 1, 1) != 1)
 	{
-		return PCX_ERROR_WRITING;
+		return 1;
 	}
 
 	retval = PHYSFS_write(PCXfile, &palette[0], sizeof(palette), 1);
 	if (retval !=1)	{
-		return PCX_ERROR_WRITING;
+		return 1;
 	}
-	return PCX_ERROR_NONE;
+	return 0;
 }
 
+namespace {
+
 // returns number of bytes written into outBuff, 0 if failed
-int pcx_encode_line(const uint8_t *inBuff, uint_fast32_t inLen, PHYSFS_File *fp)
+int pcx_encode_line(const std::span<const uint8_t> in, PHYSFS_File *fp)
 {
-	ubyte last;
 	int i;
-	register int total;
-	register ubyte runCount; 	// max single runlength is 63
+	int total;
+	ubyte runCount; 	// max single runlength is 63
 	total = 0;
-	last = *(inBuff);
+	auto last = in.front();
 	runCount = 1;
 
-	range_for (const auto ub, unchecked_partial_range(inBuff, 1u, inLen))
+	range_for (const auto ub, unchecked_partial_range(in.data(), 1u, in.size()))
 	{
 		if (ub == last)	{
 			runCount++;			// it encodes
@@ -414,6 +365,8 @@ int pcx_encode_byte(ubyte byt, ubyte cnt, PHYSFS_File *fid)
 	}
 	return 0;
 }
+
+}
 #endif
 
 //text for error messges
@@ -429,16 +382,15 @@ constexpr char pcx_error_messages[] = {
 
 
 //function to return pointer to error message
-const char *pcx_errormsg(int error_number)
+const char *pcx_errormsg(const pcx_result r)
 {
 	const char *p = pcx_error_messages;
 
+	unsigned error_number = static_cast<unsigned>(r);
 	while (error_number--) {
-
-		if (p == pcx_error_messages + lengthof(pcx_error_messages)) return NULL;
-
+		if (p == std::end(pcx_error_messages))
+			return nullptr;
 		p += strlen(p)+1;
-
 	}
 
 	return p;

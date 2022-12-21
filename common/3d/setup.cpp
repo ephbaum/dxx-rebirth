@@ -17,7 +17,6 @@
 
 #include "3d.h"
 #include "globvars.h"
-#include "clipper.h"
 
 #if DXX_USE_OGL
 #include "ogl_init.h"
@@ -34,11 +33,13 @@ void g3_start_frame(grs_canvas &canvas)
 	fix s;
 
 	//set int w,h & fixed-point w,h/2
-	Canv_w2 = (Canvas_width  = canvas.cv_bitmap.bm_w)<<15;
-	Canv_h2 = (Canvas_height = canvas.cv_bitmap.bm_h)<<15;
+	const int Canvas_width = canvas.cv_bitmap.bm_w;
+	const int Canvas_height = canvas.cv_bitmap.bm_h;
+	Canv_w2 = Canvas_width << 15;
+	Canv_h2 = Canvas_height << 15;
 #ifdef __powerc
-	fCanv_w2 = f2fl((Canvas_width  = canvas.cv_bitmap.bm_w)<<15);
-	fCanv_h2 = f2fl((Canvas_height = canvas.cv_bitmap.bm_h)<<15);
+	fCanv_w2 = f2fl((Canvas_width)<<15);
+	fCanv_h2 = f2fl((Canvas_height)<<15);
 #endif
 
 	//compute aspect ratio for this canvas

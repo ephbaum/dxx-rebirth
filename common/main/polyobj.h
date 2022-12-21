@@ -30,11 +30,27 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 struct bitmap_index;
 
-#ifdef __cplusplus
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <physfs.h>
+#include "d_array.h"
+#include "inferno.h"
 #include "pack.h"
+
+namespace dcx {
+
+enum class polygon_model_index : uint8_t
+{
+	None = UINT8_MAX
+};
+
+enum class polygon_simpler_model_index : uint8_t
+{
+	None = 0,
+};
+
+}
 
 #ifdef dsx
 namespace dsx {
@@ -46,11 +62,8 @@ constexpr std::integral_constant<unsigned, 85> MAX_POLYGON_MODELS{};
 constexpr std::integral_constant<unsigned, 200> MAX_POLYGON_MODELS{};
 #endif
 
-// array of names of currently-loaded models
-extern array<char[13], MAX_POLYGON_MODELS> Pof_names;
-
 //for each model, a model number for dying & dead variants, or -1 if none
-extern array<int, MAX_POLYGON_MODELS> Dying_modelnums, Dead_modelnums;
+extern enumerated_array<polygon_model_index, MAX_POLYGON_MODELS, polygon_model_index> Dying_modelnums, Dead_modelnums;
 }
 #endif
 
@@ -63,25 +76,25 @@ struct polymodel : prohibit_void_ptr<polymodel>
 	unsigned n_models;
 	unsigned model_data_size;
 	std::unique_ptr<uint8_t[]>   model_data;
-	array<int, MAX_SUBMODELS> submodel_ptrs;
-	array<vms_vector, MAX_SUBMODELS> submodel_offsets;
-	array<vms_vector, MAX_SUBMODELS> submodel_norms;   // norm for sep plane
-	array<vms_vector, MAX_SUBMODELS> submodel_pnts;    // point on sep plane
-	array<fix, MAX_SUBMODELS> submodel_rads;       // radius for each submodel
-	array<ubyte, MAX_SUBMODELS> submodel_parents;    // what is parent for each submodel
-	array<vms_vector, MAX_SUBMODELS> submodel_mins;
-	array<vms_vector, MAX_SUBMODELS> submodel_maxs;
+	std::array<int, MAX_SUBMODELS> submodel_ptrs;
+	std::array<vms_vector, MAX_SUBMODELS> submodel_offsets;
+	std::array<vms_vector, MAX_SUBMODELS> submodel_norms;   // norm for sep plane
+	std::array<vms_vector, MAX_SUBMODELS> submodel_pnts;    // point on sep plane
+	std::array<fix, MAX_SUBMODELS> submodel_rads;       // radius for each submodel
+	std::array<ubyte, MAX_SUBMODELS> submodel_parents;    // what is parent for each submodel
+	std::array<vms_vector, MAX_SUBMODELS> submodel_mins;
+	std::array<vms_vector, MAX_SUBMODELS> submodel_maxs;
 	vms_vector mins,maxs;                       // min,max for whole model
 	fix     rad;
 	ushort  first_texture;
 	ubyte   n_textures;
-	ubyte   simpler_model;                      // alternate model with less detail (0 if none, model_num+1 else)
+	polygon_simpler_model_index simpler_model;                      // alternate model with less detail (0 if none, model_num+1 else)
 	//vms_vector min,max;
 };
 
 class submodel_angles
 {
-	typedef const array<vms_angvec, MAX_SUBMODELS> array_type;
+	using array_type = const std::array<vms_angvec, MAX_SUBMODELS>;
 	array_type *p;
 public:
 	submodel_angles(std::nullptr_t) : p(nullptr) {}
@@ -94,9 +107,19 @@ public:
 	}
 };
 
+struct d_level_shared_polygon_model_state
+{
 // how many polygon objects there are
-extern unsigned N_polygon_models;
-void init_polygon_models();
+	unsigned N_polygon_models;
+};
+
+void init_polygon_models(d_level_shared_polygon_model_state &);
+
+/* Only defined if DXX_WORDS_NEED_ALIGNMENT, but always declared, so
+ * that the header preprocesses to the same text regardless of the
+ * setting.
+ */
+void align_polygon_model_data(polymodel *pm);
 
 }
 #ifdef dsx
@@ -105,17 +128,24 @@ namespace dsx {
 /* Individual levels can customize the polygon models through robot overrides,
  * so this must be scoped to the level, not to the mission.
  */
-struct d_level_shared_polygon_model_state
+struct d_level_shared_polygon_model_state : ::dcx::d_level_shared_polygon_model_state
 {
-	array<polymodel, MAX_POLYGON_MODELS> Polygon_models;
+	enumerated_array<polymodel, MAX_POLYGON_MODELS, polygon_model_index> Polygon_models;
+	// array of names of currently-loaded models
+	enumerated_array<char[FILENAME_LEN], MAX_POLYGON_MODELS, polygon_model_index> Pof_names;
+#if defined(DXX_BUILD_DESCENT_II)
+	//the model number of the marker object
+	polygon_model_index Marker_model_num = polygon_model_index::None;
+	bool Exit_models_loaded;
+#endif
 };
 
 // array of pointers to polygon objects
 extern d_level_shared_polygon_model_state LevelSharedPolygonModelState;
 
-void free_polygon_models();
+void free_polygon_models(d_level_shared_polygon_model_state &LevelSharedPolygonModelState);
 
-int load_polygon_model(const char *filename,int n_textures,int first_texture,robot_info *r);
+polygon_model_index load_polygon_model(const char *filename, int n_textures, int first_texture, robot_info *r);
 }
 #endif
 
@@ -123,9 +153,9 @@ namespace dcx {
 
 class alternate_textures
 {
-	const bitmap_index *p;
+	const bitmap_index *p = nullptr;
 public:
-	alternate_textures() : p(nullptr) {}
+	alternate_textures() = default;
 	alternate_textures(std::nullptr_t) : p(nullptr) {}
 	template <std::size_t N>
 		alternate_textures(const std::array<bitmap_index, N> &a) : p(a.data())
@@ -139,7 +169,8 @@ public:
 #ifdef dsx
 namespace dsx {
 // draw a polygon model
-void draw_polygon_model(grs_canvas &, const vms_vector &pos, const vms_matrix &orient, submodel_angles anim_angles, unsigned model_num, unsigned flags, g3s_lrgb light, const glow_values_t *glow_values, alternate_textures);
+void draw_polygon_model(const enumerated_array<polymodel, MAX_POLYGON_MODELS, polygon_model_index> &, grs_canvas &, const vms_vector &pos, const vms_matrix &orient, submodel_angles anim_angles, const polygon_model_index model_num, unsigned flags, g3s_lrgb light, const glow_values_t *glow_values, alternate_textures);
+void draw_polygon_model(grs_canvas &, const vms_vector &pos, const vms_matrix &orient, submodel_angles anim_angles, const polymodel &model_num, unsigned flags, g3s_lrgb light, const glow_values_t *glow_values, alternate_textures);
 }
 #endif
 
@@ -147,26 +178,33 @@ void draw_polygon_model(grs_canvas &, const vms_vector &pos, const vms_matrix &o
 // more-or-less fill the canvas.  Note that this routine actually renders
 // into an off-screen canvas that it creates, then copies to the current
 // canvas.
-void draw_model_picture(grs_canvas &, uint_fast32_t mn, const vms_angvec &orient_angles);
+void draw_model_picture(grs_canvas &, const polymodel &mn, const vms_angvec &orient_angles);
 
 #if defined(DXX_BUILD_DESCENT_I) || defined(DXX_BUILD_DESCENT_II)
 #if defined(DXX_BUILD_DESCENT_I)
 #define MAX_POLYOBJ_TEXTURES 50
 #elif defined(DXX_BUILD_DESCENT_II)
-// free up a model, getting rid of all its memory
-void free_model(polymodel &po);
 
 #define MAX_POLYOBJ_TEXTURES 100
 constexpr std::integral_constant<unsigned, 166> N_D2_POLYGON_MODELS{};
 #endif
-extern array<grs_bitmap *, MAX_POLYOBJ_TEXTURES> texture_list;
 #endif
 
 namespace dcx {
+
+#if defined(DXX_BUILD_DESCENT_II)
+/* This function exists in both games and has the same implementation in
+ * both, but is static in Descent 1.  Declare it in the header only for
+ * Descent 2.
+ */
+// free up a model, getting rid of all its memory
+void free_model(polymodel &po);
+#endif
+
 /*
  * reads a polymodel structure from a PHYSFS_File
  */
-extern void polymodel_read(polymodel *pm, PHYSFS_File *fp);
+void polymodel_read(polymodel &pm, PHYSFS_File *fp);
 }
 #if 0
 void polymodel_write(PHYSFS_File *fp, const polymodel &pm);
@@ -178,7 +216,9 @@ void polymodel_write(PHYSFS_File *fp, const polymodel &pm);
 #ifdef dsx
 namespace dsx {
 void polygon_model_data_read(polymodel *pm, PHYSFS_File *fp);
-
-}
+polygon_model_index build_polygon_model_index_from_untrusted(unsigned i);
+#if DXX_USE_OGL
+void ogl_cache_polymodel_textures(polygon_model_index model_num);
 #endif
+}
 #endif

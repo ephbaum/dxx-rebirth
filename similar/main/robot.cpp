@@ -27,16 +27,16 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "dxxerror.h"
 #include "inferno.h"
 #include "robot.h"
+#include "ai.h"
 #include "object.h"
 #include "polyobj.h"
 #include "physfsx.h"
+#include "d_levelstate.h"
+#include "segment.h"
 
+#include "d_enumerate.h"
 #include "compiler-range_for.h"
 #include "partial_range.h"
-
-namespace dcx {
-unsigned N_robot_joints;
-}
 
 #if 0
 static inline void PHYSFSX_writeAngleVec(PHYSFS_File *fp, const vms_angvec &v)
@@ -51,20 +51,17 @@ namespace dsx {
 
 //given an object and a gun number, return position in 3-space of gun
 //fills in gun_point
-void calc_gun_point(vms_vector &gun_point, const object_base &obj, unsigned gun_num)
+void calc_gun_point(const robot_info &r, vms_vector &gun_point, const object_base &obj, const robot_gun_number entry_gun_num)
 {
 	Assert(obj.render_type == RT_POLYOBJ || obj.render_type == RT_MORPH);
 	assert(get_robot_id(obj) < LevelSharedRobotInfoState.N_robot_types);
 
-	auto &Robot_info = LevelSharedRobotInfoState.Robot_info;
-	const auto &r = Robot_info[get_robot_id(obj)];
 	auto &Polygon_models = LevelSharedPolygonModelState.Polygon_models;
 	const auto &pm = Polygon_models[r.model_num];
 
-	if (gun_num >= r.n_guns)
-	{
-		gun_num = 0;
-	}
+	const auto gun_num = (underlying_value(entry_gun_num) >= r.n_guns)
+		? robot_gun_number::_0
+		: entry_gun_num;
 
 	auto pnt = r.gun_points[gun_num];
 
@@ -87,10 +84,9 @@ void calc_gun_point(vms_vector &gun_point, const object_base &obj, unsigned gun_
 
 //fills in ptr to list of joints, and returns the number of joints in list
 //takes the robot type (object id), gun number, and desired state
-partial_range_t<const jointpos *> robot_get_anim_state(const d_level_shared_robot_info_state::d_robot_info_array &robot_info, const array<jointpos, MAX_ROBOT_JOINTS> &robot_joints, const unsigned robot_type, const unsigned gun_num, const unsigned state)
+partial_range_t<const jointpos *> robot_get_anim_state(const d_robot_info_array &robot_info, const std::array<jointpos, MAX_ROBOT_JOINTS> &robot_joints, const unsigned robot_type, const robot_gun_number gun_num, const robot_animation_state state)
 {
 	auto &rirt = robot_info[robot_type];
-	assert(gun_num <= rirt.n_guns);
 	auto &as = rirt.anim_states[gun_num][state];
 	const unsigned o = as.offset;
 	return partial_range(robot_joints, o, o + as.n_joints);
@@ -98,23 +94,21 @@ partial_range_t<const jointpos *> robot_get_anim_state(const d_level_shared_robo
 
 #ifndef NDEBUG
 //for test, set a robot to a specific state
-static void set_robot_state(object_base &obj, const unsigned state) __attribute_used;
-static void set_robot_state(object_base &obj, const unsigned state)
+__attribute_used
+static void set_robot_state(object_base &obj, const robot_animation_state state)
 {
 	auto &Robot_joints = LevelSharedRobotJointState.Robot_joints;
-	int g,j,jo;
-	jointlist *jl;
+	int j,jo;
 
 	assert(obj.type == OBJ_ROBOT);
 
 	auto &Robot_info = LevelSharedRobotInfoState.Robot_info;
 	auto &ri = Robot_info[get_robot_id(obj)];
 
-	for (g = 0; g < ri.n_guns + 1; g++)
+	const unsigned n_guns = ri.n_guns + 1;
+	for (auto &as : partial_range(ri.anim_states, n_guns))
 	{
-
-		jl = &ri.anim_states[g][state];
-
+		const auto jl = &as[state];
 		jo = jl->offset;
 
 		for (j=0;j<jl->n_joints;j++,jo++) {
@@ -130,40 +124,46 @@ static void set_robot_state(object_base &obj, const unsigned state)
 
 //set the animation angles for this robot.  Gun fields of robot info must
 //be filled in.
-void robot_set_angles(robot_info *r,polymodel *pm,array<array<vms_angvec, MAX_SUBMODELS>, N_ANIM_STATES> &angs)
+void robot_set_angles(robot_info &r, polymodel &pm, enumerated_array<std::array<vms_angvec, MAX_SUBMODELS>, N_ANIM_STATES, robot_animation_state> &angs)
 {
 	auto &Robot_joints = LevelSharedRobotJointState.Robot_joints;
-	int g,state;
-	array<int, MAX_SUBMODELS> gun_nums;			//which gun each submodel is part of
+	std::array<robot_gun_number, MAX_SUBMODELS> gun_nums;			//which gun each submodel is part of
+	gun_nums[0] = robot_gun_number{UINT8_MAX};		//body never animates, at least for now
+	{
+		auto &&gr = partial_range(gun_nums, 1u, pm.n_models);
+		//assume part of body...
+		std::fill(gr.begin(), gr.end(), robot_gun_number{r.n_guns});
+	}
 
-	range_for (auto &m, partial_range(gun_nums, 1u, pm->n_models))
-		m = r->n_guns;		//assume part of body...
-
-	gun_nums[0] = -1;		//body never animates, at least for now
-
-	for (g=0;g<r->n_guns;g++) {
-		auto m = r->gun_submodels[g];
-
-		while (m != 0) {
+	for (auto [g, entry_m] : enumerate(partial_const_range(r.gun_submodels, r.n_guns)))
+	{
+		const std::size_t bound = std::min(std::size(gun_nums), std::size(pm.submodel_parents));
+		auto m = entry_m;
+		while (m != 0 && m < bound)
+		{
 			gun_nums[m] = g;				//...unless we find it in a gun
-			m = pm->submodel_parents[m];
+			m = pm.submodel_parents[m];
 		}
 	}
 
-	for (g=0;g<r->n_guns+1;g++) {
+	const auto n_models = pm.n_models;
+	const auto &&gun_num_model_range = enumerate(partial_range(gun_nums, n_models));
+	const unsigned n_guns = r.n_guns + 1;
+	for (auto &&[g, ras] : enumerate(partial_range(r.anim_states, n_guns)))
+	{
+		for (auto &&[state, as] : enumerate(ras))
+		{
+			as.n_joints = 0;
+			as.offset = LevelSharedRobotJointState.N_robot_joints;
 
-		for (state=0;state<N_ANIM_STATES;state++) {
-
-			r->anim_states[g][state].n_joints = 0;
-			r->anim_states[g][state].offset = N_robot_joints;
-
-			for (unsigned m = 0; m < pm->n_models; ++m)
+			for (auto &&[m, gn] : gun_num_model_range)
 			{
-				if (gun_nums[m] == g) {
+				if (gn == g)
+				{
+					const auto N_robot_joints = LevelSharedRobotJointState.N_robot_joints ++;
 					Robot_joints[N_robot_joints].jointnum = m;
 					Robot_joints[N_robot_joints].angles = angs[state][m];
-					r->anim_states[g][state].n_joints++;
-					N_robot_joints++;
+					r.anim_states[g][state].n_joints++;
 					Assert(N_robot_joints < MAX_ROBOT_JOINTS);
 				}
 			}
@@ -174,25 +174,39 @@ void robot_set_angles(robot_info *r,polymodel *pm,array<array<vms_angvec, MAX_SU
 
 }
 
+namespace {
+
 /*
  * reads n jointlist structs from a PHYSFS_File
  */
-static void jointlist_read(PHYSFS_File *fp, array<jointlist, N_ANIM_STATES> &jl)
+static void jointlist_read(PHYSFS_File *fp, std::array<jointlist, N_ANIM_STATES> &jl)
 {
 	range_for (auto &i, jl)
 	{
 		i.n_joints = PHYSFSX_readShort(fp);
 		i.offset = PHYSFSX_readShort(fp);
+		if (!i.n_joints)
+			/* The custom campaign `Descent 2: Enemy Vignettes` has
+			 * custom robots with invalid joints.  These joints have
+			 * invalid offsets, but `n_joints` of 0.  This makes the
+			 * invalid data easy to detect and clean.
+			 *
+			 * When the number of joints is zero, discard the loaded
+			 * offset and set it to 0, which will always be in range.
+			 */
+			i.offset = 0;
 	}
+}
+
 }
 
 namespace dsx {
 
-imobjptridx_t robot_create(const unsigned id, const vmsegptridx_t segnum, const vms_vector &pos, const vms_matrix *const orient, const fix size, const ai_behavior behavior, const imsegidx_t hide_segment)
+imobjptridx_t robot_create(const d_robot_info_array &Robot_info, const unsigned id, const vmsegptridx_t segnum, const vms_vector &pos, const vms_matrix *const orient, const fix size, const ai_behavior behavior, const imsegidx_t hide_segment)
 {
-	const auto &&objp = obj_create(OBJ_ROBOT, id, segnum, pos, orient, size, CT_AI, MT_PHYSICS, RT_POLYOBJ);
+	const auto &&objp = obj_create(LevelUniqueObjectState, LevelSharedSegmentState, LevelUniqueSegmentState, OBJ_ROBOT, id, segnum, pos, orient, size, object::control_type::ai, object::movement_type::physics, RT_POLYOBJ);
 	if (objp)
-		init_ai_object(objp, behavior, hide_segment);
+		init_ai_object(Robot_info, objp, behavior, hide_segment);
 	return objp;
 }
 
@@ -201,7 +215,7 @@ imobjptridx_t robot_create(const unsigned id, const vmsegptridx_t segnum, const 
  */
 void robot_info_read(PHYSFS_File *fp, robot_info &ri)
 {
-	ri.model_num = PHYSFSX_readInt(fp);
+	ri.model_num = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(fp));
 #if defined(DXX_BUILD_DESCENT_I)
 	ri.n_guns = PHYSFSX_readInt(fp);
 #endif
@@ -290,7 +304,7 @@ void robot_info_read(PHYSFS_File *fp, robot_info &ri)
 	ri.death_roll = PHYSFSX_readByte(fp);
 
 	ri.flags = PHYSFSX_readByte(fp);
-	array<char, 3> pad;
+	std::array<char, 3> pad;
 	PHYSFS_read(fp, pad, pad.size(), 1);
 
 	ri.deathroll_sound = PHYSFSX_readByte(fp);

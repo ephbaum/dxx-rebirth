@@ -17,8 +17,9 @@ typedef char file_extension_t[5];
 
 #include "dxxsconf.h"
 #include "dsx-ns.h"
-#include "compiler-array.h"
 #include "fwd-partial_range.h"
+#include <array>
+#include "backports-ranges.h"
 
 namespace dcx {
 
@@ -36,7 +37,7 @@ class PHYSFSX_uncounted_list_template : public std::unique_ptr<char *[], D>
 {
 public:
 	typedef null_sentinel_iterator<char *> const_iterator;
-	DXX_INHERIT_CONSTRUCTORS(PHYSFSX_uncounted_list_template, std::unique_ptr<char *[], D>);
+	using std::unique_ptr<char *[], D>::unique_ptr;
 	const_iterator begin() const
 	{
 		return this->get();
@@ -77,13 +78,13 @@ public:
 typedef PHYSFSX_uncounted_list_template<PHYSFS_list_deleter> PHYSFSX_uncounted_list;
 typedef PHYSFSX_counted_list_template<PHYSFS_list_deleter> PHYSFSX_counted_list;
 
+[[nodiscard]]
 __attribute_nonnull()
-__attribute_warn_unused_result
-PHYSFSX_uncounted_list PHYSFSX_findFiles(const char *path, partial_range_t<const file_extension_t *> exts);
+PHYSFSX_uncounted_list PHYSFSX_findFiles(const char *path, ranges::subrange<const file_extension_t *> exts);
 
+[[nodiscard]]
 __attribute_nonnull()
-__attribute_warn_unused_result
-PHYSFSX_uncounted_list PHYSFSX_findabsoluteFiles(const char *path, const char *realpath, const partial_range_t<const file_extension_t *> exts);
+PHYSFSX_uncounted_list PHYSFSX_findabsoluteFiles(const char *path, const char *realpath, ranges::subrange<const file_extension_t *> exts);
 
 }
 #endif

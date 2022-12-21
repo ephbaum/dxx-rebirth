@@ -28,7 +28,6 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include <string.h>
 #include "u_mem.h"
 #include "gr.h"
-#include "grdef.h"
 #include "rle.h"
 #include "dxxerror.h"
 #include "byteutil.h"
@@ -36,12 +35,13 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "ogl_init.h"
 #endif
 
-#include "compiler-array.h"
-#include "compiler-exchange.h"
 #include "compiler-range_for.h"
 #include "d_range.h"
+#include <array>
 
 namespace dcx {
+
+namespace {
 
 static void gr_bm_ubitblt00_rle(unsigned w, unsigned h, int dx, int dy, int sx, int sy, const grs_bitmap &src, grs_bitmap &dest);
 #if !DXX_USE_OGL
@@ -77,7 +77,9 @@ static void gr_for_each_bitmap_line(grs_canvas &canvas, const unsigned x, const 
 	}
 }
 
-#if defined(WIN32) && defined(__GNUC__) && (__GNUC__ >= 6 && __GNUC__ <= 7)
+static void gr_ubitmap00(grs_canvas &canvas, const unsigned x, const unsigned y, const grs_bitmap &bm)
+{
+#if defined(WIN32) && defined(__GNUC__) && (__GNUC__ >= 6 && __GNUC__ <= 10)
 /*
  * When using memcpy directly, i686-w64-mingw32-g++-6.3.0 fails to
  * deduce the template instantiation correctly, leading to a compiler
@@ -85,24 +87,20 @@ static void gr_for_each_bitmap_line(grs_canvas &canvas, const unsigned x, const 
  * work correctly.  For the affected cases, define a trivial wrapper,
  * which gcc deduces correctly.
  *
+ * This appears to be gcc bug #71740.
+ * <https://gcc.gnu.org/bugzilla/show_bug.cgi?id=71740>
+ *
  * Known affected:
  * - i686-w64-mingw32-g++-6.3.0
  * - i686-w64-mingw32-g++-7.3.0
+ * - i686-w64-mingw32-g++-10.2.0
  *
- * Restrict this workaround to known broken versions, since some
- * compiler versions may have a special case to treat a call to `memcpy`
- * differently from a call to a function that wraps `memcpy`.
+ * Restrict this workaround to known broken versions.
  */
-static void d_memcpy(void *const __restrict__ dest, const void *const __restrict__ src, std::size_t len)
-{
-	memcpy(dest, src, len);
-}
+	void *(__attribute__((__cdecl__)) *d_memcpy)(void*, const void*, size_t) = memcpy;
 #else
 #define d_memcpy memcpy
 #endif
-
-static void gr_ubitmap00(grs_canvas &canvas, const unsigned x, const unsigned y, const grs_bitmap &bm)
-{
 	gr_for_each_bitmap_line(canvas, x, y, bm, d_memcpy);
 }
 
@@ -126,7 +124,7 @@ static inline void gr_for_each_bitmap_byte(grs_canvas &canvas, const uint_fast32
 
 static void gr_ubitmap012(grs_canvas &canvas, const unsigned x, const unsigned y, const grs_bitmap &bm)
 {
-	const auto a = [](grs_canvas &cv, const uint8_t *const src, const uint_fast32_t px, const uint_fast32_t py) {
+	const auto a = [](grs_canvas &cv, const color_palette_index *const src, const uint_fast32_t px, const uint_fast32_t py) {
 		const auto color = *src;
 		gr_upixel(cv.cv_bitmap, px, py, color);
 	};
@@ -136,7 +134,7 @@ static void gr_ubitmap012(grs_canvas &canvas, const unsigned x, const unsigned y
 #if !DXX_USE_OGL
 static void gr_ubitmap012m(grs_canvas &canvas, const unsigned x, const unsigned y, const grs_bitmap &bm)
 {
-	const auto a = [](grs_canvas &cv, const uint8_t *const src, const uint_fast32_t px, const uint_fast32_t py) {
+	const auto a = [](grs_canvas &cv, const color_palette_index *const src, const uint_fast32_t px, const uint_fast32_t py) {
 		const uint8_t c = *src;
 		if (c != 255)
 		{
@@ -171,13 +169,16 @@ static void gr_ubitmapGENERICm(grs_canvas &canvas, const unsigned x, const unsig
 		range_for (const uint_fast32_t x1, xrange(bm_w))
 		{
 			const auto c = gr_gpixel(bm,x1,y1);
-			if ( c != 255 )	{
+			if (c != TRANSPARENCY_COLOR)
+			{
 				gr_upixel(canvas.cv_bitmap, x + x1, y + y1, c);
 			}
 		}
 	}
 }
 #endif
+
+}
 
 void gr_ubitmap(grs_canvas &canvas, grs_bitmap &bm)
 {
@@ -198,7 +199,7 @@ void gr_ubitmap(grs_canvas &canvas, grs_bitmap &bm)
 			return;
 #if DXX_USE_OGL
 		case bm_mode::ogl:
-			ogl_ubitmapm_cs(canvas, x, y, -1, -1, bm, ogl_colors::white, F1_0);
+			ogl_ubitmapm_cs(canvas, x, y, opengl_bitmap_use_dst_canvas, opengl_bitmap_use_dst_canvas, bm, ogl_colors::white);
 			return;
 #endif
 		default:
@@ -231,6 +232,8 @@ void gr_ubitmapm(grs_canvas &canvas, const unsigned x, const unsigned y, grs_bit
 		gr_ubitmapGENERICm(canvas, x, y, bm);
 	}
 }
+
+namespace {
 
 // From Linear to Linear
 static void gr_bm_ubitblt00(const unsigned w, const unsigned h, const unsigned dx, const unsigned dy, const unsigned sx, const unsigned sy, const grs_bitmap &src, grs_bitmap &dest)
@@ -266,6 +269,8 @@ static void gr_bm_ubitblt00m(const unsigned w, const uint_fast32_t h, const unsi
 			dbits += dest.bm_rowsize;
 		}
 	}
+}
+
 }
 
 void gr_bm_ubitblt(grs_canvas &canvas, const unsigned w, const unsigned h, const int dx, const int dy, const int sx, const int sy, const grs_bitmap &src)
@@ -304,7 +309,7 @@ void gr_bitmap(grs_canvas &canvas, const unsigned x, const unsigned y, grs_bitma
 		return;
 	// Draw bitmap bm[x,y] into (dx1,dy1)-(dx2,dy2)
 #if DXX_USE_OGL
-	ogl_ubitmapm_cs(canvas, x, y, 0, 0, bm, ogl_colors::white, F1_0);
+	ogl_ubitmapm_cs(canvas, x, y, opengl_bitmap_use_src_bitmap, opengl_bitmap_use_src_bitmap, bm, ogl_colors::white);
 #else
 	int sx = 0, sy = 0;
 	if ( dx1 < 0 )
@@ -406,11 +411,9 @@ void bm_rle_window::apply(const uint_fast32_t w, const uint_fast32_t h, const ui
 	// No interlacing, copy the whole buffer.
 	for (uint_fast32_t i = h; i; --i)
 	{
-		f(exchange(dbits, dbits + bm_rowsize), src_bits, sx, w);
+		f(std::exchange(dbits, dbits + bm_rowsize), src_bits, sx, w);
 		advance_src_bits();
 	}
-}
-
 }
 
 static void gr_bm_ubitblt00_rle(const unsigned w, const unsigned h, const int dx, const int dy, const int sx, const int sy, const grs_bitmap &src, grs_bitmap &dest)
@@ -455,7 +458,7 @@ static void scale_line(const uint8_t *in, uint8_t *out, const uint_fast32_t ilen
 			++i;
 		}
 		auto e = out + i;
-		std::fill(exchange(out, e), e, *in++);
+		std::fill(std::exchange(out, e), e, *in++);
 	}
 }
 
@@ -483,6 +486,8 @@ inside:
 	}
 }
 
+}
+
 void show_fullscr(grs_canvas &canvas, grs_bitmap &bm)
 {
 	auto &scr = canvas.cv_bitmap;
@@ -490,7 +495,7 @@ void show_fullscr(grs_canvas &canvas, grs_bitmap &bm)
 	if (bm.get_type() == bm_mode::linear && scr.get_type() == bm_mode::ogl &&
 		bm.bm_w <= grd_curscreen->get_screen_width() && bm.bm_h <= grd_curscreen->get_screen_height()) // only scale with OGL if bitmap is not bigger than screen size
 	{
-		ogl_ubitmapm_cs(canvas, 0, 0, -1, -1, bm, ogl_colors::white, F1_0);//use opengl to scale, faster and saves ram. -MPM
+		ogl_ubitmapm_cs(canvas, 0, 0, opengl_bitmap_use_dst_canvas, opengl_bitmap_use_dst_canvas, bm, ogl_colors::white);//use opengl to scale, faster and saves ram. -MPM
 		return;
 	}
 #endif
@@ -521,7 +526,7 @@ void gr_bitblt_find_transparent_area(const grs_bitmap &bm, unsigned &minx, unsig
 	maxy = 0;
 
 	unsigned i = 0, count = 0;
-	auto check = [&](unsigned x, unsigned y, ubyte c) {
+	auto check = [&](unsigned x, unsigned y, const color_palette_index c) {
 		if (c == TRANSPARENCY_COLOR) {				// don't look for transparancy color here.
 			count++;
 			minx = min(x, minx);
@@ -538,7 +543,7 @@ void gr_bitblt_find_transparent_area(const grs_bitmap &bm, unsigned &minx, unsig
 		bm_rle_expand expander(bm);
 		for (uint_fast32_t y = 0;; ++y)
 		{
-			array<uint8_t, 4096> buf;
+			std::array<uint8_t, 4096> buf;
 			if (expander.step(bm_rle_expand_range(buf)) != bm_rle_expand::again)
 				break;
 			range_for (const uint_fast32_t x, xrange(bm_w))

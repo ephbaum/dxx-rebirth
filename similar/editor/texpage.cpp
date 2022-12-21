@@ -30,7 +30,6 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 #include "inferno.h"
 #include "gameseg.h"
-#include "screens.h"			// For GAME_SCREEN?????
 #include "editor.h"			// For TMAP_CURBOX??????
 #include "gr.h"				// For canves, font stuff
 #include "ui.h"				// For UI_GADGET stuff
@@ -48,10 +47,10 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 constexpr std::integral_constant<unsigned, 12> TMAPS_PER_PAGE{};
 
-static array<std::unique_ptr<UI_GADGET_USERBOX>, TMAPS_PER_PAGE> TmapBox;
+static std::array<std::unique_ptr<UI_GADGET_USERBOX>, TMAPS_PER_PAGE> TmapBox;
 static std::unique_ptr<UI_GADGET_USERBOX> TmapCurrent;
 
-int CurrentTexture = 0;		// Used globally
+texture_index CurrentTexture;		// Used globally
 
 #if defined(DXX_BUILD_DESCENT_I)
 #define DXX_TEXTURE_INITIALIZER(D1, D2)	D1
@@ -107,9 +106,11 @@ static void texpage_show_current()
 {
 	auto &TmapInfo = LevelUniqueTmapInfoState.TmapInfo;
 	gr_set_current_canvas(TmapCurrent->canvas);
-	PIGGY_PAGE_IN(Textures[CurrentTexture]);
-	gr_ubitmap(*grd_curcanv, GameBitmaps[Textures[CurrentTexture].index]);
-	texpage_print_name( TmapInfo[CurrentTexture].filename );
+	const auto ct = CurrentTexture;
+	auto &t = Textures[ct];
+	PIGGY_PAGE_IN(t);
+	gr_ubitmap(*grd_curcanv, GameBitmaps[t.index]);
+	texpage_print_name(TmapInfo[ct].filename);
 }
 
 int texpage_goto_first()
@@ -165,11 +166,9 @@ static int texpage_goto_next()
 //NOTE:  this code takes the texture map number, not this index in the
 //list of available textures.  There are different if there are holes in
 //the list
-int texpage_grab_current(int n)
+int texpage_grab_current(texture1_value n)
 {
-	if ((n < 0) || (n >= NumTextures)) return 0;
-
-	CurrentTexture = n;
+	CurrentTexture = get_texture_index(n);
 
 	TexturePage = CurrentTexture / TMAPS_PER_PAGE;
 	
@@ -187,18 +186,18 @@ int texpage_grab_current(int n)
 void texpage_init( UI_DIALOG * dlg )
 {
 	auto &t = texpage_dialog;
-	t.prev_texture = ui_add_gadget_button( dlg, TMAPCURBOX_X + 00, TMAPCURBOX_Y - 24, 30, 20, "<<", texpage_goto_prev );
-	t.next_texture = ui_add_gadget_button( dlg, TMAPCURBOX_X + 32, TMAPCURBOX_Y - 24, 30, 20, ">>", texpage_goto_next );
+	t.prev_texture = ui_add_gadget_button(*dlg, TMAPCURBOX_X + 00, TMAPCURBOX_Y - 24, 30, 20, "<<", texpage_goto_prev);
+	t.next_texture = ui_add_gadget_button(*dlg, TMAPCURBOX_X + 32, TMAPCURBOX_Y - 24, 30, 20, ">>", texpage_goto_next);
 
-	t.first_texture = ui_add_gadget_button( dlg, TMAPCURBOX_X + 00, TMAPCURBOX_Y - 48, 15, 20, "T", texpage_goto_first );
-	t.metal_texture = ui_add_gadget_button( dlg, TMAPCURBOX_X + 17, TMAPCURBOX_Y - 48, 15, 20, "M", texpage_goto_metals );
-	t.light_texture = ui_add_gadget_button( dlg, TMAPCURBOX_X + 34, TMAPCURBOX_Y - 48, 15, 20, "L", texpage_goto_lights );
-	t.effects_texture = ui_add_gadget_button( dlg, TMAPCURBOX_X + 51, TMAPCURBOX_Y - 48, 15, 20, "E", texpage_goto_effects );
+	t.first_texture = ui_add_gadget_button(*dlg, TMAPCURBOX_X + 00, TMAPCURBOX_Y - 48, 15, 20, "T", texpage_goto_first);
+	t.metal_texture = ui_add_gadget_button(*dlg, TMAPCURBOX_X + 17, TMAPCURBOX_Y - 48, 15, 20, "M", texpage_goto_metals);
+	t.light_texture = ui_add_gadget_button(*dlg, TMAPCURBOX_X + 34, TMAPCURBOX_Y - 48, 15, 20, "L", texpage_goto_lights);
+	t.effects_texture = ui_add_gadget_button(*dlg, TMAPCURBOX_X + 51, TMAPCURBOX_Y - 48, 15, 20, "E", texpage_goto_effects);
 
 	for (int i=0;i<TMAPS_PER_PAGE;i++)
-		TmapBox[i] = ui_add_gadget_userbox( dlg, TMAPBOX_X + (i/3)*(2+TMAPBOX_W), TMAPBOX_Y + (i%3)*(2+TMAPBOX_H), TMAPBOX_W, TMAPBOX_H);
+		TmapBox[i] = ui_add_gadget_userbox(*dlg, TMAPBOX_X + (i / 3) * (2 + TMAPBOX_W), TMAPBOX_Y + (i % 3) * (2 + TMAPBOX_H), TMAPBOX_W, TMAPBOX_H);
 
-	TmapCurrent = ui_add_gadget_userbox( dlg, TMAPCURBOX_X, TMAPCURBOX_Y, 64, 64 );
+	TmapCurrent = ui_add_gadget_userbox(*dlg, TMAPCURBOX_X, TMAPCURBOX_Y, 64, 64);
 
 	TmapnameCanvas = gr_create_sub_canvas(grd_curscreen->sc_canvas, TMAPCURBOX_X , TMAPCURBOX_Y + TMAPBOX_H + 10, 100, 20);
 }
@@ -213,20 +212,25 @@ void texpage_close()
 
 #define	MAX_REPLACEMENTS	32
 
+namespace {
+
 struct replacement
 {
-	int	n, old;
+	texture_index n;
+	texture_index old;
 };
 
 int	Num_replacements=0;
-static array<replacement, MAX_REPLACEMENTS> Replacement_list;
+static std::array<replacement, MAX_REPLACEMENTS> Replacement_list;
+
+}
 
 int texpage_do(const d_event &event)
 {
 	if (event.type == EVENT_UI_DIALOG_DRAW)
 	{
 		gr_set_current_canvas( TmapnameCanvas );
-		gr_set_curfont(*grd_curcanv, ui_small_font.get());
+		gr_set_curfont(*grd_curcanv, *ui_small_font.get());
 		gr_set_fontcolor(*grd_curcanv, CBLACK, CWHITE);
 		
 		texpage_redraw();
@@ -270,26 +274,23 @@ void do_replacements(void)
 	med_compress_mine();
 
 	for (int replnum=0; replnum<Num_replacements; replnum++) {
-		int	old_tmap_num, new_tmap_num;
-
-		old_tmap_num = Replacement_list[replnum].old;
-		new_tmap_num = Replacement_list[replnum].n;
-		Assert(old_tmap_num >= 0);
-		Assert(new_tmap_num >= 0);
+		const auto old_tmap_num = Replacement_list[replnum].old;
+		const auto new_tmap_num = Replacement_list[replnum].n;
 
 		range_for (unique_segment &segp, vmsegptr)
 		{
 			range_for (auto &sidep, segp.sides)
 			{
-				if (sidep.tmap_num == old_tmap_num) {
-					sidep.tmap_num = new_tmap_num;
+				if (get_texture_index(sidep.tmap_num) == old_tmap_num) {
+					sidep.tmap_num = build_texture1_value(new_tmap_num);
 				}
-				if ((sidep.tmap_num2 != 0) && ((sidep.tmap_num2 & 0x3fff) == old_tmap_num)) {
+				if (sidep.tmap_num2 != texture2_value::None && get_texture_index(sidep.tmap_num2) == old_tmap_num)
+				{
 					if (new_tmap_num == 0) {
 						Int3();	//	Error.  You have tried to replace a tmap_num2 with 
 									//	the 0th tmap_num2 which is ILLEGAL!
 					} else {
-						sidep.tmap_num2 = new_tmap_num | (sidep.tmap_num2 & 0xc000);
+						sidep.tmap_num2 = build_texture2_value(new_tmap_num, get_texture_rotation_high(sidep.tmap_num2));
 					}
 				}
 			}
@@ -300,34 +301,34 @@ void do_replacements(void)
 
 void do_replacements_all(void)
 {
-	for (int i = 0; i < Last_level; i++)
+	for (int i = 0; i < Current_mission->last_level; ++i)
 	{
 		load_level(
 #if defined(DXX_BUILD_DESCENT_II)
 			LevelSharedSegmentState.DestructibleLights,
 #endif
-			Level_names[i]);
+			Current_mission->level_names[i]);
 		do_replacements();
 		save_level(
 #if defined(DXX_BUILD_DESCENT_II)
 			LevelSharedSegmentState.DestructibleLights,
 #endif
-			Level_names[i]);
+			Current_mission->level_names[i]);
 	}
 
-	for (int i = 0; i < -Last_secret_level; i++)
+	for (int i = 0; i < -Current_mission->last_secret_level; ++i)
 	{
 		load_level(
 #if defined(DXX_BUILD_DESCENT_II)
 			LevelSharedSegmentState.DestructibleLights,
 #endif
-			Secret_level_names[i]);
+			Current_mission->secret_level_names[i]);
 		do_replacements();
 		save_level(
 #if defined(DXX_BUILD_DESCENT_II)
 			LevelSharedSegmentState.DestructibleLights,
 #endif
-			Secret_level_names[i]);
+			Current_mission->secret_level_names[i]);
 	}
 
 }

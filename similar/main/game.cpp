@@ -47,19 +47,15 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "key.h"
 #include "config.h"
 #include "object.h"
-#include "physics.h"
 #include "dxxerror.h"
 #include "joy.h"
-#include "iff.h"
 #include "pcx.h"
 #include "timer.h"
 #include "render.h"
 #include "laser.h"
 #include "screens.h"
 #include "textures.h"
-#include "slew.h"
 #include "gauges.h"
-#include "texmap.h"
 #include "3d.h"
 #include "effects.h"
 #include "menu.h"
@@ -91,15 +87,12 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "switch.h"
 #include "controls.h"
 #include "songs.h"
-#include "rbaudio.h"
 
 #include "multi.h"
 #include "cntrlcen.h"
 #include "pcx.h"
 #include "state.h"
 #include "piggy.h"
-#include "multibot.h"
-#include "fvi.h"
 #include "ai.h"
 #include "robot.h"
 #include "playsave.h"
@@ -119,37 +112,64 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #endif
 
 #include "d_enumerate.h"
+#include "d_levelstate.h"
 #include "d_range.h"
 #include "compiler-range_for.h"
 #include "partial_range.h"
 #include "segiter.h"
 
-static fix64 last_timer_value=0;
-static fix64 sync_timer_value=0;
-fix ThisLevelTime=0;
-
-grs_canvas	Screen_3d_window;							// The rectangle for rendering the mine to
+d_time_fix ThisLevelTime;
 
 namespace dcx {
+namespace {
+static fix64 last_timer_value;
+static fix64 sync_timer_value;
+}
+grs_subcanvas Screen_3d_window;							// The rectangle for rendering the mine to
 int	force_cockpit_redraw=0;
 int	PaletteRedAdd, PaletteGreenAdd, PaletteBlueAdd;
 
 int	Game_suspended=0; //if non-zero, nothing moves but player
-int	Game_mode = GM_GAME_OVER;
+game_mode_flags Game_mode;
 int	Global_missile_firing_count = 0;
+
+std::optional<Difficulty_level_type> build_difficulty_level_from_untrusted(const int8_t untrusted)
+{
+	switch (untrusted)
+	{
+		case static_cast<int8_t>(Difficulty_level_type::_0):
+		case static_cast<int8_t>(Difficulty_level_type::_1):
+		case static_cast<int8_t>(Difficulty_level_type::_2):
+		case static_cast<int8_t>(Difficulty_level_type::_3):
+		case static_cast<int8_t>(Difficulty_level_type::_4):
+			return Difficulty_level_type{untrusted};
+		default:
+			return std::nullopt;
+	}
+}
+
 }
 
 //	Function prototypes for GAME.C exclusively.
 
 namespace dsx {
-static window_event_result GameProcessFrame(void);
-static bool FireLaser(player_info &);
+
+game_window *Game_wind;
+
+namespace {
+
+static window_event_result GameProcessFrame(const d_level_shared_robot_info_state &);
+static bool FireLaser(player_info &, const control_info &Controls);
 static void powerup_grab_cheat_all();
+
+}
 
 #if defined(DXX_BUILD_DESCENT_II)
 d_flickering_light_state Flickering_light_state;
+namespace {
 static void slide_textures(void);
 static void flicker_lights(const d_level_shared_destructible_light_state &LevelSharedDestructibleLightState, d_flickering_light_state &fls, fvmsegptridx &vmsegptridx);
+}
 #endif
 
 // Cheats
@@ -177,11 +197,54 @@ void reset_palette_add()
 	PaletteBlueAdd		= 0;
 }
 
-screen_mode Game_screen_mode{640, 480};
+constexpr screen_mode initial_large_game_screen_mode{1024, 768};
+screen_mode Game_screen_mode = initial_large_game_screen_mode;
+
+#if DXX_USE_STEREOSCOPIC_RENDER
+StereoFormat VR_stereo;
+fix  VR_eye_width = F1_0;
+int  VR_eye_offset = 0;
+int  VR_sync_width = 20;
+grs_subcanvas VR_hud_left;
+grs_subcanvas VR_hud_right;
+#endif
 
 }
 
 namespace dsx {
+
+#if DXX_USE_STEREOSCOPIC_RENDER
+void init_stereo()
+{
+#if DXX_USE_OGL
+	// init stereo options
+	if (CGameArg.OglStereo || CGameArg.OglStereoView) {
+		if (VR_stereo == StereoFormat::None && !VR_eye_offset)
+			VR_stereo = (CGameArg.OglStereoView) ? static_cast<StereoFormat>(CGameArg.OglStereoView % (static_cast<unsigned>(StereoFormat::HighestFormat) + 1)) : StereoFormat::AboveBelow;
+		constexpr int half_width_eye_offset = -6;
+		constexpr int full_width_eye_offset = -12;
+		switch (VR_stereo)
+		{
+			case StereoFormat::None:
+			case StereoFormat::AboveBelow:
+			case StereoFormat::AboveBelowSync:
+				VR_eye_offset = full_width_eye_offset;
+				break;
+			case StereoFormat::SideBySideFullHeight:
+			case StereoFormat::SideBySideHalfHeight:
+				VR_eye_offset = half_width_eye_offset;
+				break;
+		}
+		VR_eye_width = (F1_0 * 7) / 10;	// Descent 1.5 defaults
+		VR_sync_width = (20 * SHEIGHT) / 480;
+		PlayerCfg.CockpitMode[1] = cockpit_mode_t::full_screen;
+	}
+	else {
+		VR_stereo = StereoFormat::None;
+	}
+#endif
+}
+#endif
 
 //initialize the various canvases on the game screen
 //called every time the screen mode or cockpit changes
@@ -193,54 +256,90 @@ void init_cockpit()
 		return;
 
 	if ( Screen_mode == SCREEN_EDITOR )
-		PlayerCfg.CockpitMode[1] = CM_FULL_SCREEN;
+		PlayerCfg.CockpitMode[1] = cockpit_mode_t::full_screen;
 
 #if !DXX_USE_OGL
-	if (PlayerCfg.CockpitMode[1] != CM_LETTERBOX)
+	if (PlayerCfg.CockpitMode[1] != cockpit_mode_t::letterbox)
 	{
 #if defined(DXX_BUILD_DESCENT_II)
 		int HiresGFXAvailable = !GameArg.GfxSkipHiresGFX;
 #endif
-		auto full_screen_mode = HiresGFXAvailable ? screen_mode{640, 480} : screen_mode{320, 200};
+		const auto full_screen_mode = HiresGFXAvailable
+			? screen_mode /* large_game_screen_mode */{640, 480}
+			: screen_mode /* small_game_screen_mode */{320, 200};
 		if (Game_screen_mode != full_screen_mode) {
-			PlayerCfg.CockpitMode[1] = CM_FULL_SCREEN;
+			PlayerCfg.CockpitMode[1] = cockpit_mode_t::full_screen;
 		}
 	}
 #endif
 
 	gr_set_default_canvas();
+	auto &canvas = *grd_curcanv;
 
 	switch( PlayerCfg.CockpitMode[1] ) {
-		case CM_FULL_COCKPIT:
-			game_init_render_sub_buffers(0, 0, SWIDTH, (SHEIGHT*2)/3);
+		case cockpit_mode_t::full_cockpit:
+			game_init_render_sub_buffers(canvas, 0, 0, SWIDTH, (SHEIGHT*2)/3);
 			break;
 
-		case CM_REAR_VIEW:
+		case cockpit_mode_t::rear_view:
 		{
 			unsigned x1 = 0, y1 = 0, x2 = SWIDTH, y2 = (SHEIGHT*2)/3;
-			int mode = PlayerCfg.CockpitMode[1];
+			const auto mode =
 #if defined(DXX_BUILD_DESCENT_II)
-			mode += (HIRESMODE?(Num_cockpits/2):0);
+				HIRESMODE
+				? static_cast<cockpit_mode_t>(static_cast<uint8_t>(cockpit_mode_t::rear_view) + (Num_cockpits / 2))
+				:
 #endif
+				cockpit_mode_t::rear_view;
 
-			PIGGY_PAGE_IN(cockpit_bitmap[mode]);
-			auto &bm = GameBitmaps[cockpit_bitmap[mode].index];
+			auto &cb = cockpit_bitmap[mode];
+			PIGGY_PAGE_IN(cb);
+			auto &bm = GameBitmaps[cb.index];
 			gr_bitblt_find_transparent_area(bm, x1, y1, x2, y2);
-			game_init_render_sub_buffers(x1*(static_cast<float>(SWIDTH)/bm.bm_w), y1*(static_cast<float>(SHEIGHT)/bm.bm_h), (x2-x1+1)*(static_cast<float>(SWIDTH)/bm.bm_w), (y2-y1+2)*(static_cast<float>(SHEIGHT)/bm.bm_h));
+			game_init_render_sub_buffers(canvas, x1 * (static_cast<float>(SWIDTH) / bm.bm_w), y1 * (static_cast<float>(SHEIGHT) / bm.bm_h), (x2 - x1 + 1) * (static_cast<float>(SWIDTH) / bm.bm_w), (y2 - y1 + 2) * (static_cast<float>(SHEIGHT) / bm.bm_h));
 			break;
 		}
 
-		case CM_FULL_SCREEN:
-			game_init_render_sub_buffers(0, 0, SWIDTH, SHEIGHT);
+		case cockpit_mode_t::full_screen:
+			{
+				unsigned w = SWIDTH;
+				unsigned h = SHEIGHT;
+#if DXX_USE_STEREOSCOPIC_RENDER
+				switch (VR_stereo)
+				{
+					case StereoFormat::None:
+						/* Preserve width */
+						/* Preserve height */
+						break;
+					case StereoFormat::AboveBelow:
+					case StereoFormat::AboveBelowSync:
+						/* Preserve width */
+						/* Change height */
+						h /= 2;
+						break;
+					case StereoFormat::SideBySideHalfHeight:
+						/* Change width */
+						/* Change height */
+						h /= 2;
+						[[fallthrough]];
+					case StereoFormat::SideBySideFullHeight:
+						/* Change width */
+						/* Preserve height */
+						w /= 2;
+						break;
+				}
+#endif
+				game_init_render_sub_buffers(canvas, 0, 0, w, h);
+			}
 			break;
 
-		case CM_STATUS_BAR:
-			game_init_render_sub_buffers( 0, 0, SWIDTH, (HIRESMODE?(SHEIGHT*2)/2.6:(SHEIGHT*2)/2.72) );
+		case cockpit_mode_t::status_bar:
+			game_init_render_sub_buffers(canvas, 0, 0, SWIDTH, (HIRESMODE?(SHEIGHT*2)/2.6:(SHEIGHT*2)/2.72));
 			break;
 
-		case CM_LETTERBOX:	{
-			const unsigned gsm_height = SM_H(Game_screen_mode);
-			const unsigned w = SM_W(Game_screen_mode);
+		case cockpit_mode_t::letterbox:	{
+			const unsigned gsm_height = grd_curscreen->get_screen_height();
+			const unsigned w = grd_curscreen->get_screen_width();
 			const unsigned h = (gsm_height * 3) / 4; // true letterbox size (16:9)
 			const unsigned x = 0;
 			const unsigned y = (gsm_height - h) / 2;
@@ -250,7 +349,7 @@ void init_cockpit()
 			gr_rect(canvas, x, 0, w, gsm_height - h, color);
 			gr_rect(canvas, x, gsm_height - h, w, gsm_height, color);
 
-			game_init_render_sub_buffers( x, y, w, h );
+			game_init_render_sub_buffers(canvas, x, y, w, h);
 			break;
 		}
 	}
@@ -261,8 +360,14 @@ void init_cockpit()
 }
 
 //selects a given cockpit (or lack of one).  See types in game.h
-void select_cockpit(cockpit_mode_t mode)
+void select_cockpit(const cockpit_mode_t mode)
 {
+#if DXX_USE_STEREOSCOPIC_RENDER
+	// skip switching cockpit views while stereo viewport active
+	if (VR_stereo != StereoFormat::None && mode != cockpit_mode_t::full_screen)
+		return;
+#endif
+
 	if (mode != PlayerCfg.CockpitMode[1]) {		//new mode
 		PlayerCfg.CockpitMode[1]=mode;
 		init_cockpit();
@@ -275,13 +380,65 @@ namespace dcx {
 void reset_cockpit()
 {
 	force_cockpit_redraw=1;
-	last_drawn_cockpit = -1;
+	last_drawn_cockpit = cockpit_mode_t{UINT8_MAX};
 }
 
-void game_init_render_sub_buffers( int x, int y, int w, int h )
+void game_init_render_sub_buffers(grs_canvas &canvas, const int x, const int y, const int w, const int h)
 {
-	gr_clear_canvas(*grd_curcanv, 0);
-	gr_init_sub_canvas(Screen_3d_window, grd_curscreen->sc_canvas, x, y, w, h);
+	gr_clear_canvas(canvas, 0);
+	gr_init_sub_canvas(Screen_3d_window, canvas, x, y, w, h);
+
+#if DXX_USE_STEREOSCOPIC_RENDER
+	if (VR_stereo != StereoFormat::None)
+	{
+		// offset HUD screen rects to force out-of-screen parallax on HUD overlays
+		const int dx = (VR_eye_offset < 0) ? -VR_eye_offset : 0;
+		const int dy = VR_sync_width / 2;
+		struct {
+			uint16_t x;
+			uint16_t y;
+			uint16_t w;
+			uint16_t h;
+		} l, r;
+		switch (VR_stereo) {
+			case StereoFormat::None:
+			default:
+				return;
+			case StereoFormat::AboveBelow:
+				l.x = x + dx;
+				l.y = y;
+				l.w = r.w = w - dx;
+				l.h = r.h = h;
+				r.x = x;
+				r.y = y + h;
+				break;
+			case StereoFormat::AboveBelowSync:
+				l.x = x + dx;
+				l.y = y;
+				l.w = r.w = w - dx;
+				l.h = r.h = h - dy;
+				r.x = x;
+				r.y = y + h + dy;
+				break;
+			case StereoFormat::SideBySideFullHeight:
+				l.x = x + dx;
+				l.y = r.y = y;
+				l.w = r.w = w - dx;
+				l.h = r.h = h;
+				r.x = x + w;
+				break;
+			case StereoFormat::SideBySideHalfHeight:
+				l.x = x + dx;
+				l.y = r.y = y + (h / 2);
+				l.w = r.w = w - dx;
+				l.h = r.h = h;
+				r.x = x + w;
+				break;
+		}
+		gr_init_sub_canvas(VR_hud_left,  grd_curscreen->sc_canvas, l.x, l.y, l.w, l.h);
+		gr_init_sub_canvas(VR_hud_right, grd_curscreen->sc_canvas, r.x, r.y, r.w, r.h);
+	}
+#endif
 }
 
 }
@@ -371,9 +528,9 @@ public:
 	void decrease_pause_count();
 };
 
-}
-
 static game_world_time_paused time_paused;
+
+}
 
 void game_world_time_paused::increase_pause_count()
 {
@@ -417,6 +574,8 @@ pause_game_world_time::~pause_game_world_time()
 	start_time();
 }
 
+namespace {
+
 static void game_flush_common_inputs()
 {
 	event_flush();
@@ -427,22 +586,24 @@ static void game_flush_common_inputs()
 
 }
 
+}
+
 namespace dsx {
 
-void game_flush_inputs()
+void game_flush_inputs(control_info &Controls)
 {
 	Controls = {};
 	game_flush_common_inputs();
 }
 
-}
-
-namespace dcx {
-
-void game_flush_respawn_inputs()
+void game_flush_respawn_inputs(control_info &Controls)
 {
 	static_cast<control_info::fire_controls_t &>(Controls.state) = {};
 }
+
+}
+
+namespace dcx {
 
 /*
  * timer that every sets d_tick_step true and increments d_tick_count every 1000/DESIGNATED_GAME_FPS ms.
@@ -514,13 +675,14 @@ void calc_frame_time()
 namespace dsx {
 
 #if DXX_USE_EDITOR
-void move_player_2_segment(const vmsegptridx_t seg, const unsigned side)
+void move_player_2_segment(const vmsegptridx_t seg, const sidenum_t side)
 {
+	auto &LevelSharedVertexState = LevelSharedSegmentState.get_vertex_state();
 	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vmobjptr = Objects.vmptr;
 	auto &vmobjptridx = Objects.vmptridx;
 	const auto &&console = vmobjptridx(ConsoleObject);
-	auto &Vertices = LevelSharedVertexState.get_vertices();
 	auto &vcvertptr = Vertices.vcptr;
 	compute_segment_center(vcvertptr, console->pos, seg);
 	auto vp = compute_center_point_on_side(vcvertptr, seg, side);
@@ -553,7 +715,7 @@ struct RAIIpng_struct
 
 struct d_screenshot : RAIIpng_struct
 {
-	DXX_INHERIT_CONSTRUCTORS(d_screenshot,RAIIpng_struct);
+	using RAIIpng_struct::RAIIpng_struct;
 	/* error handling callbacks */
 	[[noreturn]]
 	static void png_error_cb(png_struct *png, const char *str);
@@ -615,7 +777,7 @@ void record_screenshot_time(const struct tm &tm, png_struct *const png_ptr, png_
 #ifdef PNG_TEXT_SUPPORTED
 void record_screenshot_text_metadata(png_struct *const png_ptr, png_info *const info_ptr)
 {
-	array<png_text, 6> text_fields{};
+	std::array<png_text, 6> text_fields{};
 	char descent_version[80];
 	char descent_build_datetime[21];
 	std::string current_mission_path;
@@ -731,7 +893,7 @@ unsigned write_screenshot_png(PHYSFS_File *const file, const struct tm *const tm
 		record_screenshot_text_metadata(ss.png_ptr, ss.info_ptr);
 #endif
 		png_write_info(ss.png_ptr, ss.info_ptr);
-		array<png_byte *, 1024> row_pointers;
+		std::array<png_byte *, 1024> row_pointers;
 		const auto rpb = row_pointers.begin();
 		auto o = rpb;
 		const auto end_byte_buffer = begin_byte_buffer + bufsize;
@@ -848,8 +1010,7 @@ void save_screen_shot(int automap_flag)
 #undef DXX_SCREENSHOT_TIME_FORMAT_STRING
 #undef DXX_SCREENSHOT_FILE_EXTENSION
 	}
-	unsigned write_error;
-	if (const auto file = PHYSFSX_openWriteBuffered(savename))
+	if (const auto &&[file, physfserr] = PHYSFSX_openWriteBuffered(savename); file)
 	{
 	if (!automap_flag)
 		HUD_init_message(HM_DEFAULT, "%s '%s'", TXT_DUMPING_SCREEN, &savename[sizeof(SCRNS_DIR) - 1]);
@@ -859,11 +1020,11 @@ void save_screen_shot(int automap_flag)
 	glReadBuffer(GL_FRONT);
 #endif
 #if DXX_USE_SCREENSHOT_FORMAT_PNG
-	write_error = write_screenshot_png(file, tm, grd_curscreen->sc_canvas.cv_bitmap, void /* unused */);
+	auto write_error = write_screenshot_png(file, tm, grd_curscreen->sc_canvas.cv_bitmap, void /* unused */);
 #elif DXX_USE_SCREENSHOT_FORMAT_LEGACY
 	write_bmp(file, grd_curscreen->get_screen_width(), grd_curscreen->get_screen_height());
 	/* write_bmp never fails */
-	write_error = 0;
+	std::false_type write_error;
 #endif
 #else
 	grs_canvas &screen_canv = grd_curscreen->sc_canvas;
@@ -881,30 +1042,31 @@ void save_screen_shot(int automap_flag)
 		i.b <<= 2;
 	}
 #if DXX_USE_SCREENSHOT_FORMAT_PNG
-	write_error = write_screenshot_png(file, tm, grd_curscreen->sc_canvas.cv_bitmap, pal);
+	auto write_error = write_screenshot_png(file, tm, grd_curscreen->sc_canvas.cv_bitmap, pal);
 #elif DXX_USE_SCREENSHOT_FORMAT_LEGACY
-	write_error = pcx_write_bitmap(file, &temp_canv->cv_bitmap, pal);
+	auto write_error = pcx_write_bitmap(file, &temp_canv->cv_bitmap, pal);
 #endif
 #endif
+	if (write_error)
+		PHYSFS_delete(savename);
 	}
 	else
 	{
+		const auto e = PHYSFS_getErrorByCode(physfserr);
 		if (!automap_flag)
-			HUD_init_message(HM_DEFAULT, "Failed to open screenshot file for writing: %s", &savename[sizeof(SCRNS_DIR) - 1]);
+			HUD_init_message(HM_DEFAULT, "Failed to open screenshot file for writing: %s: %s", &savename[sizeof(SCRNS_DIR) - 1], e);
 		else
-			con_printf(CON_URGENT, "Failed to open screenshot file for writing: %s", savename);
+			con_printf(CON_URGENT, "Failed to open screenshot file for writing: %s: %s", savename, e);
 		return;
 	}
-	if (write_error)
-		PHYSFS_delete(savename);
 }
 #endif
 
 //initialize flying
 void fly_init(object_base &obj)
 {
-	obj.control_type = CT_FLYING;
-	obj.movement_type = MT_PHYSICS;
+	obj.control_source = object::control_type::flying;
+	obj.movement_source = object::movement_type::physics;
 
 	obj.mtype.phys_info.velocity = {};
 	obj.mtype.phys_info.thrust = {};
@@ -916,14 +1078,16 @@ void fly_init(object_base &obj)
 
 namespace dsx {
 
+namespace {
+
 //	------------------------------------------------------------------------------------
-static void do_cloak_stuff(void)
+static void do_cloak_stuff()
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vmobjptr = Objects.vmptr;
-	range_for (auto &&e, enumerate(partial_range(Players, N_players)))
+	for (auto &&[i, value] : enumerate(partial_range(Players, N_players)))
 	{
-		auto &plobj = *vmobjptr(e.value.objnum);
+		auto &plobj = *vmobjptr(value.objnum);
 		auto &player_info = plobj.ctype.player_info;
 		auto &pl_flags = player_info.powerup_flags;
 		if (pl_flags & PLAYER_FLAGS_CLOAKED)
@@ -931,7 +1095,6 @@ static void do_cloak_stuff(void)
 			if (GameTime64 > player_info.cloak_time+CLOAK_TIME_MAX)
 			{
 				pl_flags &= ~PLAYER_FLAGS_CLOAKED;
-				auto &i = e.idx;
 				if (i == Player_num) {
 					multi_digi_play_sample(SOUND_CLOAK_OFF, F1_0);
 					maybe_drop_net_powerup(POW_CLOAK, 1, 0);
@@ -966,17 +1129,21 @@ static void do_invulnerable_stuff(player_info &player_info)
 	}
 }
 
+}
+
 #if defined(DXX_BUILD_DESCENT_I)
 static inline void do_afterburner_stuff(object_array &)
 {
 }
 #elif defined(DXX_BUILD_DESCENT_II)
 ubyte	Last_afterburner_state = 0;
-static fix Last_afterburner_charge;
 fix64	Time_flash_last_played;
 
 #define AFTERBURNER_LOOP_START	((GameArg.SndDigiSampleRate==SAMPLE_RATE_22K)?32027:(32027/2))		//20098
 #define AFTERBURNER_LOOP_END		((GameArg.SndDigiSampleRate==SAMPLE_RATE_22K)?48452:(48452/2))		//25776
+
+namespace {
+static fix Last_afterburner_charge;
 
 static void do_afterburner_stuff(object_array &Objects)
 {
@@ -1025,6 +1192,8 @@ static void do_afterburner_stuff(object_array &Objects)
 	Last_afterburner_state = Controls.state.afterburner;
 	Last_afterburner_charge = Afterburner_charge;
 }
+
+}
 #endif
 
 //	Amount to diminish guns towards normal, per second.
@@ -1067,6 +1236,8 @@ void PALETTE_FLASH_ADD(int _dr, int _dg, int _db)
 
 }
 
+namespace {
+
 static void diminish_palette_color_toward_zero(int& palette_color_add, const int& dec_amount)
 {
 	if (palette_color_add > 0 ) {
@@ -1082,7 +1253,11 @@ static void diminish_palette_color_toward_zero(int& palette_color_add, const int
 	}
 }
 
+}
+
 namespace dsx {
+
+namespace {
 
 //	------------------------------------------------------------------------------------
 //	Diminish palette effects towards normal.
@@ -1156,6 +1331,8 @@ static void diminish_palette_towards_normal(void)
 
 }
 
+}
+
 namespace {
 
 int	Redsave, Bluesave, Greensave;
@@ -1201,23 +1378,6 @@ bool allowed_to_fire_laser(const player_info &player_info)
 	return 1;
 }
 
-int allowed_to_fire_flare(player_info &player_info)
-{
-	auto &Next_flare_fire_time = player_info.Next_flare_fire_time;
-	if (Next_flare_fire_time > GameTime64)
-		return 0;
-
-#if defined(DXX_BUILD_DESCENT_II)
-	if (player_info.energy < Weapon_info[weapon_id_type::FLARE_ID].energy_usage)
-#define	FLARE_BIG_DELAY	(F1_0*2)
-		Next_flare_fire_time = GameTime64 + FLARE_BIG_DELAY;
-	else
-#endif
-		Next_flare_fire_time = GameTime64 + F1_0/4;
-
-	return 1;
-}
-
 int allowed_to_fire_missile(const player_info &player_info)
 {
 	auto &Next_missile_fire_time = player_info.Next_missile_fire_time;
@@ -1226,7 +1386,6 @@ int allowed_to_fire_missile(const player_info &player_info)
 		return 0;
 
 	return 1;
-}
 }
 
 #if defined(DXX_BUILD_DESCENT_II)
@@ -1238,20 +1397,13 @@ void full_palette_save(void)
 }
 #endif
 
+namespace {
+
 #if DXX_USE_SDLMIXER
 #define EXT_MUSIC_TEXT "Jukebox/Audio CD"
 #else
 #define EXT_MUSIC_TEXT "Audio CD"
 #endif
-
-static int free_help(newmenu *, const d_event &event, newmenu_item *items)
-{
-	if (event.type == EVENT_WINDOW_CLOSE)
-	{
-		std::default_delete<newmenu_item[]>()(items);
-	}
-	return 0;
-}
 
 #if (defined(__APPLE__) || defined(macintosh))
 #define _DXX_HELP_MENU_SAVE_LOAD(VERB)	\
@@ -1307,12 +1459,12 @@ static int free_help(newmenu *, const d_event &event, newmenu_item *items)
 	DXX_MENUITEM(VERB, TEXT, "Alt-Shift-F4\t  Rename GuideBot", HELP_ASF4)	\
 	DXX_MENUITEM(VERB, TEXT, "Shift-F5/F6\t  Drop primary/secondary", HELP_SF5_6)	\
 	DXX_MENUITEM(VERB, TEXT, "Shift-number\t  GuideBot commands", HELP_GUIDEBOT_COMMANDS)
-#define _DXX_NETHELP_DROPFLAG(VERB)	\
+#define DSX_NETHELP_DROPFLAG(VERB)	\
 	DXX_MENUITEM(VERB, TEXT, "ALT-0\t  DROP FLAG", NETHELP_DROPFLAG)
 #else
 #define _DXX_HELP_MENU_D2_DXX_F4(VERB)
 #define _DXX_HELP_MENU_D2_DXX_FEATURES(VERB)
-#define _DXX_NETHELP_DROPFLAG(VERB)
+#define DSX_NETHELP_DROPFLAG(VERB)
 #endif
 
 #define DXX_HELP_MENU(VERB)	\
@@ -1333,23 +1485,37 @@ static int free_help(newmenu *, const d_event &event, newmenu_item *items)
 	_DXX_HELP_MENU_AUDIO(VERB)	\
 	_DXX_HELP_MENU_HINT_CMD_KEY(VERB, HELP)	\
 
-enum {
-	DXX_HELP_MENU(ENUM)
-};
+}
 
 void show_help()
 {
-	const unsigned nitems = DXX_HELP_MENU(COUNT);
-	auto m = new newmenu_item[nitems];
-	DXX_HELP_MENU(ADD);
-	newmenu_dotiny(NULL, TXT_KEYS, nitems, m, 0, free_help, m);
+	struct help_menu_items
+	{
+		enum {
+			DXX_HELP_MENU(ENUM)
+		};
+		std::array<newmenu_item, DXX_HELP_MENU(COUNT)> m;
+		help_menu_items()
+		{
+			DXX_HELP_MENU(ADD);
+		}
+	};
+	struct help_menu : help_menu_items, passive_newmenu
+	{
+		help_menu(grs_canvas &src) :
+			passive_newmenu(menu_title{nullptr}, menu_subtitle{TXT_KEYS}, menu_filename{nullptr}, tiny_mode_flag::tiny, tab_processing_flag::ignore, adjusted_citem::create(m, 0), src)
+		{
+		}
+	};
+	auto menu = window_create<help_menu>(grd_curscreen->sc_canvas);
+	(void)menu;
 }
 
 #undef DXX_HELP_MENU
 
-#define DXX_NETHELP_MENU(VERB)	\
+#define DSX_NETHELP_MENU(VERB)	\
 	DXX_MENUITEM(VERB, TEXT, "F1\t  THIS SCREEN", NETHELP_HELP)	\
-	_DXX_NETHELP_DROPFLAG(VERB)	\
+	DSX_NETHELP_DROPFLAG(VERB)	\
 	_DXX_NETHELP_SAVELOAD_GAME(VERB)	\
 	DXX_MENUITEM(VERB, TEXT, "ALT-F4\t  SHOW PLAYER NAMES ON HUD", NETHELP_HUDNAMES)	\
 	DXX_MENUITEM(VERB, TEXT, "F7\t  TOGGLE KILL LIST", NETHELP_TOGGLE_KILL_LIST)	\
@@ -1367,18 +1533,34 @@ void show_help()
 	DXX_MENUITEM(VERB, TEXT, "/KillReactor\t  BLOW UP THE MINE (Host-only)", NETHELP_COMMAND_KILL_REACTOR)	\
 
 enum {
-	DXX_NETHELP_MENU(ENUM)
+	DSX_NETHELP_MENU(ENUM)
 };
 
 void show_netgame_help()
 {
-	const unsigned nitems = DXX_NETHELP_MENU(COUNT);
-	auto m = new newmenu_item[nitems];
-	DXX_NETHELP_MENU(ADD);
-	newmenu_dotiny(NULL, TXT_KEYS, nitems, m, 0, free_help, m);
+	struct help_menu_items
+	{
+		enum {
+			DSX_NETHELP_MENU(ENUM)
+		};
+		std::array<newmenu_item, DSX_NETHELP_MENU(COUNT)> m;
+		help_menu_items()
+		{
+			DSX_NETHELP_MENU(ADD);
+		}
+	};
+	struct help_menu : help_menu_items, passive_newmenu
+	{
+		help_menu(grs_canvas &src) :
+			passive_newmenu(menu_title{nullptr}, menu_subtitle{TXT_KEYS}, menu_filename{nullptr}, tiny_mode_flag::tiny, tab_processing_flag::ignore, adjusted_citem::create(m, 0), src)
+		{
+		}
+	};
+	auto menu = window_create<help_menu>(grd_curscreen->sc_canvas);
+	(void)menu;
 }
 
-#undef DXX_NETHELP_MENU
+#undef DSX_NETHELP_MENU
 
 #define DXX_NEWDEMO_HELP_MENU(VERB)	\
 	DXX_MENUITEM(VERB, TEXT, "ESC\t  QUIT DEMO PLAYBACK", DEMOHELP_QUIT)	\
@@ -1402,11 +1584,31 @@ enum {
 
 void show_newdemo_help()
 {
-	const unsigned nitems = DXX_NEWDEMO_HELP_MENU(COUNT);
-	auto m = new newmenu_item[nitems];
-	DXX_NEWDEMO_HELP_MENU(ADD);
-	newmenu_dotiny(NULL, "DEMO PLAYBACK CONTROLS", nitems, m, 0, free_help, m);
+	struct help_menu_items
+	{
+		enum {
+			DXX_NEWDEMO_HELP_MENU(ENUM)
+		};
+		std::array<newmenu_item, DXX_NEWDEMO_HELP_MENU(COUNT)> m;
+		help_menu_items()
+		{
+			DXX_NEWDEMO_HELP_MENU(ADD);
+		}
+	};
+	struct help_menu : help_menu_items, passive_newmenu
+	{
+		help_menu(grs_canvas &src) :
+			passive_newmenu(menu_title{nullptr}, menu_subtitle{"DEMO PLAYBACK CONTROLS"}, menu_filename{nullptr}, tiny_mode_flag::tiny, tab_processing_flag::ignore, adjusted_citem::create(m, 0), src)
+		{
+		}
+	};
+	auto menu = window_create<help_menu>(grd_curscreen->sc_canvas);
+	(void)menu;
 }
+
+}
+
+namespace {
 
 #undef DXX_NEWDEMO_HELP_MENU
 
@@ -1425,7 +1627,7 @@ static leave_type leave_mode;
 static void end_rear_view()
 {
 	Rear_view = 0;
-	if (PlayerCfg.CockpitMode[1] == CM_REAR_VIEW)
+	if (PlayerCfg.CockpitMode[1] == cockpit_mode_t::rear_view)
 		select_cockpit(PlayerCfg.CockpitMode[0]);
 	if (Newdemo_state == ND_STATE_RECORDING)
 		newdemo_record_restore_rearview();
@@ -1438,8 +1640,12 @@ static void check_end_rear_view()
 		end_rear_view();
 }
 
+}
+
+namespace dsx {
+
 //deal with rear view - switch it on, or off, or whatever
-void check_rear_view()
+void check_rear_view(control_info &Controls)
 {
 	static fix64 entry_time;
 
@@ -1459,8 +1665,8 @@ void check_rear_view()
 				Rear_view = 1;
 				leave_mode = leave_type::maybe_on_release;		//means wait for another key
 				entry_time = timer_query();
-				if (PlayerCfg.CockpitMode[1] == CM_FULL_COCKPIT)
-					select_cockpit(CM_REAR_VIEW);
+				if (PlayerCfg.CockpitMode[1] == cockpit_mode_t::full_cockpit)
+					select_cockpit(cockpit_mode_t::rear_view);
 				if (Newdemo_state == ND_STATE_RECORDING)
 					newdemo_record_rearview();
 			}
@@ -1488,6 +1694,8 @@ void check_rear_view()
 		default:
 			break;
 	}
+}
+
 }
 
 void reset_rear_view(void)
@@ -1522,18 +1730,18 @@ void game_disable_cheats()
 
 namespace dsx {
 
-window *game_setup(void)
+game_window *game_setup()
 {
 
 	PlayerCfg.CockpitMode[1] = PlayerCfg.CockpitMode[0];
-	last_drawn_cockpit = -1;	// Force cockpit to redraw next time a frame renders.
+	last_drawn_cockpit = cockpit_mode_t{UINT8_MAX};	// Force cockpit to redraw next time a frame renders.
 	Endlevel_sequence = 0;
 
-	const auto game_wind = window_create(grd_curscreen->sc_canvas, 0, 0, SWIDTH, SHEIGHT, game_handler, unused_window_userdata);
-	if (!game_wind)
-		return NULL;
-
+	auto game_wind = window_create<game_window>(grd_curscreen->sc_canvas, 0, 0, SWIDTH, SHEIGHT);
 	reset_palette_add();
+#if DXX_USE_STEREOSCOPIC_RENDER
+	init_stereo();
+#endif
 	init_cockpit();
 	init_gauges();
 	netplayerinfo_on = 0;
@@ -1542,7 +1750,7 @@ window *game_setup(void)
 	if (!Cursegp)
 	{
 		Cursegp = imsegptridx(segment_first);
-		Curside = 0;
+		Curside = sidenum_t::WLEFT;
 	}
 #endif
 
@@ -1558,14 +1766,8 @@ window *game_setup(void)
 	return game_wind;
 }
 
-}
-
-window *Game_wind = NULL;
-
-namespace dsx {
-
 // Event handler for the game
-window_event_result game_handler(window *,const d_event &event, const unused_window_userdata_t *)
+window_event_result game_window::event_handler(const d_event &event)
 {
 	auto result = window_event_result::ignored;
 
@@ -1576,7 +1778,7 @@ window_event_result game_handler(window *,const d_event &event, const unused_win
 
 			event_toggle_focus(1);
 			key_toggle_repeat(0);
-			game_flush_inputs();
+			game_flush_inputs(Controls);
 
 			if (time_paused)
 				start_time();
@@ -1604,22 +1806,26 @@ window_event_result game_handler(window *,const d_event &event, const unused_win
 			key_toggle_repeat(1);
 			break;
 
+#if DXX_MAX_BUTTONS_PER_JOYSTICK
 		case EVENT_JOYSTICK_BUTTON_UP:
 		case EVENT_JOYSTICK_BUTTON_DOWN:
+#endif
+#if DXX_MAX_AXES_PER_JOYSTICK
 		case EVENT_JOYSTICK_MOVED:
+#endif
 		case EVENT_MOUSE_BUTTON_UP:
 		case EVENT_MOUSE_BUTTON_DOWN:
 		case EVENT_MOUSE_MOVED:
 		case EVENT_KEY_COMMAND:
 		case EVENT_KEY_RELEASE:
 		case EVENT_IDLE:
-			return ReadControls(event);
+			return ReadControls(LevelSharedRobotInfoState, event, Controls);
 
 		case EVENT_WINDOW_DRAW:
 			if (!time_paused)
 			{
 				calc_frame_time();
-				result = GameProcessFrame();
+				result = GameProcessFrame(LevelSharedRobotInfoState);
 			}
 
 			if (!Automap_active)		// efficiency hack
@@ -1628,7 +1834,7 @@ window_event_result game_handler(window *,const d_event &event, const unused_win
 					init_cockpit();
 					force_cockpit_redraw=0;
 				}
-				game_render_frame();
+				game_render_frame(LevelSharedRobotInfoState.Robot_info, Controls);
 			}
 			break;
 
@@ -1646,7 +1852,7 @@ window_event_result game_handler(window *,const d_event &event, const unused_win
 			songs_play_song( SONG_TITLE, 1 );
 
 			game_disable_cheats();
-			Game_mode = GM_GAME_OVER;
+			Game_mode = {};
 #if DXX_USE_EDITOR
 			if (!EditorWindow)		// have to do it this way because of the necessary longjmp. Yuck.
 #endif
@@ -1655,6 +1861,12 @@ window_event_result game_handler(window *,const d_event &event, const unused_win
 			key_toggle_repeat(1);
 			Game_wind = nullptr;
 			return window_event_result::ignored;
+
+		case EVENT_LOOP_BEGIN_LOOP:
+			kconfig_begin_loop(Controls);
+			break;
+		case EVENT_LOOP_END_LOOP:
+			kconfig_end_loop(Controls, FrameTime);
 			break;
 
 		default:
@@ -1685,11 +1897,21 @@ namespace dsx {
 object *Missile_viewer=NULL;
 object_signature_t Missile_viewer_sig;
 
-array<unsigned, 2> Marker_viewer_num{{~0u, ~0u}};
-array<unsigned, 2> Coop_view_player{{UINT_MAX, UINT_MAX}};
+enumerated_array<game_marker_index, 2, gauge_inset_window_view> Marker_viewer_num{
+	{{
+		game_marker_index::None,
+		game_marker_index::None,
+	}}
+};
+enumerated_array<unsigned, 2, gauge_inset_window_view> Coop_view_player{
+	{{
+		 UINT_MAX,
+		 UINT_MAX
+	}}
+};
 
 //returns ptr to escort robot, or NULL
-imobjptridx_t find_escort(fvmobjptridx &vmobjptridx, const d_level_shared_robot_info_state::d_robot_info_array &Robot_info)
+imobjptridx_t find_escort(fvmobjptridx &vmobjptridx, const d_robot_info_array &Robot_info)
 {
 	range_for (const auto &&o, vmobjptridx)
 	{
@@ -1699,17 +1921,14 @@ imobjptridx_t find_escort(fvmobjptridx &vmobjptridx, const d_level_shared_robot_
 	return object_none;
 }
 
+namespace {
 //if water or fire level, make occasional sound
-static void do_ambient_sounds()
+static void do_ambient_sounds(const uint8_t s2_flags)
 {
-	int has_water,has_lava;
-	int sound;
-
-	const auto s2_flags = vcsegptr(ConsoleObject->segnum)->s2_flags;
-	has_lava = (s2_flags & S2F_AMBIENT_LAVA);
-	has_water = (s2_flags & S2F_AMBIENT_WATER);
-
-	if (has_lava) {							//has lava
+	const auto has_water = (s2_flags & S2F_AMBIENT_WATER);
+	sound_effect sound;
+	if (s2_flags & S2F_AMBIENT_LAVA)
+	{							//has lava
 		sound = SOUND_AMBIENT_LAVA;
 		if (has_water && (d_rand() & 1))	//both, pick one
 			sound = SOUND_AMBIENT_WATER;
@@ -1723,6 +1942,7 @@ static void do_ambient_sounds()
 		fix volume = d_rand() + f1_0/2;
 		digi_play_sample(sound,volume);
 	}
+}
 }
 }
 #endif
@@ -1745,8 +1965,11 @@ void game_leave_menus(void)
 
 namespace dsx {
 
-window_event_result GameProcessFrame()
+namespace {
+
+window_event_result GameProcessFrame(const d_level_shared_robot_info_state &LevelSharedRobotInfoState)
 {
+	auto &LevelUniqueControlCenterState = LevelUniqueObjectState.ControlCenterState;
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vmobjptr = Objects.vmptr;
 	auto &plrobj = get_local_plrobj();
@@ -1756,13 +1979,14 @@ window_event_result GameProcessFrame()
 	const auto player_was_dead = Player_dead_state;
 	auto result = window_event_result::ignored;
 
+	state_poll_autosave_game(GameUniqueState, LevelUniqueObjectState);
 	update_player_stats();
 	diminish_palette_towards_normal();		//	Should leave palette effect up for as long as possible by putting right before render.
 	do_afterburner_stuff(Objects);
 	do_cloak_stuff();
 	do_invulnerable_stuff(player_info);
 #if defined(DXX_BUILD_DESCENT_II)
-	init_ai_frame(player_info.powerup_flags);
+	init_ai_frame(player_info.powerup_flags, Controls);
 	result = do_final_boss_frame();
 
 	auto &pl_flags = player_info.powerup_flags;
@@ -1800,11 +2024,15 @@ window_event_result GameProcessFrame()
 	if (Game_mode & GM_MULTI)
 	{
 		result = std::max(multi_do_frame(), result);
-		if (Netgame.PlayTimeAllowed && ThisLevelTime>=i2f((Netgame.PlayTimeAllowed*5*60)))
-			multi_check_for_killgoal_winner();
+		if (Netgame.PlayTimeAllowed.count())
+		{
+			if (ThisLevelTime >= Netgame.PlayTimeAllowed)
+				multi_check_for_killgoal_winner(LevelSharedRobotInfoState.Robot_info);
+			ThisLevelTime += d_time_fix(FrameTime);
+		}
 	}
 
-	result = std::max(dead_player_frame(), result);
+	result = std::max(dead_player_frame(LevelSharedRobotInfoState.Robot_info), result);
 	if (Newdemo_state != ND_STATE_PLAYBACK)
 		result = std::max(do_controlcen_dead_frame(), result);
 	if (result == window_event_result::close)
@@ -1813,16 +2041,13 @@ window_event_result GameProcessFrame()
 #if defined(DXX_BUILD_DESCENT_II)
 	process_super_mines_frame();
 	do_seismic_stuff();
-	do_ambient_sounds();
+	do_ambient_sounds(vcsegptr(ConsoleObject->segnum)->s2_flags);
 #endif
-
-	if ((Game_mode & GM_MULTI) && Netgame.PlayTimeAllowed)
-		ThisLevelTime +=FrameTime;
 
 	digi_sync_sounds();
 
 	if (Endlevel_sequence) {
-		result = std::max(do_endlevel_frame(), result);
+		result = std::max(do_endlevel_frame(LevelSharedRobotInfoState), result);
 		powerup_grab_cheat_all();
 		do_special_effects();
 		return result;					//skip everything else
@@ -1830,10 +2055,11 @@ window_event_result GameProcessFrame()
 
 	if ((Newdemo_state != ND_STATE_PLAYBACK) || (Newdemo_vcr_state != ND_STATE_PAUSED)) {
 		do_special_effects();
-		wall_frame_process();
+		wall_frame_process(LevelSharedRobotInfoState.Robot_info);
 	}
 
-	if (Control_center_destroyed) {
+	if (LevelUniqueControlCenterState.Control_center_destroyed)
+	{
 		if (Newdemo_state==ND_STATE_RECORDING )
 			newdemo_record_control_center_destroyed();
 	}
@@ -1854,17 +2080,16 @@ window_event_result GameProcessFrame()
 #ifndef NEWHOMER
 		player_info.homing_object_dist = -1; // Assume not being tracked.  Laser_do_weapon_sequence modifies this.
 #endif
-		result = std::max(object_move_all(), result);
+		result = std::max(game_move_all_objects(LevelSharedRobotInfoState), result);
 		powerup_grab_cheat_all();
 
 		if (Endlevel_sequence)	//might have been started during move
 			return result;
 
-		fuelcen_update_all();
+		fuelcen_update_all(LevelSharedRobotInfoState.Robot_info);
+		do_ai_frame_all(LevelSharedRobotInfoState.Robot_info);
 
-		do_ai_frame_all();
-
-		auto laser_firing_count = FireLaser(player_info);
+		auto laser_firing_count = FireLaser(player_info, Controls);
 		if (auto &Auto_fire_fusion_cannon_time = player_info.Auto_fire_fusion_cannon_time)
 		{
 			if (player_info.Primary_weapon != primary_weapon_index_t::FUSION_INDEX)
@@ -1887,7 +2112,7 @@ window_event_result GameProcessFrame()
 
 		if (laser_firing_count)
 			do_laser_firing_player(plrobj);
-		delayed_autoselect(player_info);
+		delayed_autoselect(player_info, Controls);
 	}
 
 	if (Do_appearance_effect) {
@@ -1903,46 +2128,55 @@ window_event_result GameProcessFrame()
 
 	//if the player is taking damage, give up guided missile control
 	if (local_player_shields_ref != player_shields)
-		release_guided_missile(LevelUniqueObjectState, Player_num);
+	{
+		const auto player_num = Player_num;
+		if (const auto &&gimobj = LevelUniqueObjectState.Guided_missile.get_player_active_guided_missile(vmobjptr, player_num))
+			release_local_guided_missile(LevelUniqueObjectState, player_num, *gimobj);
+	}
 #endif
 
 	// Check if we have to close in-game menus for multiplayer
-	if ((Game_mode & GM_MULTI) && (get_local_player().connected == CONNECT_PLAYING))
+	if ((Game_mode & GM_MULTI) && get_local_player().connected == player_connection_status::playing)
 	{
-		if (Endlevel_sequence || (Player_dead_state != player_was_dead) || (local_player_shields_ref < player_shields) || (Control_center_destroyed && Countdown_seconds_left < 10))
+		if (Endlevel_sequence || Player_dead_state != player_was_dead || local_player_shields_ref < player_shields || (LevelUniqueControlCenterState.Control_center_destroyed && LevelUniqueControlCenterState.Countdown_seconds_left < 10))
                         game_leave_menus();
 	}
 
 	return result;
 }
 
+}
+
 #if defined(DXX_BUILD_DESCENT_II)
 void compute_slide_segs()
 {
 	auto &TmapInfo = LevelUniqueTmapInfoState.TmapInfo;
-	range_for (const auto &&segp, vmsegptr)
+	for (const csmusegment suseg : vmsegptr)
 	{
-		uint8_t slide_textures = 0;
-		range_for (const int sidenum, xrange(6u)) {
-			const auto &sside = segp->shared_segment::sides[sidenum];
-			const auto &uside = segp->unique_segment::sides[sidenum];
-			const auto &ti = TmapInfo[uside.tmap_num];
+		sidemask_t slide_textures{};
+		for (const auto sidenum : MAX_SIDES_PER_SEGMENT)
+		{
+			const auto &uside = suseg.u.sides[sidenum];
+			const auto &ti = TmapInfo[get_texture_index(uside.tmap_num)];
 			if (!(ti.slide_u || ti.slide_v))
 				continue;
-			if (IS_CHILD(segp->children[sidenum]) && sside.wall_num == wall_none)
+			const auto &sside = suseg.s.sides[sidenum];
+			if (IS_CHILD(suseg.s.children[sidenum]) && sside.wall_num == wall_none)
 				/* If a wall exists, it could be visible at start or
 				 * become visible later, so always enable sliding for
 				 * walls.
 				 */
 				continue;
-			slide_textures |= 1 << sidenum;
+			slide_textures |= build_sidemask(sidenum);
 		}
-		segp->slide_textures = slide_textures;
+		suseg.u.slide_textures = slide_textures;
 	}
 }
 
+namespace {
+
 template <fix uvl::*p>
-static void update_uv(array<uvl, 4> &uvls, uvl &i, fix a)
+static void update_uv(std::array<uvl, 4> &uvls, uvl &i, fix a)
 {
 	if (!a)
 		return;
@@ -1959,15 +2193,16 @@ static void update_uv(array<uvl, 4> &uvls, uvl &i, fix a)
 static void slide_textures(void)
 {
 	auto &TmapInfo = LevelUniqueTmapInfoState.TmapInfo;
-	range_for (const auto &&segp, vmsegptr)
+	for (unique_segment &useg : vmsegptr)
 	{
-		if (const auto slide_seg = segp->slide_textures)
+		if (const auto slide_seg = useg.slide_textures; slide_seg != sidemask_t{})
 		{
-			range_for (const int sidenum, xrange(6u)) {
-				if (slide_seg & (1 << sidenum))
+			for (const auto sidenum : MAX_SIDES_PER_SEGMENT)
+			{
+				if (slide_seg & build_sidemask(sidenum))
 				{
-					auto &side = segp->unique_segment::sides[sidenum];
-					const auto &ti = TmapInfo[side.tmap_num];
+					auto &side = useg.sides[sidenum];
+					const auto &ti = TmapInfo[get_texture_index(side.tmap_num)];
 					const auto tiu = ti.slide_u;
 					const auto tiv = ti.slide_v;
 					if (tiu || tiv)
@@ -2003,12 +2238,12 @@ static void flicker_lights(const d_level_shared_destructible_light_state &LevelS
 		const auto sidenum = f.sidenum;
 		{
 			auto &side = segp->unique_segment::sides[sidenum];
-			if (!(TmapInfo[side.tmap_num].lighting || TmapInfo[side.tmap_num2 & 0x3fff].lighting))
+			if (!(TmapInfo[get_texture_index(side.tmap_num)].lighting || TmapInfo[get_texture_index(side.tmap_num2)].lighting))
 				continue;
 		}
 
 		//make sure this is actually a light
-		if (! (WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, segp, segp, sidenum) & WID_RENDER_FLAG))
+		if (! (WALL_IS_DOORWAY(GameBitmaps, Textures, vcwallptr, segp, sidenum) & WALL_IS_DOORWAY_FLAG::render))
 			continue;
 
 		if ((f.timer -= FrameTime) < 0)
@@ -2025,7 +2260,7 @@ static void flicker_lights(const d_level_shared_destructible_light_state &LevelS
 }
 
 //returns ptr to flickering light structure, or NULL if can't find
-static std::pair<d_flickering_light_state::Flickering_light_array_t::iterator, d_flickering_light_state::Flickering_light_array_t::iterator> find_flicker(d_flickering_light_state &fls, const vmsegidx_t segnum, const unsigned sidenum)
+static std::pair<d_flickering_light_state::Flickering_light_array_t::iterator, d_flickering_light_state::Flickering_light_array_t::iterator> find_flicker(d_flickering_light_state &fls, const vmsegidx_t segnum, const sidenum_t sidenum)
 {
 	//see if there's already an entry for this seg/side
 	const auto &&pr = partial_range(fls.Flickering_lights, fls.Num_flickering_lights);
@@ -2033,33 +2268,37 @@ static std::pair<d_flickering_light_state::Flickering_light_array_t::iterator, d
 		return f.segnum == segnum && f.sidenum == sidenum;	//found it!
 	};
 	const auto &&pe = pr.end();
-	return {std::find_if(pr.begin(), pe, predicate), pe};
+	return {ranges::find_if(pr.begin(), pe, predicate), pe};
 }
 
-static void update_flicker(d_flickering_light_state &fls, const vmsegidx_t segnum, const unsigned sidenum, const fix timer)
+static void update_flicker(d_flickering_light_state &fls, const vmsegidx_t segnum, const sidenum_t sidenum, const fix timer)
 {
 	const auto &&i = find_flicker(fls, segnum, sidenum);
 	if (i.first != i.second)
 		i.first->timer = timer;
 }
 
+}
+
 //turn flickering off (because light has been turned off)
-void disable_flicker(d_flickering_light_state &fls, const vmsegidx_t segnum, const unsigned sidenum)
+void disable_flicker(d_flickering_light_state &fls, const vmsegidx_t segnum, const sidenum_t sidenum)
 {
 	update_flicker(fls, segnum, sidenum, flicker_timer_disabled);
 }
 
 //turn flickering off (because light has been turned on)
-void enable_flicker(d_flickering_light_state &fls, const vmsegidx_t segnum, const unsigned sidenum)
+void enable_flicker(d_flickering_light_state &fls, const vmsegidx_t segnum, const sidenum_t sidenum)
 {
 	update_flicker(fls, segnum, sidenum, 0);
 }
 #endif
 
+namespace {
+
 //	-----------------------------------------------------------------------------
 //	Fire Laser:  Registers a laser fire, and performs special stuff for the fusion
 //				    cannon.
-bool FireLaser(player_info &player_info)
+bool FireLaser(player_info &player_info, const control_info &Controls)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vmobjptr = Objects.vmptr;
@@ -2117,9 +2356,9 @@ bool FireLaser(player_info &player_info)
 						multi_send_play_sound(11, F1_0, sound_stack::allow_stacking);
 #endif
 					const auto cobjp = vmobjptridx(ConsoleObject);
-					apply_damage_to_player(cobjp, cobjp, d_rand() * 4, 0);
+					apply_damage_to_player(cobjp, cobjp, d_rand() * 4, apply_damage_player::always);
 				} else {
-					create_awareness_event(vmobjptr(ConsoleObject), player_awareness_type_t::PA_WEAPON_ROBOT_COLLISION);
+					create_awareness_event(vmobjptr(ConsoleObject), player_awareness_type_t::PA_WEAPON_ROBOT_COLLISION, LevelUniqueRobotAwarenessState);
 					multi_digi_play_sample(SOUND_FUSION_WARMUP, F1_0);
 				}
 				Fusion_next_sound_time = GameTime64 + F1_0/8 + d_rand()/4;
@@ -2173,9 +2412,11 @@ void powerup_grab_cheat_all(void)
 
 }
 
-int	Last_level_path_created = -1;
+}
 
 #ifdef SHOW_EXIT_PATH
+namespace dsx {
+namespace {
 
 //	------------------------------------------------------------------------------------------------------------------
 //	Create path for player from current segment to goal segment.
@@ -2184,14 +2425,12 @@ static int mark_player_path_to_segment(const d_vclip_array &Vclip, fvmobjptridx 
 {
 	int		player_hide_index=-1;
 
-	if (Last_level_path_created == Current_level_num) {
+	if (LevelUniqueObjectState.Level_path_created)
 		return 0;
-	}
-
-	Last_level_path_created = Current_level_num;
+	LevelUniqueObjectState.Level_path_created = 1;
 
 	auto objp = vmobjptridx(ConsoleObject);
-	const auto &&cr = create_path_points(objp, objp->segnum, segnum, Point_segs_free_ptr, 100, create_path_random_flag::nonrandom, create_path_safety_flag::unsafe, segment_none);
+	const auto &&cr = create_path_points(objp, create_path_unused_robot_info, objp->segnum, segnum, Point_segs_free_ptr, 100, create_path_random_flag::nonrandom, create_path_safety_flag::unsafe, segment_none);
 	const unsigned player_path_length = cr.second;
 	if (cr.first == create_path_result::early)
 		return 0;
@@ -2209,7 +2448,7 @@ static int mark_player_path_to_segment(const d_vclip_array &Vclip, fvmobjptridx 
 
 		seg_center = Point_segs[player_hide_index+i].point;
 
-		const auto &&obj = obj_create(OBJ_POWERUP, POW_ENERGY, vmsegptridx(Point_segs[player_hide_index+i].segnum), seg_center, &vmd_identity_matrix, Powerup_info[POW_ENERGY].size, CT_POWERUP, MT_NONE, RT_POWERUP);
+		const auto &&obj = obj_create(LevelUniqueObjectState, LevelSharedSegmentState, LevelUniqueSegmentState, OBJ_POWERUP, POW_ENERGY, vmsegptridx(Point_segs[player_hide_index+i].segnum), seg_center, &vmd_identity_matrix, Powerup_info[POW_ENERGY].size, object::control_type::powerup, object::movement_type::None, RT_POWERUP);
 		if (obj == object_none) {
 			Int3();		//	Unable to drop energy powerup for path
 			return 1;
@@ -2224,6 +2463,8 @@ static int mark_player_path_to_segment(const d_vclip_array &Vclip, fvmobjptridx 
 	return 1;
 }
 
+}
+
 //	Return true if it happened, else return false.
 int create_special_path(void)
 {
@@ -2232,8 +2473,8 @@ int create_special_path(void)
 	//	---------- Find exit doors ----------
 	range_for (const auto &&segp, vcsegptridx)
 	{
-		for (int j=0; j<MAX_SIDES_PER_SEGMENT; j++)
-			if (segp->children[j] == segment_exit)
+		for (const auto child_segnum : segp->shared_segment::children)
+			if (child_segnum == segment_exit)
 			{
 				return mark_player_path_to_segment(Vclip, vmobjptridx, vmsegptridx, segp);
 			}
@@ -2242,6 +2483,7 @@ int create_special_path(void)
 	return 0;
 }
 
+}
 #endif
 
 
@@ -2252,17 +2494,26 @@ namespace dsx {
  */
 void flickering_light_read(flickering_light &fl, PHYSFS_File *fp)
 {
-	fl.segnum = PHYSFSX_readShort(fp);
-	fl.sidenum = PHYSFSX_readShort(fp);
+	{
+		const auto s = segnum_t{static_cast<uint16_t>(PHYSFSX_readShort(fp))};
+		fl.segnum = vmsegidx_t::check_nothrow_index(s) ? s : segment_none;
+	}
+	const auto sidenum = build_sidenum_from_untrusted(PHYSFSX_readShort(fp));
 	fl.mask = PHYSFSX_readInt(fp);
 	fl.timer = PHYSFSX_readFix(fp);
 	fl.delay = PHYSFSX_readFix(fp);
+	if (!sidenum)
+	{
+		fl = {};
+		return;
+	}
+	fl.sidenum = sidenum.value();
 }
 
 void flickering_light_write(const flickering_light &fl, PHYSFS_File *fp)
 {
 	PHYSFS_writeSLE16(fp, fl.segnum);
-	PHYSFS_writeSLE16(fp, fl.sidenum);
+	PHYSFS_writeSLE16(fp, underlying_value(fl.sidenum));
 	PHYSFS_writeULE32(fp, fl.mask);
 	PHYSFSX_writeFix(fp, fl.timer);
 	PHYSFSX_writeFix(fp, fl.delay);

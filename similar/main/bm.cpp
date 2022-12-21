@@ -58,7 +58,6 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "console.h"
 #include "rle.h"
 #include "physfsx.h"
-#include "internal.h"
 #include "strutil.h"
 
 #if DXX_USE_EDITOR
@@ -66,11 +65,9 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #endif
 
 #include "compiler-range_for.h"
-#include "compiler-make_unique.h"
 #include "d_range.h"
 #include "partial_range.h"
-
-array<ubyte, MAX_SOUNDS> Sounds, AltSounds;
+#include <memory>
 
 unsigned NumTextures;
 
@@ -78,29 +75,31 @@ unsigned NumTextures;
 int Num_object_subtypes = 1;
 #endif
 
+namespace dsx {
 #if defined(DXX_BUILD_DESCENT_I)
 int Num_total_object_types;
 
 sbyte	ObjType[MAX_OBJTYPE];
-sbyte	ObjId[MAX_OBJTYPE];
+std::array<polygon_model_index, MAX_OBJTYPE> ObjId;
 fix	ObjStrength[MAX_OBJTYPE];
 #elif defined(DXX_BUILD_DESCENT_II)
 //the polygon model number to use for the marker
-int	Marker_model_num = -1;
 unsigned N_ObjBitmaps;
+namespace {
+static int extra_bitmap_num;
 static void bm_free_extra_objbitmaps();
+}
 #endif
 
-namespace dsx {
 Textures_array Textures;		// All textures.
 //for each model, a model number for dying & dead variants, or -1 if none
-array<int, MAX_POLYGON_MODELS> Dying_modelnums, Dead_modelnums;
-array<bitmap_index, N_COCKPIT_BITMAPS> cockpit_bitmap;
+enumerated_array<polygon_model_index, MAX_POLYGON_MODELS, polygon_model_index> Dying_modelnums, Dead_modelnums;
 }
 
 //right now there's only one player ship, but we can have another by
 //adding an array and setting the pointer to the active ship.
 namespace dcx {
+std::array<uint8_t, ::d2x::MAX_SOUNDS> Sounds, AltSounds;
 player_ship only_player_ship;
 
 //----------------- Miscellaneous bitmap pointers ---------------
@@ -113,13 +112,15 @@ unsigned Num_cockpits;
 
 int             First_multi_bitmap_num=-1;
 
-array<bitmap_index, MAX_OBJ_BITMAPS> ObjBitmaps;
-array<ushort, MAX_OBJ_BITMAPS>          ObjBitmapPtrs;     // These point back into ObjBitmaps, since some are used twice.
-
 namespace dsx {
+
+enumerated_array<bitmap_index, N_COCKPIT_BITMAPS, cockpit_mode_t> cockpit_bitmap;
+enumerated_array<bitmap_index, MAX_OBJ_BITMAPS, object_bitmap_index> ObjBitmaps;
+std::array<object_bitmap_index, MAX_OBJ_BITMAPS> ObjBitmapPtrs;     // These point back into ObjBitmaps, since some are used twice.
+
 void gamedata_close()
 {
-	free_polygon_models();
+	free_polygon_models(LevelSharedPolygonModelState);
 #if defined(DXX_BUILD_DESCENT_II)
 	bm_free_extra_objbitmaps();
 #endif
@@ -127,45 +128,48 @@ void gamedata_close()
 	rle_cache_close();
 	piggy_close();
 }
-}
 
 /*
  * reads n tmap_info structs from a PHYSFS_File
  */
 #if defined(DXX_BUILD_DESCENT_I)
+namespace {
 static void tmap_info_read(tmap_info &ti, PHYSFS_File *fp)
 {
 	PHYSFS_read(fp, ti.filename, 13, 1);
-	ti.flags = PHYSFSX_readByte(fp);
+	uint8_t flags;
+	PHYSFS_read(fp, &flags, 1, 1);
+	ti.flags = tmapinfo_flags{flags};
 	ti.lighting = PHYSFSX_readFix(fp);
 	ti.damage = PHYSFSX_readFix(fp);
 	ti.eclip_num = PHYSFSX_readInt(fp);
 }
+}
 
 //-----------------------------------------------------------------
 // Initializes game properties data (including texture caching system) and sound data.
-int gamedata_init()
+int gamedata_init(d_level_shared_robot_info_state &LevelSharedRobotInfoState)
 {
 	int retval;
 	
-	init_polygon_models();
-	retval = properties_init();				// This calls properties_read_cmp if appropriate
+	init_polygon_models(LevelSharedPolygonModelState);
+	retval = properties_init(LevelSharedRobotInfoState);				// This calls properties_read_cmp if appropriate
 	if (retval)
-		gamedata_read_tbl(Vclip, retval == PIGGY_PC_SHAREWARE);
+		gamedata_read_tbl(LevelSharedRobotInfoState, Vclip, retval == PIGGY_PC_SHAREWARE);
 
 	piggy_read_sounds(retval == PIGGY_PC_SHAREWARE);
 	
 	return 0;
 }
 
-namespace dsx {
-
 // Read compiled properties data from descent.pig
-void properties_read_cmp(d_vclip_array &Vclip, PHYSFS_File * fp)
+// (currently only ever called if D1)
+void properties_read_cmp(d_level_shared_robot_info_state &LevelSharedRobotInfoState, d_vclip_array &Vclip, PHYSFS_File * fp)
 {
 	auto &Effects = LevelUniqueEffectsClipState.Effects;
 	auto &Robot_joints = LevelSharedRobotJointState.Robot_joints;
 	auto &TmapInfo = LevelUniqueTmapInfoState.TmapInfo;
+	auto &WallAnims = GameSharedState.WallAnims;
 	//  bitmap_index is a short
 	
 	NumTextures = PHYSFSX_readInt(fp);
@@ -173,8 +177,8 @@ void properties_read_cmp(d_vclip_array &Vclip, PHYSFS_File * fp)
 	range_for (tmap_info &ti, TmapInfo)
 		tmap_info_read(ti, fp);
 
-	PHYSFS_read(fp, Sounds, sizeof(Sounds[0]), Sounds.size());
-	PHYSFS_read(fp, AltSounds, sizeof(AltSounds[0]), AltSounds.size());
+	PHYSFS_read(fp, Sounds, sizeof(Sounds[0]), MAX_SOUNDS);
+	PHYSFS_read(fp, AltSounds, sizeof(AltSounds[0]), MAX_SOUNDS);
 	
 	Num_vclips = PHYSFSX_readInt(fp);
 	range_for (vclip &vc, Vclip)
@@ -193,7 +197,7 @@ void properties_read_cmp(d_vclip_array &Vclip, PHYSFS_File * fp)
 	range_for (auto &r, Robot_info)
 		robot_info_read(fp, r);
 
-	N_robot_joints = PHYSFSX_readInt(fp);
+	LevelSharedRobotJointState.N_robot_joints = PHYSFSX_readInt(fp);
 	range_for (auto &r, Robot_joints)
 		jointpos_read(fp, r);
 
@@ -205,11 +209,11 @@ void properties_read_cmp(d_vclip_array &Vclip, PHYSFS_File * fp)
 		powerup_type_info_read(fp, p);
 
 	auto &Polygon_models = LevelSharedPolygonModelState.Polygon_models;
-	N_polygon_models = PHYSFSX_readInt(fp);
+	const auto N_polygon_models = LevelSharedPolygonModelState.N_polygon_models = PHYSFSX_readInt(fp);
 	{
 		const auto &&r = partial_range(Polygon_models, N_polygon_models);
 	range_for (auto &p, r)
-		polymodel_read(&p, fp);
+		polymodel_read(p, fp);
 
 	range_for (auto &p, r)
 		polygon_model_data_read(&p, fp);
@@ -218,25 +222,35 @@ void properties_read_cmp(d_vclip_array &Vclip, PHYSFS_File * fp)
 	bitmap_index_read_n(fp, partial_range(Gauges, MAX_GAUGE_BMS));
 	
 	range_for (auto &i, Dying_modelnums)
-		i = PHYSFSX_readInt(fp);
+		i = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(fp));
 	range_for (auto &i, Dead_modelnums)
-		i = PHYSFSX_readInt(fp);
+		i = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(fp));
 
 	bitmap_index_read_n(fp, ObjBitmaps);
 	range_for (auto &i, ObjBitmapPtrs)
-		i = PHYSFSX_readShort(fp);
+	{
+		const auto oi = static_cast<object_bitmap_index>(PHYSFSX_readShort(fp));
+		if (ObjBitmaps.valid_index(oi))
+			i = oi;
+		else
+			i = {};
+	}
 
 	player_ship_read(&only_player_ship, fp);
 
 	Num_cockpits = PHYSFSX_readInt(fp);
 	bitmap_index_read_n(fp, cockpit_bitmap);
 
-	PHYSFS_read(fp, Sounds, sizeof(Sounds[0]), Sounds.size());
-	PHYSFS_read(fp, AltSounds, sizeof(AltSounds[0]), AltSounds.size());
+	PHYSFS_read(fp, Sounds, sizeof(Sounds[0]), MAX_SOUNDS);
+	PHYSFS_read(fp, AltSounds, sizeof(AltSounds[0]), MAX_SOUNDS);
 
 	Num_total_object_types = PHYSFSX_readInt(fp);
 	PHYSFS_read( fp, ObjType, sizeof(ubyte), MAX_OBJTYPE );
-	PHYSFS_read( fp, ObjId, sizeof(ubyte), MAX_OBJTYPE );
+	{
+		std::array<uint8_t, std::size(ObjId)> o;
+		PHYSFS_read(fp, o.data(), sizeof(uint8_t), std::size(o));
+		std::transform(o.begin(), o.end(), ObjId.begin(), build_polygon_model_index_from_untrusted);
+	}
 	range_for (auto &i, ObjStrength)
 		i = PHYSFSX_readFix(fp);
 
@@ -248,8 +262,8 @@ void properties_read_cmp(d_vclip_array &Vclip, PHYSFS_File * fp)
 	range_for (auto &i, Reactors[0].gun_dirs)
 		PHYSFSX_readVector(fp, i);
 
-	exit_modelnum = PHYSFSX_readInt(fp);	
-	destroyed_exit_modelnum = PHYSFSX_readInt(fp);
+	exit_modelnum = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(fp));
+	destroyed_exit_modelnum = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(fp));
 
 #if DXX_USE_EDITOR
         //Build tmaplist
@@ -257,12 +271,13 @@ void properties_read_cmp(d_vclip_array &Vclip, PHYSFS_File * fp)
 	LevelUniqueTmapInfoState.Num_tmaps = TextureEffects + std::count_if(effect_range.begin(), effect_range.end(), [](const eclip &e) { return e.changing_wall_texture >= 0; });
         #endif
 }
-
-}
 #elif defined(DXX_BUILD_DESCENT_II)
+namespace {
 static void tmap_info_read(tmap_info &ti, PHYSFS_File *fp)
 {
-	ti.flags = PHYSFSX_readByte(fp);
+	uint8_t flags;
+	PHYSFS_read(fp, &flags, 1, 1);
+	ti.flags = tmapinfo_flags{flags};
 	PHYSFSX_readByte(fp);
 	PHYSFSX_readByte(fp);
 	PHYSFSX_readByte(fp);
@@ -273,19 +288,20 @@ static void tmap_info_read(tmap_info &ti, PHYSFS_File *fp)
 	ti.slide_u = PHYSFSX_readShort(fp);
 	ti.slide_v = PHYSFSX_readShort(fp);
 }
+}
 
 //-----------------------------------------------------------------
 // Initializes game properties data (including texture caching system) and sound data.
-int gamedata_init()
+int gamedata_init(d_level_shared_robot_info_state &LevelSharedRobotInfoState)
 {
-	init_polygon_models();
+	init_polygon_models(LevelSharedPolygonModelState);
 
 #if DXX_USE_EDITOR
 	// The pc_shareware argument is currently unused for Descent 2,
 	// but *may* be useful for loading Descent 1 Shareware texture properties.
-	if (!gamedata_read_tbl(Vclip, 0))
+	if (!gamedata_read_tbl(LevelSharedRobotInfoState, Vclip, 0))
 #endif
-		if (!properties_init())				// This calls properties_read_cmp
+		if (!properties_init(LevelSharedRobotInfoState))				// This calls properties_read_cmp
 				Error("Cannot open ham file\n");
 
 	piggy_read_sounds();
@@ -293,13 +309,12 @@ int gamedata_init()
 	return 0;
 }
 
-namespace dsx {
-
-void bm_read_all(d_vclip_array &Vclip, PHYSFS_File * fp)
+void bm_read_all(d_level_shared_robot_info_state &LevelSharedRobotInfoState, d_vclip_array &Vclip, PHYSFS_File * fp)
 {
 	auto &Effects = LevelUniqueEffectsClipState.Effects;
 	auto &Robot_joints = LevelSharedRobotJointState.Robot_joints;
 	auto &TmapInfo = LevelUniqueTmapInfoState.TmapInfo;
+	auto &WallAnims = GameSharedState.WallAnims;
 	unsigned t;
 
 	NumTextures = PHYSFSX_readInt(fp);
@@ -328,32 +343,32 @@ void bm_read_all(d_vclip_array &Vclip, PHYSFS_File * fp)
 	range_for (auto &r, partial_range(Robot_info, LevelSharedRobotInfoState.N_robot_types))
 		robot_info_read(fp, r);
 
-	N_robot_joints = PHYSFSX_readInt(fp);
+	const auto N_robot_joints = LevelSharedRobotJointState.N_robot_joints = PHYSFSX_readInt(fp);
 	range_for (auto &r, partial_range(Robot_joints, N_robot_joints))
 		jointpos_read(fp, r);
 
 	N_weapon_types = PHYSFSX_readInt(fp);
-	weapon_info_read_n(Weapon_info, N_weapon_types, fp, Piggy_hamfile_version);
+	weapon_info_read_n(Weapon_info, N_weapon_types, fp, Piggy_hamfile_version, 0);
 
 	N_powerup_types = PHYSFSX_readInt(fp);
 	range_for (auto &p, partial_range(Powerup_info, N_powerup_types))
 		powerup_type_info_read(fp, p);
 
 	auto &Polygon_models = LevelSharedPolygonModelState.Polygon_models;
-	N_polygon_models = PHYSFSX_readInt(fp);
+	const auto N_polygon_models = LevelSharedPolygonModelState.N_polygon_models = PHYSFSX_readInt(fp);
 	{
 		const auto &&r = partial_range(Polygon_models, N_polygon_models);
 	range_for (auto &p, r)
-		polymodel_read(&p, fp);
+		polymodel_read(p, fp);
 
 	range_for (auto &p, r)
 		polygon_model_data_read(&p, fp);
 	}
 
 	range_for (auto &i, partial_range(Dying_modelnums, N_polygon_models))
-		i = PHYSFSX_readInt(fp);
+		i = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(fp));
 	range_for (auto &i, partial_range(Dead_modelnums, N_polygon_models))
-		i = PHYSFSX_readInt(fp);
+		i = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(fp));
 
 	t = PHYSFSX_readInt(fp);
 	bitmap_index_read_n(fp, partial_range(Gauges, t));
@@ -362,7 +377,13 @@ void bm_read_all(d_vclip_array &Vclip, PHYSFS_File * fp)
 	N_ObjBitmaps = PHYSFSX_readInt(fp);
 	bitmap_index_read_n(fp, partial_range(ObjBitmaps, N_ObjBitmaps));
 	range_for (auto &i, partial_range(ObjBitmapPtrs, N_ObjBitmaps))
-		i = PHYSFSX_readShort(fp);
+	{
+		const auto oi = static_cast<object_bitmap_index>(PHYSFSX_readShort(fp));
+		if (ObjBitmaps.valid_index(oi))
+			i = oi;
+		else
+			i = {};
+	}
 
 	player_ship_read(&only_player_ship, fp);
 
@@ -379,23 +400,25 @@ void bm_read_all(d_vclip_array &Vclip, PHYSFS_File * fp)
 	Num_reactors = PHYSFSX_readInt(fp);
 	reactor_read_n(fp, partial_range(Reactors, Num_reactors));
 
-	Marker_model_num = PHYSFSX_readInt(fp);
+	LevelSharedPolygonModelState.Marker_model_num = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(fp));
 
 	//@@PHYSFS_read( fp, &N_controlcen_guns, sizeof(int), 1 );
 	//@@PHYSFS_read( fp, controlcen_gun_points, sizeof(vms_vector), N_controlcen_guns );
 	//@@PHYSFS_read( fp, controlcen_gun_dirs, sizeof(vms_vector), N_controlcen_guns );
 
-	if (Piggy_hamfile_version < 3) {
-		exit_modelnum = PHYSFSX_readInt(fp);
-		destroyed_exit_modelnum = PHYSFSX_readInt(fp);
+	if (Piggy_hamfile_version < pig_hamfile_version::_3) { // D1
+		exit_modelnum = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(fp));
+		destroyed_exit_modelnum = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(fp));
 	}
-	else
-		exit_modelnum = destroyed_exit_modelnum = N_polygon_models;
+	else	// D2: to be loaded later
+		exit_modelnum = destroyed_exit_modelnum = polygon_model_index::None;
 }
 
-}
+namespace {
 
-int extra_bitmap_num = 0;
+// this and below only really used for D2
+bool Exit_bitmaps_loaded;
+unsigned Exit_bitmap_index;
 
 static void bm_free_extra_objbitmaps()
 {
@@ -410,14 +433,17 @@ static void bm_free_extra_objbitmaps()
 		d_free(GameBitmaps[i].bm_mdata);
 	}
 	extra_bitmap_num = Num_bitmap_files;
+	Exit_bitmaps_loaded = false;
 }
 
-static void bm_free_extra_models()
+static void bm_free_extra_models(d_level_shared_polygon_model_state &LevelSharedPolygonModelState)
 {
-	const auto base = std::min(N_D2_POLYGON_MODELS.value, exit_modelnum);
-	auto &Polygon_models = LevelSharedPolygonModelState.Polygon_models;
-	range_for (auto &p, partial_range(Polygon_models, base, exchange(N_polygon_models, base)))
+	LevelSharedPolygonModelState.Exit_models_loaded = false;
+	const auto base = std::min<unsigned>(N_D2_POLYGON_MODELS.value, underlying_value(exit_modelnum));
+	for (auto &p : partial_range(LevelSharedPolygonModelState.Polygon_models, base, std::exchange(LevelSharedPolygonModelState.N_polygon_models, base)))
 		free_model(p);
+}
+
 }
 
 //type==1 means 1.1, type==2 means 1.2 (with weapons)
@@ -426,10 +452,10 @@ void bm_read_extra_robots(const char *fname, Mission::descent_version_type type)
 	auto &Robot_joints = LevelSharedRobotJointState.Robot_joints;
 	int t,version;
 
-	auto fp = PHYSFSX_openReadBuffered(fname);
+	auto &&[fp, physfserr] = PHYSFSX_openReadBuffered(fname);
 	if (!fp)
 	{
-		Error("Failed to open HAM file \"%s\"", fname);
+		Error("Failed to open HAM file \"%s\": %s", fname, PHYSFS_getErrorByCode(physfserr));
 		return;
 	}
 
@@ -446,14 +472,14 @@ void bm_read_extra_robots(const char *fname, Mission::descent_version_type type)
 		version = 0;
 	(void)version; // NOTE: we do not need it, but keep it for possible further use
 
-	bm_free_extra_models();
+	bm_free_extra_models(LevelSharedPolygonModelState);
 	bm_free_extra_objbitmaps();
 
 	//read extra weapons
 
 	t = PHYSFSX_readInt(fp);
 	N_weapon_types = N_D2_WEAPON_TYPES+t;
-	weapon_info_read_n(Weapon_info, N_weapon_types, fp, 3, N_D2_WEAPON_TYPES);
+	weapon_info_read_n(Weapon_info, N_weapon_types, fp, pig_hamfile_version::_3, N_D2_WEAPON_TYPES);
 
 	//now read robot info
 
@@ -466,7 +492,7 @@ void bm_read_extra_robots(const char *fname, Mission::descent_version_type type)
 		robot_info_read(fp, r);
 
 	t = PHYSFSX_readInt(fp);
-	N_robot_joints = N_D2_ROBOT_JOINTS+t;
+	const auto N_robot_joints = LevelSharedRobotJointState.N_robot_joints = N_D2_ROBOT_JOINTS+t;
 	if (N_robot_joints >= MAX_ROBOT_JOINTS)
 		Error("Too many robot joints (%d) in <%s>.  Max is %d.",t,fname,MAX_ROBOT_JOINTS-N_D2_ROBOT_JOINTS);
 	range_for (auto &r, partial_range(Robot_joints, N_D2_ROBOT_JOINTS.value, N_robot_joints))
@@ -474,22 +500,22 @@ void bm_read_extra_robots(const char *fname, Mission::descent_version_type type)
 
 	unsigned u = PHYSFSX_readInt(fp);
 	auto &Polygon_models = LevelSharedPolygonModelState.Polygon_models;
-	N_polygon_models = N_D2_POLYGON_MODELS+u;
+	const auto N_polygon_models = LevelSharedPolygonModelState.N_polygon_models = N_D2_POLYGON_MODELS+u;
 	if (N_polygon_models >= MAX_POLYGON_MODELS)
 		Error("Too many polygon models (%d) in <%s>.  Max is %d.",u,fname,MAX_POLYGON_MODELS-N_D2_POLYGON_MODELS);
 	{
 		const auto &&r = partial_range(Polygon_models, N_D2_POLYGON_MODELS.value, N_polygon_models);
 		range_for (auto &p, r)
-		polymodel_read(&p, fp);
+			polymodel_read(p, fp);
 
 		range_for (auto &p, r)
 			polygon_model_data_read(&p, fp);
 	}
 
 	range_for (auto &i, partial_range(Dying_modelnums, N_D2_POLYGON_MODELS.value, N_polygon_models))
-		i = PHYSFSX_readInt(fp);
+		i = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(fp));
 	range_for (auto &i, partial_range(Dead_modelnums, N_D2_POLYGON_MODELS.value, N_polygon_models))
-		i = PHYSFSX_readInt(fp);
+		i = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(fp));
 
 	t = PHYSFSX_readInt(fp);
 	if (N_D2_OBJBITMAPS+t >= ObjBitmaps.size())
@@ -500,7 +526,13 @@ void bm_read_extra_robots(const char *fname, Mission::descent_version_type type)
 	if (N_D2_OBJBITMAPPTRS+t >= ObjBitmapPtrs.size())
 		Error("Too many object bitmap pointers (%d) in <%s>.  Max is %" DXX_PRI_size_type ".", t, fname, ObjBitmapPtrs.size() - N_D2_OBJBITMAPPTRS);
 	range_for (auto &i, partial_range(ObjBitmapPtrs, N_D2_OBJBITMAPPTRS.value, N_D2_OBJBITMAPPTRS + t))
-		i = PHYSFSX_readShort(fp);
+	{
+		const auto oi = static_cast<object_bitmap_index>(PHYSFSX_readShort(fp));
+		if (ObjBitmaps.valid_index(oi))
+			i = oi;
+		else
+			i = {};
+	}
 }
 
 int Robot_replacements_loaded = 0;
@@ -508,12 +540,15 @@ int Robot_replacements_loaded = 0;
 void load_robot_replacements(const d_fname &level_name)
 {
 	auto &Robot_joints = LevelSharedRobotJointState.Robot_joints;
-	int t,i,j;
-	char ifile_name[FILENAME_LEN];
+	int t,j;
+	std::array<char, FILENAME_LEN> ifile_name;
+	if (!change_filename_extension(ifile_name, level_name, "HXM"))
+	{
+		con_printf(CON_URGENT, "Failed to generate HXM name from level name \"%s\"", level_name.data());
+		return;
+	}
 
-	change_filename_extension(ifile_name, level_name, ".HXM" );
-
-	auto fp = PHYSFSX_openReadBuffered(ifile_name);
+	auto fp = PHYSFSX_openReadBuffered(ifile_name.data()).first;
 	if (!fp)		//no robot replacement file
 		return;
 
@@ -529,148 +564,210 @@ void load_robot_replacements(const d_fname &level_name)
 	auto &Robot_info = LevelSharedRobotInfoState.Robot_info;
 	const auto N_robot_types = LevelSharedRobotInfoState.N_robot_types;
 	for (j=0;j<t;j++) {
-		i = PHYSFSX_readInt(fp);		//read robot number
-		if (i<0 || i>=N_robot_types)
-			Error("Robots number (%d) out of range in (%s).  Range = [0..%d].",i,static_cast<const char *>(level_name),N_robot_types-1);
+		const unsigned i = PHYSFSX_readInt(fp);		//read robot number
+		if (i >= N_robot_types)
+			Error("Robots number (%u) out of range in (%s).  Range = [0..%u].", i, static_cast<const char *>(level_name), N_robot_types- 1);
 		robot_info_read(fp, Robot_info[i]);
 	}
 
 	t = PHYSFSX_readInt(fp);			//read number of joints
+	const auto N_robot_joints = LevelSharedRobotJointState.N_robot_joints;
 	for (j=0;j<t;j++) {
-		i = PHYSFSX_readInt(fp);		//read joint number
-		if (i<0 || i>=N_robot_joints)
-			Error("Robots joint (%d) out of range in (%s).  Range = [0..%d].",i,static_cast<const char *>(level_name),N_robot_joints-1);
+		const unsigned i = PHYSFSX_readInt(fp);		//read joint number
+		if (i >= N_robot_joints)
+			Error("Robots joint (%u) out of range in (%s).  Range = [0..%u].", i, static_cast<const char *>(level_name), N_robot_joints - 1);
 		jointpos_read(fp, Robot_joints[i]);
 	}
 
 	auto &Polygon_models = LevelSharedPolygonModelState.Polygon_models;
+	const auto N_polygon_models = LevelSharedPolygonModelState.N_polygon_models;
 	t = PHYSFSX_readInt(fp);			//read number of polygon models
 	for (j=0;j<t;j++)
 	{
-		i = PHYSFSX_readInt(fp);		//read model number
-		if (i<0 || i>=N_polygon_models)
-			Error("Polygon model (%d) out of range in (%s).  Range = [0..%d].",i,static_cast<const char *>(level_name),N_polygon_models-1);
+		const unsigned i = PHYSFSX_readInt(fp);		//read model number
+		const auto pmi = build_polygon_model_index_from_untrusted(i);
+		if (underlying_value(pmi) >= N_polygon_models)
+			Error("Polygon model (%u) out of range in (%s).  Range = [0..%u].", i, static_cast<const char *>(level_name), N_polygon_models - 1);
 
-		free_model(Polygon_models[i]);
-		polymodel_read(&Polygon_models[i], fp);
-		polygon_model_data_read(&Polygon_models[i], fp);
+		auto &m = Polygon_models[pmi];
+		free_model(m);
+		polymodel_read(m, fp);
+		polygon_model_data_read(&m, fp);
 
-		Dying_modelnums[i] = PHYSFSX_readInt(fp);
-		Dead_modelnums[i] = PHYSFSX_readInt(fp);
+		Dying_modelnums[pmi] = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(fp));
+		Dead_modelnums[pmi] = build_polygon_model_index_from_untrusted(PHYSFSX_readInt(fp));
 	}
 
 	t = PHYSFSX_readInt(fp);			//read number of objbitmaps
 	for (j=0;j<t;j++) {
-		i = PHYSFSX_readInt(fp);		//read objbitmap number
-		if (i < 0 || i >= ObjBitmaps.size())
-			Error("Object bitmap number (%d) out of range in (%s).  Range = [0..%" DXX_PRI_size_type "].", i, static_cast<const char *>(level_name), ObjBitmaps.size() - 1);
-		bitmap_index_read(fp, ObjBitmaps[i]);
+		const auto oi = static_cast<object_bitmap_index>(PHYSFSX_readInt(fp));		//read objbitmap number
+		if (!ObjBitmaps.valid_index(oi))
+			Error("Object bitmap number (%u) out of range in (%s).  Range = [0..%" DXX_PRI_size_type "].", static_cast<unsigned>(oi), static_cast<const char *>(level_name), ObjBitmaps.size() - 1);
+		bitmap_index_read(fp, ObjBitmaps[oi]);
 	}
 
 	t = PHYSFSX_readInt(fp);			//read number of objbitmapptrs
 	for (j=0;j<t;j++) {
-		i = PHYSFSX_readInt(fp);		//read objbitmapptr number
-		if (i < 0 || i >= ObjBitmapPtrs.size())
-			Error("Object bitmap pointer (%d) out of range in (%s).  Range = [0..%" DXX_PRI_size_type "].", i, static_cast<const char *>(level_name), ObjBitmapPtrs.size() - 1);
-		ObjBitmapPtrs[i] = PHYSFSX_readShort(fp);
+		const unsigned i = PHYSFSX_readInt(fp);		//read objbitmapptr number
+		if (i >= ObjBitmapPtrs.size())
+			Error("Object bitmap pointer (%u) out of range in (%s).  Range = [0..%" DXX_PRI_size_type "].", i, static_cast<const char *>(level_name), ObjBitmapPtrs.size() - 1);
+		const auto oi = static_cast<object_bitmap_index>(PHYSFSX_readShort(fp));
+		if (!ObjBitmaps.valid_index(oi))
+			Error("Object bitmap number (%u) out of range in (%s).  Range = [0..%" DXX_PRI_size_type "].", static_cast<unsigned>(oi), static_cast<const char *>(level_name), ObjBitmaps.size() - 1);
+		ObjBitmapPtrs[i] = oi;
 	}
 	Robot_replacements_loaded = 1;
 }
 
+namespace {
 
 /*
  * Routines for loading exit models
  *
  * Used by d1 levels (including some add-ons), and by d2 shareware.
  * Could potentially be used by d2 add-on levels, but only if they
- * don't use "extra" robots...
+ * don't use "extra" robots... or maybe they do
  */
 
 // formerly exitmodel_bm_load_sub
-static bitmap_index read_extra_bitmap_iff(const char * filename )
+static grs_bitmap *read_extra_bitmap_iff(const char * filename, grs_bitmap &n)
 {
-	bitmap_index bitmap_num;
-	grs_bitmap * n = &GameBitmaps[extra_bitmap_num];
 	palette_array_t newpal;
 	int iff_error;		//reference parm to avoid warning message
 
-	bitmap_num.index = 0;
-
 	//MALLOC( new, grs_bitmap, 1 );
-	iff_error = iff_read_bitmap(filename, *n, &newpal);
+	iff_error = iff_read_bitmap(filename, n, &newpal);
 	if (iff_error != IFF_NO_ERROR)		{
 		con_printf(CON_DEBUG, "Error loading exit model bitmap <%s> - IFF error: %s", filename, iff_errormsg(iff_error));
-		return bitmap_num;
+		return nullptr;
 	}
 
-	gr_remap_bitmap_good(*n, newpal, iff_has_transparency ? iff_transparent_color : -1, 254);
+	gr_remap_bitmap_good(n, newpal, iff_has_transparency ? iff_transparent_color : -1, 254);
 
-	n->avg_color = 0;	//compute_average_pixel(new);
-
-	bitmap_num.index = extra_bitmap_num;
-
-	GameBitmaps[extra_bitmap_num++] = *n;
-
-	//d_free( n );
-	return bitmap_num;
+#if !DXX_USE_OGL
+	n.avg_color = 0;	//compute_average_pixel(new);
+#endif
+	return &n;
 }
 
 // formerly load_exit_model_bitmap
 static grs_bitmap *bm_load_extra_objbitmap(const char *name)
 {
-	assert(N_ObjBitmaps < ObjBitmaps.size());
+	const auto oi = static_cast<object_bitmap_index>(N_ObjBitmaps);
+	if (!ObjBitmaps.valid_index(oi))
+		return nullptr;
 	{
-		ObjBitmaps[N_ObjBitmaps] = read_extra_bitmap_iff(name);
-
-		if (ObjBitmaps[N_ObjBitmaps].index == 0)
+		auto &bitmap_idx = ObjBitmaps[oi];
+		const auto bitmap_store_index = bitmap_index{static_cast<uint16_t>(extra_bitmap_num)};
+		grs_bitmap &n = GameBitmaps[bitmap_store_index.index];
+		if (!read_extra_bitmap_iff(name, n))
 		{
-			RAIIdmem<char[]> name2(d_strdup(name));
-			*strrchr(name2.get(), '.') = '\0';
-			ObjBitmaps[N_ObjBitmaps] = read_extra_bitmap_d1_pig(name2.get());
+			const char *const dot = strrchr(name, '.');
+			if (const auto r = read_extra_bitmap_d1_pig(std::span<const char>(name, dot ? std::distance(name, dot) : 8), n); !r)
+				return r;
 		}
-		if (ObjBitmaps[N_ObjBitmaps].index == 0)
-			return NULL;
+		bitmap_idx = bitmap_store_index;
+		++ extra_bitmap_num;
 
-		if (GameBitmaps[ObjBitmaps[N_ObjBitmaps].index].bm_w!=64 || GameBitmaps[ObjBitmaps[N_ObjBitmaps].index].bm_h!=64)
+		if (n.bm_w != 64 || n.bm_h != 64)
 			Error("Bitmap <%s> is not 64x64",name);
-		ObjBitmapPtrs[N_ObjBitmaps] = N_ObjBitmaps;
+		ObjBitmapPtrs[N_ObjBitmaps] = oi;
 		N_ObjBitmaps++;
 		assert(N_ObjBitmaps < ObjBitmaps.size());
-		return &GameBitmaps[ObjBitmaps[N_ObjBitmaps-1].index];
+		return &n;
 	}
 }
 
+static void bm_unload_last_objbitmaps(unsigned count)
+{
+	assert(N_ObjBitmaps >= count);
+
+	unsigned new_N_ObjBitmaps = N_ObjBitmaps - count;
+	range_for (auto &o, partial_range(ObjBitmaps, new_N_ObjBitmaps, N_ObjBitmaps))
+		d_free(GameBitmaps[o.index].bm_mdata);
+	N_ObjBitmaps = new_N_ObjBitmaps;
+}
+
+}
+
+// only called for D2 registered, but there is a D1 check anyway for
+// possible later use
 int load_exit_models()
 {
 	int start_num;
 
-	bm_free_extra_models();
-	bm_free_extra_objbitmaps();
+/*
+	don't free extra models in native D2 mode -- ziplantil. it's our
+	responsibility to make sure the exit stuff is already loaded rather than
+	loading it all again.
 
-	start_num = N_ObjBitmaps;
-	if (!bm_load_extra_objbitmap("steel1.bbm") ||
-		!bm_load_extra_objbitmap("rbot061.bbm") ||
-		!bm_load_extra_objbitmap("rbot062.bbm") ||
-		!bm_load_extra_objbitmap("steel1.bbm") ||
-		!bm_load_extra_objbitmap("rbot061.bbm") ||
-		!bm_load_extra_objbitmap("rbot063.bbm"))
+	however, in D1 mode, we always need to reload everything due to how
+	the exit data is loaded (which is different from D2 native mode)
+*/
+	if (EMULATING_D1) // D1?
 	{
-		con_puts(CON_NORMAL, "Can't load exit models!");
+		bm_free_extra_models(LevelSharedPolygonModelState);
+		bm_free_extra_objbitmaps();
+	}
+	else if (!Exit_bitmaps_loaded)
+	{
+		extra_bitmap_num = Num_bitmap_files;
+	}
+
+	// make sure there is enough space to load textures and models
+	if (!Exit_bitmaps_loaded && N_ObjBitmaps > ObjBitmaps.size() - 6)
+	{
 		return 0;
 	}
-	auto &Polygon_models = LevelSharedPolygonModelState.Polygon_models;
-	if (auto exit_hamfile = PHYSFSX_openReadBuffered("exit.ham"))
+	if (!LevelSharedPolygonModelState.Exit_models_loaded && LevelSharedPolygonModelState.N_polygon_models > MAX_POLYGON_MODELS - 2)
 	{
-		exit_modelnum = N_polygon_models++;
-		destroyed_exit_modelnum = N_polygon_models++;
-		polymodel_read(&Polygon_models[exit_modelnum], exit_hamfile);
-		polymodel_read(&Polygon_models[destroyed_exit_modelnum], exit_hamfile);
-		Polygon_models[exit_modelnum].first_texture = start_num;
-		Polygon_models[destroyed_exit_modelnum].first_texture = start_num+3;
+		return 0;
+	}
 
-		polygon_model_data_read(&Polygon_models[exit_modelnum], exit_hamfile);
+	start_num = N_ObjBitmaps;
+	if (!Exit_bitmaps_loaded)
+	{
+		if (!bm_load_extra_objbitmap("steel1.bbm") ||
+			!bm_load_extra_objbitmap("rbot061.bbm") ||
+			!bm_load_extra_objbitmap("rbot062.bbm") ||
+			!bm_load_extra_objbitmap("steel1.bbm") ||
+			!bm_load_extra_objbitmap("rbot061.bbm") ||
+			!bm_load_extra_objbitmap("rbot063.bbm"))
+		{
+			// unload the textures that we already loaded
+			bm_unload_last_objbitmaps(N_ObjBitmaps - start_num);
+			con_puts(CON_NORMAL, "Can't load exit models!");
+			return 0;
+		}	
+		Exit_bitmap_index = start_num;
+	}
 
-		polygon_model_data_read(&Polygon_models[destroyed_exit_modelnum], exit_hamfile);
+	auto &Polygon_models = LevelSharedPolygonModelState.Polygon_models;
+	const auto N_polygon_models = LevelSharedPolygonModelState.N_polygon_models;
+	if (LevelSharedPolygonModelState.Exit_models_loaded && underlying_value(exit_modelnum) < N_polygon_models && underlying_value(destroyed_exit_modelnum) < N_polygon_models)
+	{
+		// already loaded, just adjust texture indexes
+		Polygon_models[exit_modelnum].first_texture = Exit_bitmap_index;
+		Polygon_models[destroyed_exit_modelnum].first_texture = Exit_bitmap_index+3;
+		return 1;
+	}
+
+	if (auto exit_hamfile = PHYSFSX_openReadBuffered("exit.ham").first)
+	{
+		const auto em = static_cast<polygon_model_index>(N_polygon_models);
+		const auto dem = static_cast<polygon_model_index>(N_polygon_models + 1);
+		LevelSharedPolygonModelState.N_polygon_models = N_polygon_models + 2;
+		exit_modelnum = em;
+		destroyed_exit_modelnum = dem;
+		auto &pem = Polygon_models[em];
+		auto &pdem = Polygon_models[dem];
+		polymodel_read(pem, exit_hamfile);
+		polymodel_read(pdem, exit_hamfile);
+		pem.first_texture = start_num;
+		pdem.first_texture = start_num+3;
+
+		polygon_model_data_read(&pem, exit_hamfile);
+		polygon_model_data_read(&pdem, exit_hamfile);
 	} else if (PHYSFSX_exists("exit01.pof",1) && PHYSFSX_exists("exit01d.pof",1)) {
 
 		exit_modelnum = load_polygon_model("exit01.pof", 3, start_num, NULL);
@@ -681,7 +778,7 @@ int load_exit_models()
 		ogl_cache_polymodel_textures(destroyed_exit_modelnum);
 #endif
 	}
-	else if ((exit_hamfile = PHYSFSX_openReadBuffered(D1_PIGFILE)))
+	else if ((exit_hamfile = PHYSFSX_openReadBuffered(D1_PIGFILE).first))
 	{
 		int offset, offset2;
 		int hamsize;
@@ -698,34 +795,47 @@ int load_exit_models()
 		case D1_10_BIG_PIGSIZE:
 		case D1_10_PIGSIZE:
 			Int3();             /* exit models should be in .pofs */
-			DXX_BOOST_FALLTHROUGH;
+			[[fallthrough]];
 		case D1_OEM_PIGSIZE:
 		case D1_MAC_PIGSIZE:
 		case D1_MAC_SHARE_PIGSIZE:
+			// unload the textures that we already loaded
+			bm_unload_last_objbitmaps(N_ObjBitmaps - start_num);
 			con_puts(CON_NORMAL, "Can't load exit models!");
 			return 0;
 		}
-		PHYSFSX_fseek(exit_hamfile, offset, SEEK_SET);
-		exit_modelnum = N_polygon_models++;
-		destroyed_exit_modelnum = N_polygon_models++;
-		polymodel_read(&Polygon_models[exit_modelnum], exit_hamfile);
-		polymodel_read(&Polygon_models[destroyed_exit_modelnum], exit_hamfile);
-		Polygon_models[exit_modelnum].first_texture = start_num;
-		Polygon_models[destroyed_exit_modelnum].first_texture = start_num+3;
+		PHYSFS_seek(exit_hamfile, offset);
+		const auto em = static_cast<polygon_model_index>(N_polygon_models);
+		const auto dem = static_cast<polygon_model_index>(N_polygon_models + 1);
+		LevelSharedPolygonModelState.N_polygon_models = N_polygon_models + 2;
+		exit_modelnum = em;
+		destroyed_exit_modelnum = dem;
+		auto &pem = Polygon_models[em];
+		auto &pdem = Polygon_models[dem];
+		polymodel_read(pem, exit_hamfile);
+		polymodel_read(pdem, exit_hamfile);
+		pem.first_texture = start_num;
+		pdem.first_texture = start_num+3;
 
-		PHYSFSX_fseek(exit_hamfile, offset2, SEEK_SET);
-		polygon_model_data_read(&Polygon_models[exit_modelnum], exit_hamfile);
-		polygon_model_data_read(&Polygon_models[destroyed_exit_modelnum], exit_hamfile);
+		PHYSFS_seek(exit_hamfile, offset2);
+		polygon_model_data_read(&pem, exit_hamfile);
+		polygon_model_data_read(&pdem, exit_hamfile);
 	} else {
+		// unload the textures that we already loaded
+		bm_unload_last_objbitmaps(N_ObjBitmaps - start_num);
 		con_puts(CON_NORMAL, "Can't load exit models!");
 		return 0;
 	}
 
+	// set to be loaded, but only on D2 - always reload the data on D1
+	LevelSharedPolygonModelState.Exit_models_loaded = Exit_bitmaps_loaded = !EMULATING_D1;
 	return 1;
 }
 #endif
 
-void compute_average_rgb(grs_bitmap *bm, array<fix, 3> &rgb)
+}
+
+void compute_average_rgb(grs_bitmap *bm, std::array<fix, 3> &rgb)
 {
 	rgb = {};
 	if (unlikely(!bm->get_bitmap_data()))
@@ -748,7 +858,7 @@ void compute_average_rgb(grs_bitmap *bm, array<fix, 3> &rgb)
 	if (bm->get_flag_mask(BM_FLAG_RLE))
 	{
 		bm_rle_expand expander(*bm);
-		const auto &&buf = make_unique<uint8_t[]>(bm_w);
+		const auto &&buf = std::make_unique<uint8_t[]>(bm_w);
 		range_for (const uint_fast32_t i, xrange(bm_h))
 		{
 			(void)i;

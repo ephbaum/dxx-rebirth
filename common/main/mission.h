@@ -32,9 +32,7 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "inferno.h"
 #include "dxxsconf.h"
 #include "dsx-ns.h"
-#include "fwd-window.h"
 
-#ifdef __cplusplus
 #include "ntstring.h"
 
 #define MAX_MISSIONS                    5000 // ZICO - changed from 300 to get more levels in list
@@ -75,10 +73,13 @@ constexpr std::integral_constant<uint8_t, 127> MAX_SECRET_LEVELS_PER_MISSION{};	
 #define FULL_MISSION_HOGSIZE        7595079 // v1.1 - 1.2
 #define FULL_10_MISSION_HOGSIZE     7107354 // v1.0
 #define MAC_FULL_MISSION_HOGSIZE    7110007 // v1.1 - 1.2
+#include "movie.h"
 #endif
 
 //where the missions go
 #define MISSION_DIR "missions/"
+
+constexpr std::integral_constant<std::size_t, 128> DXX_MAX_MISSION_PATH_LENGTH{};
 
 /* Path and filename must be kept in sync. */
 class Mission_path
@@ -114,19 +115,26 @@ public:
 	/* Must be in this order for move constructor to work properly */
 	std::string path;				// relative file path
 	std::string::const_iterator filename;          // filename without extension
-#if defined(DXX_BUILD_DESCENT_II)
 	enum class descent_version_type : uint8_t
 	{
+#if defined(DXX_BUILD_DESCENT_II)
+		/* These values are written to the binary savegame as part of
+		 * the mission name.  If the values are reordered or renumbered,
+		 * old savegames will be unable to find the matching mission
+		 * file.
+		 */
 		descent2a,	// !name
 		descent2z,	// zname
 		descent2x,	// xname
 		descent2,
+#endif
 		descent1,
 	};
-#endif
 };
 
 #if defined(DXX_BUILD_DESCENT_I) || defined(DXX_BUILD_DESCENT_II)
+namespace dsx {
+
 struct Mission : Mission_path
 {
 	std::unique_ptr<ubyte[]>	secret_level_table; // originating level no for each secret level 
@@ -144,6 +152,7 @@ struct Mission : Mission_path
 #if defined(DXX_BUILD_DESCENT_II)
 	descent_version_type descent_version;	// descent 1 or descent 2?
 	std::unique_ptr<d_fname> alternate_ham_file;
+	std::unique_ptr<LoadedMovieWithResolution> extra_robot_movie;
 #endif
 	/* Explicitly default move constructor and move operator=
 	 *
@@ -176,17 +185,6 @@ struct Mission : Mission_path
 typedef std::unique_ptr<Mission> Mission_ptr;
 extern Mission_ptr Current_mission; // current mission
 
-#define Current_mission_longname	Current_mission->mission_name
-#define Current_mission_filename	&*Current_mission->filename
-#define Briefing_text_filename		Current_mission->briefing_text_filename
-#define Ending_text_filename		Current_mission->ending_text_filename
-#define Last_level			Current_mission->last_level
-#define Last_secret_level		Current_mission->last_secret_level
-#define N_secret_levels			Current_mission->n_secret_levels
-#define Secret_level_table		Current_mission->secret_level_table
-#define Level_names			Current_mission->level_names
-#define Secret_level_names		Current_mission->secret_level_names
-
 #if defined(DXX_BUILD_DESCENT_II)
 /* Wrap in parentheses to avoid precedence problems.  Put constant on
  * the left to silence clang's overzealous -Wparentheses-equality messages.
@@ -199,13 +197,28 @@ extern Mission_ptr Current_mission; // current mission
 #endif
 #define PLAYING_BUILTIN_MISSION	(Current_mission->builtin_hogsize != 0)
 #define ANARCHY_ONLY_MISSION	(1 == Current_mission->anarchy_only_flag)
+
+}
 #endif
 
 //values for d1 built-in mission
-#define BIMD1_LAST_LEVEL		27
-#define BIMD1_LAST_SECRET_LEVEL		-3
 #define BIMD1_ENDING_FILE_OEM		"endsat.txb"
 #define BIMD1_ENDING_FILE_SHARE		"ending.txb"
+
+#ifdef dsx
+
+namespace dcx {
+
+enum class mission_name_type
+{
+	basename,
+	pathname,
+	guess,
+};
+
+}
+
+namespace dsx {
 
 #if defined(DXX_BUILD_DESCENT_II)
 //values for d2 built-in mission
@@ -216,17 +229,35 @@ int load_mission_ham();
 void bm_read_extra_robots(const char *fname, Mission::descent_version_type type);
 #endif
 
+struct mission_entry_predicate
+{
+	/* May be a basename or may be a path relative to the root of the
+	 * PHYSFS virtual filesystem, depending on what the caller provides.
+	 *
+	 * In both cases, the file extension is omitted.
+	 */
+	const char *filesystem_name;
+#if defined(DXX_BUILD_DESCENT_II)
+	bool check_version;
+	Mission::descent_version_type descent_version;
+#endif
+	mission_entry_predicate with_filesystem_name(const char *fsname) const
+	{
+		mission_entry_predicate m = *this;
+		m.filesystem_name = fsname;
+		return m;
+	}
+};
+
 //loads the named mission if it exists.
 //Returns nullptr if mission loaded ok, else error string.
-const char *load_mission_by_name (const char *mission_name);
-
-//Handles creating and selecting from the mission list.
-//Returns 1 if a mission was loaded.
-int select_mission (int anarchy_mode, const char *message, window_event_result (*when_selected)(void));
+const char *load_mission_by_name (mission_entry_predicate mission_name, mission_name_type);
 
 #if DXX_USE_EDITOR
 void create_new_mission(void);
 #endif
+
+}
 
 #endif
 

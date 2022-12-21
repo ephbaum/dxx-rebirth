@@ -11,14 +11,13 @@
 #include <type_traits>
 #include <physfs.h>
 #include "piggy.h"
-#include "maths.h"
 #include "textures.h"
 #include "fwd-object.h"
 #include "fwd-segment.h"
 #include "cpp-valptridx.h"
 
 namespace dcx {
-using actdoornum_t = uint8_t;
+enum class actdoornum_t : uint8_t;
 constexpr std::integral_constant<std::size_t, 255> MAX_WALLS{}; // Maximum number of walls
 constexpr std::integral_constant<std::size_t, 90> MAX_DOORS{};  // Maximum number of open doors
 struct active_door;
@@ -48,46 +47,15 @@ enum wall_type_t : uint8_t
 	WALL_CLOAKED = 7,   // Can see it, and see through it
 #endif
 };
+
+struct d_level_unique_wall_subsystem_state;
 }
 
 namespace dcx {
-typedef unsigned wall_flag_t;
-constexpr std::integral_constant<wall_flag_t, 1> WALL_BLASTED{};   // Blasted out wall.
-constexpr std::integral_constant<wall_flag_t, 2> WALL_DOOR_OPENED{};   // Open door.
-constexpr std::integral_constant<wall_flag_t, 8> WALL_DOOR_LOCKED{};   // Door is locked.
-constexpr std::integral_constant<wall_flag_t, 16> WALL_DOOR_AUTO{};  // Door automatically closes after time.
-constexpr std::integral_constant<wall_flag_t, 32> WALL_ILLUSION_OFF{};  // Illusionary wall is shut off.
-constexpr std::integral_constant<wall_flag_t, 64> WALL_EXPLODING{};
-}
-#if defined(DXX_BUILD_DESCENT_II)
-namespace dsx {
-constexpr std::integral_constant<wall_flag_t, 128> WALL_BUDDY_PROOF{}; // Buddy assumes he cannot get through this wall.
-}
-#endif
 
-namespace dcx {
-typedef unsigned wall_state_t;
-constexpr std::integral_constant<wall_state_t, 0> WALL_DOOR_CLOSED{};       // Door is closed
-constexpr std::integral_constant<wall_state_t, 1> WALL_DOOR_OPENING{};       // Door is opening.
-constexpr std::integral_constant<wall_state_t, 2> WALL_DOOR_WAITING{};       // Waiting to close
-constexpr std::integral_constant<wall_state_t, 3> WALL_DOOR_CLOSING{};       // Door is closing
-}
-#if defined(DXX_BUILD_DESCENT_II)
-namespace dsx {
-constexpr std::integral_constant<wall_state_t, 4> WALL_DOOR_OPEN{};       // Door is open, and staying open
-constexpr std::integral_constant<wall_state_t, 5> WALL_DOOR_CLOAKING{};       // Wall is going from closed -> open
-constexpr std::integral_constant<wall_state_t, 6> WALL_DOOR_DECLOAKING{};       // Wall is going from open -> closed
-}
-#endif
-
-namespace dcx {
-enum wall_key_t : uint8_t
-{
-	KEY_NONE = 1,
-	KEY_BLUE = 2,
-	KEY_RED = 4,
-	KEY_GOLD = 8,
-};
+enum class wall_flag : uint8_t;
+enum class wall_state : uint8_t;
+enum class wall_key : uint8_t;
 
 constexpr std::integral_constant<fix, 100 * F1_0> WALL_HPS{};    // Normal wall's hp
 constexpr std::integral_constant<fix, 5 * F1_0> WALL_DOOR_INTERVAL{};      // How many seconds a door is open
@@ -106,55 +74,44 @@ constexpr std::integral_constant<std::size_t, 50> MAX_CLIP_FRAMES{};
 }
 
 namespace dcx {
-template <unsigned value>
-struct WALL_IS_DOORWAY_FLAG
+
+enum class WALL_IS_DOORWAY_FLAG : uint8_t
 {
-	constexpr operator unsigned() const { return value; }
-	template <unsigned F2>
-		constexpr WALL_IS_DOORWAY_FLAG<value | F2> operator|(WALL_IS_DOORWAY_FLAG<F2>) const
-		{
-			return {};
-		}
-	void *operator &() const = delete;
+	None = 0,
+	fly = 1,
+	render = 2,
+	rendpast = 4,
+	external = 8,
+	/* if DXX_BUILD_DESCENT_II */
+	cloaked = 16,
+	/* endif */
 };
 
-template <unsigned F>
-struct WALL_IS_DOORWAY_sresult_t
+static constexpr WALL_IS_DOORWAY_FLAG operator|(const WALL_IS_DOORWAY_FLAG a, const WALL_IS_DOORWAY_FLAG b)
 {
-};
+	return static_cast<WALL_IS_DOORWAY_FLAG>(static_cast<uint8_t>(a) | static_cast<uint8_t>(b));
+}
 
-template <unsigned F>
-static inline constexpr WALL_IS_DOORWAY_sresult_t<F> WALL_IS_DOORWAY_sresult(WALL_IS_DOORWAY_FLAG<F>)
+enum class WALL_IS_DOORWAY_sresult_t : unsigned;
+
+static constexpr WALL_IS_DOORWAY_sresult_t WALL_IS_DOORWAY_sresult(WALL_IS_DOORWAY_FLAG F)
 {
-	return {};
+	return WALL_IS_DOORWAY_sresult_t{static_cast<unsigned>(F)};
 }
 
 struct WALL_IS_DOORWAY_result_t;
 
-// WALL_IS_DOORWAY flags.
-constexpr WALL_IS_DOORWAY_FLAG<1> WID_FLY_FLAG{};
-constexpr WALL_IS_DOORWAY_FLAG<2> WID_RENDER_FLAG{};
-constexpr WALL_IS_DOORWAY_FLAG<4> WID_RENDPAST_FLAG{};
-constexpr WALL_IS_DOORWAY_FLAG<8> WID_EXTERNAL_FLAG{};
-}
-#if defined(DXX_BUILD_DESCENT_II)
-namespace dsx {
-constexpr WALL_IS_DOORWAY_FLAG<16> WID_CLOAKED_FLAG{};
-}
-#endif
-
-namespace dcx {
 //  WALL_IS_DOORWAY return values          F/R/RP
-constexpr auto WID_WALL                = WALL_IS_DOORWAY_sresult(WID_RENDER_FLAG);   // 0/1/0        wall
-constexpr auto WID_TRANSPARENT_WALL    = WALL_IS_DOORWAY_sresult(WID_RENDER_FLAG | WID_RENDPAST_FLAG);   // 0/1/1        transparent wall
-constexpr auto WID_ILLUSORY_WALL       = WALL_IS_DOORWAY_sresult(WID_FLY_FLAG | WID_RENDER_FLAG);   // 1/1/0        illusory wall
-constexpr auto WID_TRANSILLUSORY_WALL  = WALL_IS_DOORWAY_sresult(WID_FLY_FLAG | WID_RENDER_FLAG | WID_RENDPAST_FLAG);   // 1/1/1        transparent illusory wall
-constexpr auto WID_NO_WALL             = WALL_IS_DOORWAY_sresult(WID_FLY_FLAG | WID_RENDPAST_FLAG);   //  1/0/1       no wall, can fly through
-constexpr auto WID_EXTERNAL            = WALL_IS_DOORWAY_sresult(WID_EXTERNAL_FLAG);   // 0/0/0/1  don't see it, dont fly through it
+constexpr auto WID_WALL                = WALL_IS_DOORWAY_sresult(WALL_IS_DOORWAY_FLAG::render);   // 0/1/0        wall
+constexpr auto WID_TRANSPARENT_WALL    = WALL_IS_DOORWAY_sresult(WALL_IS_DOORWAY_FLAG::render | WALL_IS_DOORWAY_FLAG::rendpast);   // 0/1/1        transparent wall
+constexpr auto WID_ILLUSORY_WALL       = WALL_IS_DOORWAY_sresult(WALL_IS_DOORWAY_FLAG::fly | WALL_IS_DOORWAY_FLAG::render);   // 1/1/0        illusory wall
+constexpr auto WID_TRANSILLUSORY_WALL  = WALL_IS_DOORWAY_sresult(WALL_IS_DOORWAY_FLAG::fly | WALL_IS_DOORWAY_FLAG::render | WALL_IS_DOORWAY_FLAG::rendpast);   // 1/1/1        transparent illusory wall
+constexpr auto WID_NO_WALL             = WALL_IS_DOORWAY_sresult(WALL_IS_DOORWAY_FLAG::fly | WALL_IS_DOORWAY_FLAG::rendpast);   //  1/0/1       no wall, can fly through
+constexpr auto WID_EXTERNAL            = WALL_IS_DOORWAY_sresult(WALL_IS_DOORWAY_FLAG::external);   // 0/0/0/1  don't see it, dont fly through it
 }
 #if defined(DXX_BUILD_DESCENT_II)
 namespace dsx {
-constexpr auto WID_CLOAKED_WALL        = WALL_IS_DOORWAY_sresult(WID_RENDER_FLAG | WID_RENDPAST_FLAG | WID_CLOAKED_FLAG);
+constexpr auto WID_CLOAKED_WALL        = WALL_IS_DOORWAY_sresult(WALL_IS_DOORWAY_FLAG::render | WALL_IS_DOORWAY_FLAG::rendpast | WALL_IS_DOORWAY_FLAG::cloaked);
 }
 #endif
 #endif
@@ -172,7 +129,6 @@ constexpr std::integral_constant<wall_clip_flag_t, 4> WCF_TMAP1{};       //this 
 constexpr std::integral_constant<wall_clip_flag_t, 8> WCF_HIDDEN{};       //this uses primary tmap, not tmap2
 }
 
-#ifdef dsx
 namespace dsx {
 struct wall;
 struct wclip;
@@ -194,55 +150,40 @@ DXX_VALPTRIDX_DEFINE_SUBTYPE_TYPEDEFS(cloaking_wall, clwall);
 DXX_VALPTRIDX_DECLARE_SUBTYPE(dsx::, wall, wallnum_t, dcx::MAX_WALLS);
 namespace dsx {
 DXX_VALPTRIDX_DEFINE_SUBTYPE_TYPEDEFS(wall, wall);
-using wall_animations_array = array<wclip, MAX_WALL_ANIMS>;
-extern wall_animations_array WallAnims;
-constexpr valptridx<wall>::magic_constant<0xffff> wall_none{};
+using wall_animations_array = std::array<wclip, MAX_WALL_ANIMS>;
+constexpr valptridx<wall>::magic_constant<wallnum_t{0xffffu}> wall_none{};
 }
 
 namespace dcx {
 DXX_VALPTRIDX_DEFINE_SUBTYPE_TYPEDEFS(active_door, actdoor);
 extern unsigned Num_wall_anims;
 }
-#endif
-
-#if DXX_USE_EDITOR
-#ifdef dsx
 namespace dsx {
-void wall_init();
-}
-#endif
-#endif
 
-#if defined(DXX_BUILD_DESCENT_I) || defined(DXX_BUILD_DESCENT_II)
 // Automatically checks if a there is a doorway (i.e. can fly through)
-#ifdef dsx
-namespace dsx {
-WALL_IS_DOORWAY_result_t WALL_IS_DOORWAY(const GameBitmaps_array &GameBitmaps, const Textures_array &Textures, fvcwallptr &vcwallptr, const shared_segment &sseg, const unique_segment &useg, const uint_fast32_t side);
+WALL_IS_DOORWAY_result_t WALL_IS_DOORWAY(const GameBitmaps_array &GameBitmaps, const Textures_array &Textures, fvcwallptr &vcwallptr, cscusegment seg, sidenum_t side);
 
 // Deteriorate appearance of wall. (Changes bitmap (paste-ons))
 }
-#endif
-void wall_damage(vmsegptridx_t seg, unsigned side, fix damage);
+void wall_damage(vmsegptridx_t seg, sidenum_t side, fix damage);
 
 // Destroys a blastable wall. (So it is an opening afterwards)
-void wall_destroy(vmsegptridx_t seg, unsigned side);
+void wall_destroy(vmsegptridx_t seg, sidenum_t side);
 
-#ifdef dsx
 namespace dsx {
 
-void wall_illusion_on(fvmwallptr &, vcsegptridx_t seg, unsigned side);
-void wall_illusion_off(fvmwallptr &, vcsegptridx_t seg, unsigned side);
+void wall_illusion_on(fvmwallptr &, vcsegptridx_t seg, sidenum_t side);
+void wall_illusion_off(fvmwallptr &, vcsegptridx_t seg, sidenum_t side);
 
 // Opens a door
-void wall_open_door(vmsegptridx_t seg, unsigned side);
+void wall_open_door(vmsegptridx_t seg, sidenum_t side);
 
 #if defined(DXX_BUILD_DESCENT_I)
 #elif defined(DXX_BUILD_DESCENT_II)
 // Closes a door
-void wall_close_door(wall_array &Walls, vmsegptridx_t seg, unsigned side);
+void wall_close_door(wall_array &Walls, vmsegptridx_t seg, sidenum_t side);
 #endif
 }
-#endif
 
 //return codes for wall_hit_process()
 enum class wall_hit_process_t : unsigned
@@ -255,51 +196,41 @@ enum class wall_hit_process_t : unsigned
 
 // Determines what happens when a wall is shot
 //obj is the object that hit...either a weapon or the player himself
-#ifdef dsx
 class player_flags;
 namespace dsx {
-wall_hit_process_t wall_hit_process(player_flags, vmsegptridx_t seg, unsigned side, fix damage, unsigned playernum, const object &obj);
+void wall_init(d_level_unique_wall_subsystem_state &LevelUniqueWallSubsystemState);
+wall_hit_process_t wall_hit_process(player_flags, vmsegptridx_t seg, sidenum_t side, fix damage, unsigned playernum, const object &obj);
 
 // Opens/destroys specified door.
-}
-#endif
-void wall_toggle(fvmwallptr &vmwallptr, vmsegptridx_t segnum, unsigned side);
+void wall_toggle(fvmwallptr &vmwallptr, vmsegptridx_t segnum, sidenum_t side);
 
 // Called once per frame..
-#ifdef dsx
-namespace dsx {
-void wall_frame_process();
-}
-#endif
+void wall_frame_process(const d_robot_info_array &Robot_info);
 
 //set the tmap_num or tmap_num2 field for a wall/door
-void wall_set_tmap_num(const wclip &, vmsegptridx_t seg, unsigned side, vmsegptridx_t csegp, unsigned cside, unsigned frame_num);
+void wall_set_tmap_num(const wclip &, vmsegptridx_t seg, sidenum_t side, vmsegptridx_t csegp, sidenum_t cside, unsigned frame_num);
+void wclip_read(PHYSFS_File *, wclip &wc);
+void wall_read(PHYSFS_File *fp, wall &w);
+void wall_write(PHYSFS_File *fp, const wall &w, short version);
+
+void wall_close_door_ref(fvmsegptridx &vmsegptridx, wall_array &Walls, const wall_animations_array &WallAnims, active_door &);
+}
 
 #if defined(DXX_BUILD_DESCENT_II)
 //start wall open <-> closed transitions
 namespace dsx {
-void start_wall_cloak(vmsegptridx_t seg, unsigned side);
-void start_wall_decloak(vmsegptridx_t seg, unsigned side);
+void start_wall_cloak(vmsegptridx_t seg, sidenum_t side);
+void start_wall_decloak(vmsegptridx_t seg, sidenum_t side);
 
 void cloaking_wall_read(cloaking_wall &cw, PHYSFS_File *fp);
 void cloaking_wall_write(const cloaking_wall &cw, PHYSFS_File *fp);
 void blast_nearby_glass(const object &objp, fix damage);
 }
 #endif
-#endif
-
-void wclip_read(PHYSFS_File *, wclip &wc);
-#if 0
-void wclip_write(PHYSFS_File *, const wclip &);
-#endif
 
 void v16_wall_read(PHYSFS_File *fp, v16_wall &w);
 void v19_wall_read(PHYSFS_File *fp, v19_wall &w);
-void wall_read(PHYSFS_File *fp, wall &w);
 
 void active_door_read(PHYSFS_File *fp, active_door &ad);
 void active_door_write(PHYSFS_File *fp, const active_door &ad);
-
-void wall_write(PHYSFS_File *fp, const wall &w, short version);
-void wall_close_door_ref(fvmsegptridx &vmsegptridx, wall_array &Walls, const wall_animations_array &WallAnims, active_door &);
 #endif

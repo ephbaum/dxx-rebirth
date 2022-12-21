@@ -15,20 +15,24 @@
 #include "globvars.h"
 
 namespace dcx {
+namespace {
 
-static void scale_matrix(void);
+static void scale_matrix(fix);
+
+}
 
 //set view from x,y,z, viewer matrix, and zoom.  Must call one of g3_set_view_*() 
 void g3_set_view_matrix(const vms_vector &view_pos,const vms_matrix &view_matrix,fix zoom)
 {
-	View_zoom = zoom;
 	View_position = view_pos;
 	View_matrix = view_matrix;
-	scale_matrix();
+	scale_matrix(zoom);
 }
 
+namespace {
+
 //performs aspect scaling on global view matrix
-static void scale_matrix(void)
+static void scale_matrix(const fix View_zoom)
 {
 	Unscaled_matrix = View_matrix;		//so we can use unscaled if we want
 
@@ -51,6 +55,8 @@ static void scale_matrix(void)
 	vm_vec_scale(View_matrix.rvec,Matrix_scale.x);
 	vm_vec_scale(View_matrix.uvec,Matrix_scale.y);
 	vm_vec_scale(View_matrix.fvec,Matrix_scale.z);
+
+}
 
 }
 

@@ -54,6 +54,7 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "libmve.h"
 #include "text.h"
 #include "screens.h"
+#include "timer.h"
 #include "physfsrwops.h"
 #if DXX_USE_OGL
 #include "ogl_init.h"
@@ -61,6 +62,10 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "args.h"
 
 #include "compiler-range_for.h"
+#include "partial_range.h"
+#include "d_zip.h"
+
+namespace dsx {
 
 namespace {
 
@@ -72,74 +77,71 @@ struct subtitle {
 
 #define MAX_ACTIVE_SUBTITLES 3
 
-struct d_subtitle_state
+struct d_loaded_subtitle_state
 {
 	unsigned Num_subtitles = 0;
 	std::unique_ptr<char[]> subtitle_raw_data;
-	array<subtitle, 500> Subtitles;
+	std::array<subtitle, 500> Subtitles
+#ifndef NDEBUG
+		= {}
+#endif
+		;
 };
 
-static int init_subtitles(d_subtitle_state &SubtitleState, const char *filename);
+static int init_subtitles(d_loaded_subtitle_state &SubtitleState, std::span<const char> filename);
 
 // Movielib data
 
-constexpr array<array<char, 8>, 3> movielib_files{{
+constexpr std::array<std::array<char, 8>, 3> movielib_files{{
 	{"intro"}, {"other"}, {"robots"}
 }};
 
-struct loaded_movie_t
+// Function Prototypes
+static movie_play_status RunMovie(const char *filename, std::span<const char> subtitles, int highres_flag, play_movie_warn_missing, int dx,int dy);
+
+static void draw_subtitles(const d_loaded_subtitle_state &, int frame_num);
+
+//-----------------------------------------------------------------------
+
+struct movie_pause_window : window
 {
-	array<char, FILENAME_LEN + 2> filename;
+	movie_pause_window(grs_canvas &src) :
+		window(src, 0, 0, src.cv_bitmap.bm_w, src.cv_bitmap.bm_h)
+	{
+	}
+	virtual window_event_result event_handler(const d_event &) override;
 };
 
-static loaded_movie_t extra_robot_movie_mission;
-
-static RWops_ptr RoboFile;
-
-// Function Prototypes
-static int RunMovie(const char *filename, const char *subtitles, int highres_flag, int allow_abort,int dx,int dy);
-
-static void draw_subtitles(const d_subtitle_state &, int frame_num);
-
-// ----------------------------------------------------------------------
-static void* MPlayAlloc(size_t size)
-{
-    return d_malloc(size);
 }
 
-static void MPlayFree(void *p)
+}
+
+void *MovieMemoryAllocate(std::size_t size)
 {
-    d_free(p);
+	return d_malloc(size);
+}
+
+void MovieMemoryFree(void *p)
+{
+	d_free(p);
+}
+
+unsigned int MovieFileRead(SDL_RWops *const handle, void *buf, unsigned int count)
+{
+	const unsigned numread = SDL_RWread(handle, buf, 1, count);
+	return (numread == count);
 }
 
 //-----------------------------------------------------------------------
 
-static unsigned int FileRead(void *handle, void *buf, unsigned int count)
-{
-    unsigned numread;
-    numread = SDL_RWread(reinterpret_cast<SDL_RWops *>(handle), buf, 1, count);
-    return (numread == count);
-}
-
-}
-
-//-----------------------------------------------------------------------
-
+namespace dsx {
 
 //filename will actually get modified to be either low-res or high-res
 //returns status.  see values in movie.h
-int PlayMovie(const char *subtitles, const char *filename, int must_have)
+movie_play_status PlayMovie(const std::span<const char> subtitles, const char *const name, const play_movie_warn_missing must_have)
 {
-	char name[FILENAME_LEN],*p;
-	int ret;
-
 	if (GameArg.SysNoMovies)
-		return MOVIE_NOT_PLAYED;
-
-	strcpy(name,filename);
-
-	if ((p=strchr(name,'.')) == NULL)		//add extension, if missing
-		strcat(name,".MVE");
+		return movie_play_status::skipped;
 
 	// Stop all digital sounds currently playing.
 	digi_stop_digi_sounds();
@@ -154,7 +156,7 @@ int PlayMovie(const char *subtitles, const char *filename, int must_have)
 	// Start sound
 	MVE_sndInit(!CGameArg.SndNoSound ? 1 : -1);
 
-	ret = RunMovie(name, subtitles, !GameArg.GfxSkipHiresMovie, must_have, -1, -1);
+	const auto ret = RunMovie(name, subtitles, !GameArg.GfxSkipHiresMovie, must_have, -1, -1);
 
 	// MD2211: if using SDL_Mixer, we never reinit the sound system
 	if (!CGameArg.SndNoSound
@@ -163,13 +165,12 @@ int PlayMovie(const char *subtitles, const char *filename, int must_have)
 		digi_init();
 
 	Screen_mode = -1;		//force screen reset
-
 	return ret;
 }
 
-namespace {
+}
 
-static void MovieShowFrame(ubyte *buf, int dstx, int dsty, int bufw, int bufh, int sw, int sh)
+void MovieShowFrame(const uint8_t *buf, int dstx, int dsty, int bufw, int bufh, int sw, int sh)
 {
 	grs_bitmap source_bm;
 	static palette_array_t old_pal;
@@ -215,7 +216,7 @@ static void MovieShowFrame(ubyte *buf, int dstx, int dsty, int bufw, int bufh, i
 	ogl_ubitblt_i(
 		bufw*scale, bufh*scale,
 		dstx, dsty,
-		bufw, bufh, 0, 0, source_bm, grd_curcanv->cv_bitmap, (GameCfg.MovieTexFilt)?OGL_TEXFILT_TRLINEAR:OGL_TEXFILT_CLASSIC);
+		bufw, bufh, 0, 0, source_bm, grd_curcanv->cv_bitmap, (GameCfg.MovieTexFilt) ? opengl_texture_filter::trilinear : opengl_texture_filter::classic);
 
 	glEnable (GL_BLEND);
 #else
@@ -224,7 +225,7 @@ static void MovieShowFrame(ubyte *buf, int dstx, int dsty, int bufw, int bufh, i
 }
 
 //our routine to set the pallete, called from the movie code
-static void MovieSetPalette(const unsigned char *p, unsigned start, unsigned count)
+void MovieSetPalette(const unsigned char *p, unsigned start, unsigned count)
 {
 	if (count == 0)
 		return;
@@ -242,43 +243,51 @@ static void MovieSetPalette(const unsigned char *p, unsigned start, unsigned cou
 	memcpy(&gr_palette[start],p+start*3,count*3);
 }
 
-struct movie : ignore_window_pointer_t
+namespace dsx {
+
+namespace {
+
+struct movie : window
 {
-	MVE_StepStatus result;
-	int aborted;
-	int frame_num;
-	int paused;
-	MVESTREAM_ptr_t pMovie;
-	d_subtitle_state SubtitleState;
+	MVE_StepStatus result = MVE_StepStatus::EndOfFile;
+	int frame_num = 0;
+	int paused = 0;
+	const MVESTREAM_ptr_t pMovie;
+	d_loaded_subtitle_state SubtitleState;
+	movie(grs_canvas &src, MVESTREAM_ptr_t mvestream) :
+		window(src, 0, 0, src.cv_bitmap.bm_w, src.cv_bitmap.bm_h),
+		pMovie(std::move(mvestream))
+	{
+	}
+	virtual window_event_result event_handler(const d_event &) override;
 };
 
-static window_event_result show_pause_message(window *, const d_event &event, const unused_window_userdata_t *)
+window_event_result movie_pause_window::event_handler(const d_event &event)
 {
-	window_event_result result;
-
 	switch (event.type)
 	{
 		case EVENT_MOUSE_BUTTON_DOWN:
-			if (event_mouse_get_button(event) != 0)
+			if (event_mouse_get_button(event) != mbtn::left)
 				return window_event_result::ignored;
-			DXX_BOOST_FALLTHROUGH;
+			[[fallthrough]];
 		case EVENT_KEY_COMMAND:
-			if ((result = call_default_handler(event)) == window_event_result::ignored)
-			{
+			if (const auto result = call_default_handler(event); result == window_event_result::ignored)
 				return window_event_result::close;
-			}
-			return result;
+			else
+				return result;
+		case EVENT_IDLE:
+			timer_delay(F1_0 / 4);
+			break;
 
 		case EVENT_WINDOW_DRAW:
 		{
 			const char *msg = TXT_PAUSE;
-			int h;
 			int y;
 
 			gr_set_default_canvas();
 			auto &canvas = *grd_curcanv;
 			const auto &game_font = *GAME_FONT;
-			gr_get_string_size(game_font, msg, nullptr, &h, nullptr);
+			const auto h = gr_get_string_size(game_font, msg).height;
 
 			y = (grd_curscreen->get_screen_height() - h) / 2;
 
@@ -294,66 +303,63 @@ static window_event_result show_pause_message(window *, const d_event &event, co
 	return window_event_result::ignored;
 }
 
-static window_event_result MovieHandler(window *, const d_event &event, movie *m)
+window_event_result movie::event_handler(const d_event &event)
 {
-	int key;
-
 	switch (event.type)
 	{
 		case EVENT_WINDOW_ACTIVATED:
-			m->paused = 0;
+			paused = 0;
 			break;
 
 		case EVENT_WINDOW_DEACTIVATED:
-			m->paused = 1;
+			paused = 1;
 			MVE_rmHoldMovie();
 			break;
 
 		case EVENT_KEY_COMMAND:
-			key = event_key_get(event);
+			{
+				const auto key = event_key_get(event);
 
 			// If ESCAPE pressed, then quit movie.
 			if (key == KEY_ESC) {
-				m->result = MVE_StepStatus::EndOfFile;
-				m->aborted = 1;
 				return window_event_result::close;
 			}
 
 			// If PAUSE pressed, then pause movie
 			if ((key == KEY_PAUSE) || (key == KEY_COMMAND + KEY_P))
 			{
-				if (window_create(grd_curscreen->sc_canvas, 0, 0, SWIDTH, SHEIGHT, show_pause_message, unused_window_userdata))
+				if (auto pause_window = window_create<movie_pause_window>(w_canv))
+				{
+					(void)pause_window;
 					MVE_rmHoldMovie();
+				}
 				return window_event_result::handled;
 			}
 			break;
+			}
 
 		case EVENT_WINDOW_DRAW:
-			if (!m->paused)
+			if (!paused)
 			{
-				m->result = MVE_rmStepMovie(*m->pMovie.get());
-				if (m->result != MVE_StepStatus::Continue)
-				{
+				result = MVE_rmStepMovie(*pMovie.get());
+				if (result == MVE_StepStatus::EndOfFile)
 					return window_event_result::close;
+				if (result != MVE_StepStatus::Continue)
+				{
+					return window_event_result::handled;
 				}
 			}
 
-			draw_subtitles(m->SubtitleState, m->frame_num);
+			draw_subtitles(SubtitleState, frame_num);
 
 			gr_palette_load(gr_palette);
 
-			if (!m->paused)
-				m->frame_num++;
+			if (!paused)
+				frame_num++;
 			break;
 
 		case EVENT_WINDOW_CLOSE:
-			if (Quitting)
-			{
-				m->result = MVE_StepStatus::EndOfFile;
-				m->aborted = 1;
-			}
 			break;
-			
 		default:
 			break;
 	}
@@ -361,41 +367,31 @@ static window_event_result MovieHandler(window *, const d_event &event, movie *m
 }
 
 //returns status.  see movie.h
-int RunMovie(const char *const filename, const char *const subtitles, const int hires_flag, const int must_have, const int dx, const int dy)
+movie_play_status RunMovie(const char *const filename, const std::span<const char> subtitles, const int hires_flag, const play_movie_warn_missing warn_missing, const int dx, const int dy)
 {
-	movie m;
 	int track = 0;
-	int aborted = 0;
 #if DXX_USE_OGL
 	palette_array_t pal_save;
 #endif
 
-	init_subtitles(m.SubtitleState, subtitles);
-
-	m.result = MVE_StepStatus::EndOfFile;
-	m.aborted = 0;
-	m.frame_num = 0;
-	m.paused = 0;
-
 	// Open Movie file.  If it doesn't exist, no movie, just return.
 
-	auto filehndl = PHYSFSRWOPS_openRead(filename);
+	auto &&[filehndl, physfserr] = PHYSFSRWOPS_openRead(filename);
 	if (!filehndl)
 	{
-		con_printf(must_have ? CON_URGENT : CON_VERBOSE, "Failed to open movie <%s>: %s", filename, PHYSFS_getLastError());
-		return MOVIE_NOT_PLAYED;
+		con_printf(warn_missing == play_movie_warn_missing::verbose ? CON_VERBOSE : CON_URGENT, "Failed to open movie <%s>: %s", filename, PHYSFS_getErrorByCode(physfserr));
+		return movie_play_status::skipped;
+	}
+	MVESTREAM_ptr_t mvestream;
+	if (MVE_rmPrepMovie(mvestream, filehndl.get(), dx, dy, track))
+	{
+		return movie_play_status::skipped;
 	}
 	const auto reshow = hide_menus();
-	const auto wind = window_create(grd_curscreen->sc_canvas, 0, 0, SWIDTH, SHEIGHT, MovieHandler, &m);
-	if (!wind)
-	{
-		if (reshow)
-			show_menus();
-		return MOVIE_NOT_PLAYED;
-	}
-
-	MVE_memCallbacks(MPlayAlloc, MPlayFree);
-	MVE_ioCallbacks(FileRead);
+	auto wind = window_create<movie>(grd_curscreen->sc_canvas, std::move(mvestream));
+	bool exists = true;
+	wind->track(&exists);
+	init_subtitles(wind->SubtitleState, subtitles);
 
 #if DXX_USE_OGL
 	set_screen_mode(SCREEN_MOVIE);
@@ -405,32 +401,13 @@ int RunMovie(const char *const filename, const char *const subtitles, const int 
 #else
 	gr_set_mode(hires_flag ? screen_mode{640, 480} : screen_mode{320, 200});
 #endif
-	MVE_sfCallbacks(MovieShowFrame);
-	MVE_palCallbacks(MovieSetPalette);
 
-	if (MVE_rmPrepMovie(m.pMovie, filehndl.get(), dx, dy, track)) {
-		Int3();
-		window_close(wind);
-		if (reshow)
-			show_menus();
-		return MOVIE_NOT_PLAYED;
-	}
+	while (exists)
+		event_process();
+	wind = nullptr;
 
-	MVE_sfCallbacks(MovieShowFrame);
-	MVE_palCallbacks(MovieSetPalette);
-
-	do {
-		event_process_all();
-	} while(window_get_front() == wind);
-
-	assert(m.aborted || m.result == MVE_StepStatus::EndOfFile);	 ///movie should be over
-
-	m.pMovie.reset();
-
-	filehndl.reset();                           // Close Movie File
 	if (reshow)
 		show_menus();
-	aborted = m.aborted;
 
 	// Restore old graphic state
 
@@ -440,21 +417,21 @@ int RunMovie(const char *const filename, const char *const subtitles, const int 
 	gr_palette_load(pal_save);
 #endif
 
-	return (aborted?MOVIE_ABORTED:MOVIE_PLAYED_FULL);
+	return movie_play_status::started;
 }
 
 }
 
 //returns 1 if frame updated ok
-int RotateRobot(MVESTREAM_ptr_t &pMovie)
+int RotateRobot(MVESTREAM_ptr_t &pMovie, SDL_RWops *const RoboFile)
 {
 	auto err = MVE_rmStepMovie(*pMovie.get());
 	gr_palette_load(gr_palette);
 
 	if (err == MVE_StepStatus::EndOfFile)     //end of movie, so reset
 	{
-		SDL_RWseek(RoboFile.get(), 0, SEEK_SET);
-		if (MVE_rmPrepMovie(pMovie, RoboFile.get(), SWIDTH/2.3, SHEIGHT/2.3, 0))
+		SDL_RWseek(RoboFile, 0, SEEK_SET);
+		if (MVE_rmPrepMovie(pMovie, RoboFile, SWIDTH/2.3, SHEIGHT/2.3, 0))
 		{
 			Int3();
 			return 0;
@@ -470,40 +447,31 @@ int RotateRobot(MVESTREAM_ptr_t &pMovie)
 	return 1;
 }
 
-
 void DeInitRobotMovie(MVESTREAM_ptr_t &pMovie)
 {
 	pMovie.reset();
-	RoboFile.reset();                           // Close Movie File
 }
 
-
-int InitRobotMovie(const char *filename, MVESTREAM_ptr_t &pMovie)
+RWops_ptr InitRobotMovie(const char *filename, MVESTREAM_ptr_t &pMovie)
 {
 	if (GameArg.SysNoMovies)
-		return 0;
+		return nullptr;
 
 	con_printf(CON_DEBUG, "RoboFile=%s", filename);
 
-	MVE_memCallbacks(MPlayAlloc, MPlayFree);
-	MVE_ioCallbacks(FileRead);
-	MVE_sfCallbacks(MovieShowFrame);
-	MVE_palCallbacks(MovieSetPalette);
 	MVE_sndInit(-1);        //tell movies to play no sound for robots
 
-	RoboFile = PHYSFSRWOPS_openRead(filename);
-
+	auto &&[RoboFile, physfserr] = PHYSFSRWOPS_openRead(filename);
 	if (!RoboFile)
 	{
-		con_printf(CON_URGENT, "Can't open movie <%s>: %s", filename, PHYSFS_getLastError());
-		return MOVIE_NOT_PLAYED;
+		con_printf(CON_URGENT, "Failed to open movie <%s>: %s", filename, PHYSFS_getErrorByCode(physfserr));
+		return nullptr;
 	}
 	if (MVE_rmPrepMovie(pMovie, RoboFile.get(), SWIDTH/2.3, SHEIGHT/2.3, 0)) {
 		Int3();
-		return 0;
+		return nullptr;
 	}
-
-	return 1;
+	return std::move(RoboFile);
 }
 
 namespace {
@@ -530,9 +498,9 @@ static char *next_field (char *p)
 	return p;
 }
 
-static int init_subtitles(d_subtitle_state &SubtitleState, const char *const filename)
+static int init_subtitles(d_loaded_subtitle_state &SubtitleState, const std::span<const char> filename)
 {
-	if (!filename)
+	if (filename.empty())
 		return 0;
 	int size,read_count;
 	char *p;
@@ -546,26 +514,31 @@ static int init_subtitles(d_subtitle_state &SubtitleState, const char *const fil
 		return 0;
 	}
 
-	auto ifile = PHYSFSX_openReadBuffered(filename);		//try text version
+	auto &&[ifile, physfserr] = PHYSFSX_openReadBuffered(filename.data());		//try text version
 
 	if (!ifile) {								//no text version, try binary version
-		char filename2[FILENAME_LEN];
-		change_filename_extension(filename2, filename, ".txb");
-		ifile = PHYSFSX_openReadBuffered(filename2);
-		if (!ifile)
+		std::array<char, FILENAME_LEN> filename2;
+		if (!change_filename_extension(filename2, filename.data(), "txb"))
 		{
-			con_printf(CON_VERBOSE, "Rebirth: skipping subtitles because cannot open \"%s\" or \"%s\"", filename, filename2);
+			con_printf(CON_NORMAL, "Rebirth: skipping subtitles because cannot open \"%s\" (\"%s\")", filename.data(), PHYSFS_getErrorByCode(physfserr));
 			return 0;
 		}
+		auto &&[ifile2, physfserr2] = PHYSFSX_openReadBuffered(filename2.data());
+		if (!ifile2)
+		{
+			con_printf(CON_VERBOSE, "Rebirth: skipping subtitles because cannot open \"%s\" or \"%s\" (\"%s\", \"%s\")", filename.data(), filename2.data(), PHYSFS_getErrorByCode(physfserr), PHYSFS_getErrorByCode(physfserr2));
+			return 0;
+		}
+		ifile = std::move(ifile2);
 		have_binary = 1;
-		con_printf(CON_VERBOSE, "Rebirth: found encoded subtitles in \"%s\"", filename2);
+		con_printf(CON_VERBOSE, "Rebirth: found encoded subtitles in \"%s\"", filename2.data());
 	}
 	else
-		con_printf(CON_VERBOSE, "Rebirth: found text subtitles in \"%s\"", filename);
+		con_printf(CON_VERBOSE, "Rebirth: found text subtitles in \"%s\"", filename.data());
 
 	size = PHYSFS_fileLength(ifile);
 
-	const auto subtitle_raw_data = (SubtitleState.subtitle_raw_data = make_unique<char[]>(size + 1)).get();
+	const auto subtitle_raw_data = (SubtitleState.subtitle_raw_data = std::make_unique<char[]>(size + 1)).get();
 	read_count = PHYSFS_read(ifile, subtitle_raw_data, 1, size);
 	ifile.reset();
 
@@ -613,9 +586,9 @@ static int init_subtitles(d_subtitle_state &SubtitleState, const char *const fil
 }
 
 //draw the subtitles for this frame
-static void draw_subtitles(const d_subtitle_state &SubtitleState, const int frame_num)
+static void draw_subtitles(const d_loaded_subtitle_state &SubtitleState, const int frame_num)
 {
-	static int active_subtitles[MAX_ACTIVE_SUBTITLES];
+	static std::array<uint16_t, MAX_ACTIVE_SUBTITLES> active_subtitles;
 	static int next_subtitle;
 	static unsigned num_active_subtitles;
 	int y;
@@ -624,7 +597,7 @@ static void draw_subtitles(const d_subtitle_state &SubtitleState, const int fram
 	if (frame_num == 0) {
 		num_active_subtitles = 0;
 		next_subtitle = 0;
-		gr_set_curfont(*grd_curcanv, GAME_FONT);
+		gr_set_curfont(*grd_curcanv, *GAME_FONT);
 		gr_set_fontcolor(*grd_curcanv, 255, -1);
 	}
 
@@ -655,71 +628,77 @@ static void draw_subtitles(const d_subtitle_state &SubtitleState, const int fram
 
 	//erase old subtitles if necessary
 	if (must_erase) {
-		gr_rect(*grd_curcanv, 0,y,grd_curcanv->cv_bitmap.bm_w-1,grd_curcanv->cv_bitmap.bm_h-1, 0);
+		gr_rect(*grd_curcanv, 0,y,grd_curcanv->cv_bitmap.bm_w-1,grd_curcanv->cv_bitmap.bm_h-1, color_palette_index{0});
 	}
 
 	//now draw the current subtitles
 	range_for (const auto &t, partial_range(active_subtitles, num_active_subtitles))
-		if (t != -1)
 		{
 			gr_string(*grd_curcanv, *grd_curcanv->cv_font, 0x8000, y, Subtitles[t].msg);
 			y += line_spacing;
 		}
 }
 
-static int init_movie(const char *movielib, char resolution, int required, loaded_movie_t &movie)
+static PHYSFS_ErrorCode init_movie(const char *movielib, char resolution, int required, LoadedMovie &movie)
 {
-	snprintf(&movie.filename[0], movie.filename.size(), "%s-%c.mvl", movielib, resolution);
-	auto r = PHYSFSX_contfile_init(&movie.filename[0], 0);
-	if (!r)
+	std::array<char, FILENAME_LEN + 2> filename;
+	snprintf(&filename[0], filename.size(), "%s-%c.mvl", movielib, resolution);
+	auto r = PHYSFSX_addRelToSearchPath(&filename[0], movie.pathname, physfs_search_path::prepend);
+	if (r != PHYSFS_ERR_OK)
 	{
-		if (required || CGameArg.DbgVerbose)
-			con_printf(CON_URGENT, "Can't open movielib <%s>: %s", &movie.filename[0], PHYSFS_getLastError());
-		movie.filename[0] = 0;
+		movie.pathname[0] = 0;
+		con_printf(required ? CON_URGENT : CON_VERBOSE, "Failed to open movielib <%s>: %s", &filename[0], PHYSFS_getErrorByCode(r));
 	}
 	return r;
 }
 
-static void init_movie(const char *movielib, int required, loaded_movie_t &movie)
+static std::pair<PHYSFS_ErrorCode, movie_resolution> init_movie(const char *movielib, int required, LoadedMovie &movie)
 {
 	if (!GameArg.GfxSkipHiresMovie)
 	{
-		if (init_movie(movielib, 'h', required, movie))
-			return;
+		if (auto r = init_movie(movielib, 'h', required, movie); r == PHYSFS_ERR_OK)
+			return {r, movie_resolution::high};
 	}
-	init_movie(movielib, 'l', required, movie);
+	return {init_movie(movielib, 'l', required, movie), movie_resolution::low};
 }
 
 }
 
 //find and initialize the movie libraries
-void init_movies()
+std::unique_ptr<BuiltinMovies> init_movies()
 {
 	if (GameArg.SysNoMovies)
-		return;
+		return nullptr;
 
-	range_for (auto &i, movielib_files)
-	{
-		loaded_movie_t m;
-		init_movie(&i[0], 1, m);
-	}
+	auto r = std::make_unique<BuiltinMovies>();
+	for (auto &&[f, m] : zip(movielib_files, r->movies))
+		init_movie(&f[0], 1, m);
+	return r;
 }
 
-void close_extra_robot_movie()
+LoadedMovie::~LoadedMovie()
 {
-	const auto movielib = &extra_robot_movie_mission.filename[0];
+	const auto movielib = pathname.data();
 	if (!*movielib)
 		return;
-	if (!PHYSFSX_contfile_close(movielib))
-	{
-		con_printf(CON_URGENT, "Can't close movielib <%s>: %s", movielib, PHYSFS_getLastError());
-	}
-	*movielib = 0;
+	if (!PHYSFS_unmount(movielib))
+		con_printf(CON_URGENT, "Cannot close movielib <%s>: %s", movielib, PHYSFS_getLastError());
+	else
+		con_printf(CON_VERBOSE, "Unloaded movielib <%s>", movielib);
 }
 
-void init_extra_robot_movie(const char *movielib)
+std::unique_ptr<LoadedMovieWithResolution> init_extra_robot_movie(const char *movielib)
 {
 	if (GameArg.SysNoMovies)
-		return;
-	init_movie(movielib, 0, extra_robot_movie_mission);
+		return nullptr;
+	auto r = std::make_unique<LoadedMovieWithResolution>();
+	if (auto &&[code, resolution] = init_movie(movielib, 0, *r); code != PHYSFS_ERR_OK)
+		return nullptr;
+	else
+	{
+		r->resolution = resolution;
+		return r;
+	}
+}
+
 }

@@ -35,38 +35,31 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "pstypes.h"
 #include "console.h"
 #include "physfsx.h"
-#include "key.h"
 #include "gr.h"
 #include "palette.h"
 #include "fmtcheck.h"
 
 #include "inferno.h"
-#if DXX_USE_EDITOR
-#include "editor/editor.h"
-#endif
 #include "dxxerror.h"
 #include "object.h"
 #include "wall.h"
-#include "gamemine.h"
 #include "gameseg.h"
 #include "robot.h"
-#include "player.h"
 #include "newmenu.h"
 #include "textures.h"
-
+#include "text.h"
 #include "bm.h"
-#include "menu.h"
 #include "switch.h"
 #include "fuelcen.h"
 #include "powerup.h"
-#include "gameseq.h"
 #include "polyobj.h"
 #include "gamesave.h"
 #include "piggy.h"
 
 #include "compiler-range_for.h"
 #include "d_enumerate.h"
-#include "d_range.h"
+#include "d_levelstate.h"
+#include "d_underlying_value.h"
 #include "d_zip.h"
 #include "segiter.h"
 
@@ -75,19 +68,19 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 namespace dsx {
 namespace {
 #if defined(DXX_BUILD_DESCENT_I)
-using perm_tmap_buffer_type = array<int, MAX_TEXTURES>;
-using level_tmap_buffer_type = array<int8_t, MAX_TEXTURES>;
-using wall_buffer_type = array<int, MAX_WALL_ANIMS>;
+using perm_tmap_buffer_type = std::array<int, MAX_TEXTURES>;
+using level_tmap_buffer_type = std::array<int8_t, MAX_TEXTURES>;
+using wall_buffer_type = std::array<int, MAX_WALL_ANIMS>;
 #elif defined(DXX_BUILD_DESCENT_II)
-using perm_tmap_buffer_type = array<int, MAX_BITMAP_FILES>;
-using level_tmap_buffer_type = array<int8_t, MAX_BITMAP_FILES>;
-using wall_buffer_type = array<int, MAX_BITMAP_FILES>;
+using perm_tmap_buffer_type = std::array<int, MAX_BITMAP_FILES>;
+using level_tmap_buffer_type = std::array<int8_t, MAX_BITMAP_FILES>;
+using wall_buffer_type = std::array<int, MAX_BITMAP_FILES>;
 #endif
 }
 }
 
 namespace dcx {
-const array<char[10], 7> Wall_names{{
+const std::array<char[10], 7> Wall_names{{
 	"NORMAL   ",
 	"BLASTABLE",
 	"DOOR     ",
@@ -98,11 +91,14 @@ const array<char[10], 7> Wall_names{{
 }};
 }
 
-static void dump_used_textures_level(PHYSFS_File *my_file, int level_num);
+namespace {
+static void dump_used_textures_level(PHYSFS_File *my_file, int level_num, const char *Gamesave_current_filename);
 static void say_totals(fvcobjptridx &vcobjptridx, PHYSFS_File *my_file, const char *level_name);
+}
 
 namespace dsx {
-const array<char[9], MAX_OBJECT_TYPES> Object_type_names{{
+namespace {
+const std::array<char[9], MAX_OBJECT_TYPES> Object_type_names{{
 	"WALL    ",
 	"FIREBALL",
 	"ROBOT   ",
@@ -131,6 +127,9 @@ static const char *object_types(const object_base &objp)
 	return &Object_type_names[type][0];
 }
 }
+}
+
+namespace {
 
 // ----------------------------------------------------------------------------
 static const char *object_ids(const object_base &objp)
@@ -146,73 +145,63 @@ static const char *object_ids(const object_base &objp)
 	}
 }
 
-static void err_puts(PHYSFS_File *f, const char *str, size_t len) __attribute_nonnull();
-static void err_puts(PHYSFS_File *f, const char *str, size_t len)
-#define err_puts(A1,S,...)	(err_puts(A1,S, _dxx_call_puts_parameter2(1, ## __VA_ARGS__, strlen(S))))
+static void err_puts(PHYSFS_File *f, const std::span<const char> str)
 {
-	con_puts(CON_CRITICAL, str, len);
+	++Errors_in_mine;
+	con_puts(CON_CRITICAL, str.data(), str.size());
 	PHYSFSX_puts(f, str);
-	Errors_in_mine++;
 }
 
-template <size_t len>
-static void err_puts_literal(PHYSFS_File *f, const char (&str)[len]) __attribute_nonnull();
-template <size_t len>
+template <std::size_t len>
 static void err_puts_literal(PHYSFS_File *f, const char (&str)[len])
 {
-	err_puts(f, str, len);
+	err_puts(f, {str, len - 1});
 }
 
-static void err_printf(PHYSFS_File *my_file, const char * format, ... ) __attribute_format_printf(2, 3);
+void err_printf(PHYSFS_File *my_file, const char * format) = delete;
+
+__attribute_format_printf(2, 3)
 static void err_printf(PHYSFS_File *my_file, const char * format, ... )
-#define err_printf(A1,F,...)	dxx_call_printf_checked(err_printf,err_puts_literal,(A1),(F),##__VA_ARGS__)
 {
 	va_list	args;
 	char		message[256];
 
 	va_start(args, format );
-	size_t len = vsnprintf(message,sizeof(message),format,args);
+	const std::size_t len = std::max(vsnprintf(message, sizeof(message), format, args), 0);
 	va_end(args);
-	err_puts(my_file, message, len);
+	err_puts(my_file, {message, len});
 }
 
-static void warning_puts(PHYSFS_File *f, const char *str, size_t len) __attribute_nonnull();
-static void warning_puts(PHYSFS_File *f, const char *str, size_t len)
-#define warning_puts(A1,S,...)	(warning_puts(A1,S, _dxx_call_puts_parameter2(1, ## __VA_ARGS__, strlen(S))))
+static void warning_puts(PHYSFS_File *f, const std::span<const char> str)
 {
-	con_puts(CON_URGENT, str, len);
+	con_puts(CON_URGENT, str.data(), str.size());
 	PHYSFSX_puts(f, str);
 }
 
-template <size_t len>
-static void warning_puts_literal(PHYSFS_File *f, const char (&str)[len]) __attribute_nonnull();
-template <size_t len>
-static void warning_puts_literal(PHYSFS_File *f, const char (&str)[len])
-{
-	warning_puts(f, str, len);
-}
+void warning_printf(PHYSFS_File *my_file, const char *format) = delete;
 
 static void warning_printf(PHYSFS_File *my_file, const char * format, ... ) __attribute_format_printf(2, 3);
 static void warning_printf(PHYSFS_File *my_file, const char * format, ... )
-#define warning_printf(A1,F,...)	dxx_call_printf_checked(warning_printf,warning_puts_literal,(A1),(F),##__VA_ARGS__)
 {
 	va_list	args;
 	char		message[256];
 
 	va_start(args, format );
-	vsnprintf(message,sizeof(message),format,args);
+	const std::size_t written = std::max(vsnprintf(message, sizeof(message), format, args), 0);
 	va_end(args);
-	warning_puts(my_file, message);
+	warning_puts(my_file, {message, written});
+}
 }
 
 // ----------------------------------------------------------------------------
 namespace dsx {
+namespace {
 static void write_exit_text(fvcsegptridx &vcsegptridx, fvcwallptridx &vcwallptridx, PHYSFS_File *my_file)
 {
 	int	count;
 
-	PHYSFSX_printf(my_file, "-----------------------------------------------------------------------------\n");
-	PHYSFSX_printf(my_file, "Exit stuff\n");
+	PHYSFSX_puts_literal(my_file, "-----------------------------------------------------------------------------\n");
+	PHYSFSX_puts_literal(my_file, "Exit stuff\n");
 
 	//	---------- Find exit triggers ----------
 	count=0;
@@ -225,7 +214,7 @@ static void write_exit_text(fvcsegptridx &vcsegptridx, fvcwallptridx &vcwallptri
 			int	count2;
 
 			const auto i = t.get_unchecked_index();
-			PHYSFSX_printf(my_file, "Trigger %2i, is an exit trigger with %i links.\n", i, t->num_links);
+			PHYSFSX_printf(my_file, "Trigger %2i, is an exit trigger with %i links.\n", underlying_value(i), t->num_links);
 			count++;
 			if (t->num_links != 0)
 				err_printf(my_file, "Error: Exit triggers must have 0 links, this one has %i links.", t->num_links);
@@ -237,47 +226,48 @@ static void write_exit_text(fvcsegptridx &vcsegptridx, fvcwallptridx &vcwallptri
 				if (w->trigger == i)
 				{
 					count2++;
-					PHYSFSX_printf(my_file, "Exit trigger %i is in segment %i, on side %i, bound to wall %i\n", i, w->segnum, w->sidenum, static_cast<wallnum_t>(w));
+					PHYSFSX_printf(my_file, "Exit trigger %i is in segment %i, on side %i, bound to wall %hu\n", underlying_value(i), w->segnum, underlying_value(w->sidenum), underlying_value(wallnum_t{w}));
 				}
 			}
 			if (count2 == 0)
-				err_printf(my_file, "Error: Trigger %i is not bound to any wall.", i);
+				err_printf(my_file, "Error: Trigger %i is not bound to any wall.", underlying_value(i));
 			else if (count2 > 1)
-				err_printf(my_file, "Error: Trigger %i is bound to %i walls.", i, count2);
+				err_printf(my_file, "Error: Trigger %i is bound to %i walls.", underlying_value(i), count2);
 
 		}
 	}
 
 	if (count == 0)
-		err_printf(my_file, "Error: No exit trigger in this mine.");
+		err_puts_literal(my_file, "Error: No exit trigger in this mine.");
 	else if (count != 1)
-		err_printf(my_file, "Error: More than one exit trigger in this mine.");
+		err_puts_literal(my_file, "Error: More than one exit trigger in this mine.");
 	else
-		PHYSFSX_printf(my_file, "\n");
+		PHYSFSX_puts_literal(my_file, "\n");
 
 	//	---------- Find exit doors ----------
 	count = 0;
 	range_for (const auto &&segp, vcsegptridx)
 	{
-		range_for (const auto &&es, enumerate(segp->children))
+		for (const auto &&[sidenum, child_segnum] : enumerate(segp->shared_segment::children))
 		{
-			if (es.value == segment_exit)
+			if (child_segnum == segment_exit)
 			{
-				PHYSFSX_printf(my_file, "Segment %3hu, side %" PRIuFAST32 " is an exit door.\n", segp.get_unchecked_index(), es.idx);
+				PHYSFSX_printf(my_file, "Segment %3hu, side %u is an exit door.\n", segp.get_unchecked_index(), underlying_value(sidenum));
 				count++;
 			}
 		}
 	}
 
 	if (count == 0)
-		err_printf(my_file, "Error: No external wall in this mine.");
+		err_puts_literal(my_file, "Error: No external wall in this mine.");
 	else if (count != 1) {
 #if defined(DXX_BUILD_DESCENT_I)
 		warning_printf(my_file, "Warning: %i external walls in this mine.", count);
 		warning_printf(my_file, "(If %i are secret exits, then no problem.)", count-1); 
 #endif
 	} else
-		PHYSFSX_printf(my_file, "\n");
+		PHYSFSX_puts_literal(my_file, "\n");
+}
 }
 }
 
@@ -288,18 +278,18 @@ class key_stat
 	const char *const label;
 	unsigned wall_count = 0, powerup_count = 0;
 	segnum_t seg = segment_none;
-	uint8_t side = 0;
+	sidenum_t side{};
 public:
 	key_stat(const char *const p) :
 		label(p)
 	{
 	}
-	void check_wall(const segment_array &segments, PHYSFS_File *const fp, const vcwallptridx_t wpi, const wall_key_t key)
+	void check_wall(const segment_array &segments, PHYSFS_File *const fp, const vcwallptridx_t wpi, const wall_key key)
 	{
 		auto &w = *wpi;
 		if (!(w.keys & key))
 			return;
-		PHYSFSX_printf(fp, "Wall %i (seg=%i, side=%i) is keyed to the %s key.\n", static_cast<wallnum_t>(wpi), w.segnum, w.sidenum, label);
+		PHYSFSX_printf(fp, "Wall %hu (seg=%i, side=%i) is keyed to the %s key.\n", underlying_value(wallnum_t{wpi}), w.segnum, underlying_value(w.sidenum), label);
 		if (seg == segment_none)
 		{
 			seg = w.segnum;
@@ -310,7 +300,7 @@ public:
 			const auto &&connect_side = find_connect_side(segments.vcptridx(w.segnum), segments.vcptr(seg));
 			if (connect_side == side)
 				return;
-			warning_printf(fp, "Warning: This door at seg %i, is different than the one at seg %i, side %i", w.segnum, seg, side);
+			warning_printf(fp, "Warning: This door at seg %i, is different than the one at seg %i, side %i", w.segnum, seg, underlying_value(side));
 		}
 		++wall_count;
 	}
@@ -335,21 +325,19 @@ public:
 	}
 };
 
-}
-
 // ----------------------------------------------------------------------------
 static void write_key_text(fvcobjptridx &vcobjptridx, segment_array &segments, fvcwallptridx &vcwallptridx, PHYSFS_File *my_file)
 {
-	PHYSFSX_printf(my_file, "-----------------------------------------------------------------------------\n");
-	PHYSFSX_printf(my_file, "Key stuff:\n");
+	PHYSFSX_puts_literal(my_file, "-----------------------------------------------------------------------------\n");
+	PHYSFSX_puts_literal(my_file, "Key stuff:\n");
 
 	key_stat blue("blue"), gold("gold"), red("red");
 
 	range_for (const auto &&w, vcwallptridx)
 	{
-		blue.check_wall(segments, my_file, w, KEY_BLUE);
-		gold.check_wall(segments, my_file, w, KEY_GOLD);
-		red.check_wall(segments, my_file, w, KEY_RED);
+		blue.check_wall(segments, my_file, w, wall_key::blue);
+		gold.check_wall(segments, my_file, w, wall_key::gold);
+		red.check_wall(segments, my_file, w, wall_key::red);
 	}
 
 	blue.report_walls(my_file);
@@ -400,49 +388,49 @@ static void write_control_center_text(fvcsegptridx &vcsegptridx, PHYSFS_File *my
 	auto &vcobjptridx = Objects.vcptridx;
 	int	count, count2;
 
-	PHYSFSX_printf(my_file, "-----------------------------------------------------------------------------\n");
-	PHYSFSX_printf(my_file, "Control Center stuff:\n");
+	PHYSFSX_puts_literal(my_file, "-----------------------------------------------------------------------------\n");
+	PHYSFSX_puts_literal(my_file, "Control Center stuff:\n");
 
 	count = 0;
 	range_for (const auto &&segp, vcsegptridx)
 	{
-		if (segp->special == SEGMENT_IS_CONTROLCEN)
+		if (segp->special == segment_special::controlcen)
 		{
 			count++;
 			PHYSFSX_printf(my_file, "Segment %3hu is a control center.\n", static_cast<uint16_t>(segp));
 			count2 = 0;
-			range_for (const auto objp, objects_in(segp, vcobjptridx, vcsegptr))
+			range_for (const object &objp, objects_in(segp, vcobjptridx, vcsegptr))
 			{
-				if (objp->type == OBJ_CNTRLCEN)
+				if (objp.type == OBJ_CNTRLCEN)
 					count2++;
 			}
 			if (count2 == 0)
-				PHYSFSX_printf(my_file, "No control center object in control center segment.\n");
+				PHYSFSX_puts_literal(my_file, "No control center object in control center segment.\n");
 			else if (count2 != 1)
 				PHYSFSX_printf(my_file, "%i control center objects in control center segment.\n", count2);
 		}
 	}
 
 	if (count == 0)
-		err_printf(my_file, "Error: No control center in this mine.");
+		err_puts_literal(my_file, "Error: No control center in this mine.");
 	else if (count != 1)
-		err_printf(my_file, "Error: More than one control center in this mine.");
+		err_puts_literal(my_file, "Error: More than one control center in this mine.");
 }
 
 // ----------------------------------------------------------------------------
 static void write_fuelcen_text(PHYSFS_File *my_file)
 {
 	auto &Station = LevelUniqueFuelcenterState.Station;
-	int	i;
 
-	PHYSFSX_printf(my_file, "-----------------------------------------------------------------------------\n");
-	PHYSFSX_printf(my_file, "Fuel Center stuff: (Note: This means fuel, repair, materialize, control centers!)\n");
+	PHYSFSX_puts_literal(my_file, "-----------------------------------------------------------------------------\n");
+	PHYSFSX_puts_literal(my_file, "Fuel Center stuff: (Note: This means fuel, repair, materialize, control centers!)\n");
 
 	const auto Num_fuelcenters = LevelUniqueFuelcenterState.Num_fuelcenters;
-	for (i=0; i<Num_fuelcenters; i++) {
-		PHYSFSX_printf(my_file, "Fuelcenter %i: Type=%i (%s), segment = %3i\n", i, Station[i].Type, Special_names[Station[i].Type], Station[i].segnum);
-		if (Segments[Station[i].segnum].special != Station[i].Type)
-			err_printf(my_file, "Error: Conflicting data: Segment %i has special type %i (%s), expected to be %i", Station[i].segnum, Segments[Station[i].segnum].special, Special_names[Segments[Station[i].segnum].special], Station[i].Type);
+	for (auto &&[i, f] : enumerate(partial_const_range(Station, Num_fuelcenters)))
+	{
+		PHYSFSX_printf(my_file, "Fuelcenter %u: Type=%i (%s), segment = %3i\n", underlying_value(i), underlying_value(f.Type), Special_names[f.Type], f.segnum);
+		if (Segments[f.segnum].special != f.Type)
+			err_printf(my_file, "Error: Conflicting data: Segment %i has special type %i (%s), expected to be %i", f.segnum, underlying_value(Segments[f.segnum].special), Special_names[Segments[f.segnum].special], underlying_value(f.Type));
 	}
 }
 
@@ -451,17 +439,17 @@ static void write_segment_text(fvcsegptridx &vcsegptridx, PHYSFS_File *my_file)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vcobjptridx = Objects.vcptridx;
-	PHYSFSX_printf(my_file, "-----------------------------------------------------------------------------\n");
-	PHYSFSX_printf(my_file, "Segment stuff:\n");
+	PHYSFSX_puts_literal(my_file, "-----------------------------------------------------------------------------\n");
+	PHYSFSX_puts_literal(my_file, "Segment stuff:\n");
 
 	range_for (const auto &&segp, vcsegptridx)
 	{
 		PHYSFSX_printf(my_file, "Segment %4hu:", static_cast<uint16_t>(segp));
-		if (segp->special != 0)
-			PHYSFSX_printf(my_file, " special = %3i (%s), station_idx=%3i", segp->special, Special_names[segp->special], segp->station_idx);
-		if (segp->matcen_num != -1)
-			PHYSFSX_printf(my_file, " matcen = %3i", segp->matcen_num);
-		PHYSFSX_printf(my_file, "\n");
+		if (segp->special != segment_special::nothing)
+			PHYSFSX_printf(my_file, " special = %3i (%s), station_idx=%3u", underlying_value(segp->special), Special_names[segp->special], underlying_value(segp->station_idx));
+		if (segp->matcen_num != materialization_center_number::None)
+			PHYSFSX_printf(my_file, " matcen = %3i", underlying_value(segp->matcen_num));
+		PHYSFSX_puts_literal(my_file, "\n");
 	}
 
 	range_for (const auto &&segp, vcsegptridx)
@@ -470,7 +458,7 @@ static void write_segment_text(fvcsegptridx &vcsegptridx, PHYSFS_File *my_file)
 
 		PHYSFSX_printf(my_file, "Segment %4hu: ", static_cast<uint16_t>(segp));
 		depth=0;
-			PHYSFSX_printf(my_file, "Objects: ");
+		PHYSFSX_puts_literal(my_file, "Objects: ");
 		range_for (const auto objp, objects_in(segp, vcobjptridx, vcsegptr))
 			{
 				short objnum = objp;
@@ -480,35 +468,34 @@ static void write_segment_text(fvcsegptridx &vcsegptridx, PHYSFS_File *my_file)
 					break;
 				}
 			}
-		PHYSFSX_printf(my_file, "\n");
+		PHYSFSX_puts_literal(my_file, "\n");
 	}
 }
 
 // ----------------------------------------------------------------------------
-// This routine is bogus.  It assumes that all centers are matcens,
-// which is not true.  The setting of segnum is bogus.
 static void write_matcen_text(PHYSFS_File *my_file)
 {
-	int	i;
-
-	PHYSFSX_printf(my_file, "-----------------------------------------------------------------------------\n");
-	PHYSFSX_printf(my_file, "Materialization centers:\n");
+	PHYSFSX_puts_literal(my_file, "-----------------------------------------------------------------------------\n");
+	PHYSFSX_puts_literal(my_file, "Materialization centers:\n");
 	auto &RobotCenters = LevelSharedRobotcenterState.RobotCenters;
 	auto &Station = LevelUniqueFuelcenterState.Station;
 	auto &Triggers = LevelUniqueWallSubsystemState.Triggers;
 	auto &vctrgptridx = Triggers.vcptridx;
 	const auto Num_robot_centers = LevelSharedRobotcenterState.Num_robot_centers;
-	for (i=0; i<Num_robot_centers; i++) {
-		int	trigger_count=0, fuelcen_num;
+	for (auto &&[i, robotcen] : enumerate(partial_const_range(RobotCenters, Num_robot_centers)))
+	{
+		const auto fuelcen_num = robotcen.fuelcen_num;
+		auto &station = Station[fuelcen_num];
+		if (station.Type != segment_special::robotmaker)
+		{
+			err_printf(my_file, "Error: Matcen %u corresponds to Station %u, which has type %i (%s).", underlying_value(i), underlying_value(fuelcen_num), underlying_value(station.Type), Special_names[station.Type]);
+			continue;
+		}
+		int	trigger_count=0;
 
-		PHYSFSX_printf(my_file, "FuelCenter[%02i].Segment = %04i  ", i, Station[i].segnum);
-		PHYSFSX_printf(my_file, "Segment[%04i].matcen_num = %02i  ", Station[i].segnum, Segments[Station[i].segnum].matcen_num);
-
-		fuelcen_num = RobotCenters[i].fuelcen_num;
-		if (Station[fuelcen_num].Type != SEGMENT_IS_ROBOTMAKER)
-			err_printf(my_file, "Error: Matcen %i corresponds to Station %i, which has type %i (%s).", i, fuelcen_num, Station[fuelcen_num].Type, Special_names[Station[fuelcen_num].Type]);
-
-		auto segnum = Station[fuelcen_num].segnum;
+		const auto segnum = station.segnum;
+		PHYSFSX_printf(my_file, "FuelCenter[%02i].Segment = %04i  ", underlying_value(i), segnum);
+		PHYSFSX_printf(my_file, "Segment[%04i].matcen_num = %02i  ", segnum, underlying_value(Segments[segnum].matcen_num));
 
 		//	Find trigger for this materialization center.
 		range_for (auto &&t, vctrgptridx)
@@ -518,79 +505,76 @@ static void write_matcen_text(PHYSFS_File *my_file)
 				range_for (auto &k, partial_const_range(t->seg, t->num_links))
 					if (k == segnum)
 					{
-						PHYSFSX_printf(my_file, "Trigger = %2i  ", t.get_unchecked_index());
+						PHYSFSX_printf(my_file, "Trigger = %2i  ", underlying_value(t.get_unchecked_index()));
 						trigger_count++;
 					}
 			}
 		}
-		PHYSFSX_printf(my_file, "\n");
+		PHYSFSX_puts_literal(my_file, "\n");
 
 		if (trigger_count == 0)
-			err_printf(my_file, "Error: Matcen %i in segment %i has no trigger!", i, segnum);
-
+			err_printf(my_file, "Error: Matcen %i in segment %i has no trigger!", underlying_value(i), segnum);
 	}
+}
+
 }
 
 // ----------------------------------------------------------------------------
 namespace dsx {
+namespace {
 static void write_wall_text(fvcsegptridx &vcsegptridx, fvcwallptridx &vcwallptridx, PHYSFS_File *my_file)
 {
-	array<int8_t, MAX_WALLS> wall_flags;
+	enumerated_array<int8_t, MAX_WALLS, wallnum_t> wall_flags;
 
-	PHYSFSX_printf(my_file, "-----------------------------------------------------------------------------\n");
-	PHYSFSX_printf(my_file, "Walls:\n");
+	PHYSFSX_puts_literal(my_file, "-----------------------------------------------------------------------------\n");
+	PHYSFSX_puts_literal(my_file, "Walls:\n");
 #if defined(DXX_BUILD_DESCENT_II)
 	auto &Triggers = LevelUniqueWallSubsystemState.Triggers;
 #endif
 	range_for (auto &&wp, vcwallptridx)
 	{
 		auto &w = *wp;
-		int	sidenum;
-
-		const auto i = static_cast<wallnum_t>(wp);
-		PHYSFSX_printf(my_file, "Wall %03i: seg=%3i, side=%2i, linked_wall=%3i, type=%s, flags=%4x, hps=%3i, trigger=%2i, clip_num=%2i, keys=%2i, state=%i\n", i,
-			w.segnum, w.sidenum, w.linked_wall, Wall_names[w.type], w.flags, w.hps >> 16, w.trigger, w.clip_num, w.keys, w.state);
+		const auto i = underlying_value(wallnum_t{wp});
+		PHYSFSX_printf(my_file, "Wall %03hu: seg=%3i, side=%2i, linked_wall=%3hu, type=%s, flags=%4x, hps=%3i, trigger=%2i, clip_num=%2i, keys=%2i, state=%i\n", i, w.segnum, underlying_value(w.sidenum), underlying_value(wallnum_t{w.linked_wall}), Wall_names[w.type], underlying_value(w.flags), w.hps >> 16, underlying_value(w.trigger), w.clip_num, underlying_value(w.keys), underlying_value(w.state));
 
 #if defined(DXX_BUILD_DESCENT_II)
-		if (w.trigger >= Triggers.get_count())
-			PHYSFSX_printf(my_file, "Wall %03d points to invalid trigger %d\n",i,w.trigger);
+		if (const auto utw = underlying_value(w.trigger); utw >= Triggers.get_count())
+			PHYSFSX_printf(my_file, "Wall %03hu points to invalid trigger %u\n", i, utw);
 #endif
 
 		auto segnum = w.segnum;
-		sidenum = w.sidenum;
+		const auto sidenum = w.sidenum;
 
-		if (Segments[segnum].shared_segment::sides[sidenum].wall_num != wp)
-			err_printf(my_file, "Error: Wall %u points at segment %i, side %i, but that segment doesn't point back (it's wall_num = %hi)", i, segnum, sidenum, static_cast<int16_t>(Segments[segnum].shared_segment::sides[sidenum].wall_num));
+		if (const auto actual_wall_num = Segments[segnum].shared_segment::sides[sidenum].wall_num; actual_wall_num != wp)
+			err_printf(my_file, "Error: Wall %hu points at segment %i, side %i, but that segment doesn't point back (it's wall_num = %hi)", i, segnum, underlying_value(sidenum), underlying_value(actual_wall_num));
 	}
 
 	wall_flags = {};
 
 	range_for (const auto &&segp, vcsegptridx)
 	{
-		range_for (const auto &&es, enumerate(segp->shared_segment::sides))
+		for (const auto &&[idx, value] : enumerate(segp->shared_segment::sides))
 		{
-			const auto sidep = &es.value;
+			const auto sidep = &value;
 			if (sidep->wall_num != wall_none)
 			{
-				if (wall_flags[sidep->wall_num])
-					err_printf(my_file, "Error: Wall %hu appears in two or more segments, including segment %hu, side %" PRIuFAST32 ".", static_cast<int16_t>(sidep->wall_num), static_cast<segnum_t>(segp), es.idx);
+				if (auto &wf = wall_flags[sidep->wall_num])
+					err_printf(my_file, "Error: Wall %hu appears in two or more segments, including segment %hu, side %u.", underlying_value(sidep->wall_num), segp.get_unchecked_index(), underlying_value(idx));
 				else
-					wall_flags[sidep->wall_num] = 1;
+					wf = 1;
 			}
 		}
 	}
 
 }
-}
 
 // ----------------------------------------------------------------------------
-namespace dsx {
 static void write_player_text(fvcobjptridx &vcobjptridx, PHYSFS_File *my_file)
 {
 	int	num_players=0;
 
-	PHYSFSX_printf(my_file, "-----------------------------------------------------------------------------\n");
-	PHYSFSX_printf(my_file, "Players:\n");
+	PHYSFSX_puts_literal(my_file, "-----------------------------------------------------------------------------\n");
+	PHYSFSX_puts_literal(my_file, "Players:\n");
 	range_for (const auto &&objp, vcobjptridx)
 	{
 		if (objp->type == OBJ_PLAYER)
@@ -607,14 +591,12 @@ static void write_player_text(fvcobjptridx &vcobjptridx, PHYSFS_File *my_file)
 	if (num_players > MAX_MULTI_PLAYERS)
 		err_printf(my_file, "Error: %i player objects.  %i are required.", num_players, MAX_PLAYERS);
 }
-}
 
 // ----------------------------------------------------------------------------
-namespace dsx {
 static void write_trigger_text(PHYSFS_File *my_file)
 {
-	PHYSFSX_printf(my_file, "-----------------------------------------------------------------------------\n");
-	PHYSFSX_printf(my_file, "Triggers:\n");
+	PHYSFSX_puts_literal(my_file, "-----------------------------------------------------------------------------\n");
+	PHYSFSX_puts_literal(my_file, "Triggers:\n");
 	auto &Triggers = LevelUniqueWallSubsystemState.Triggers;
 	auto &vctrgptridx = Triggers.vcptridx;
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
@@ -623,26 +605,27 @@ static void write_trigger_text(PHYSFS_File *my_file)
 	{
 		const auto i = static_cast<trgnum_t>(t);
 #if defined(DXX_BUILD_DESCENT_I)
-		PHYSFSX_printf(my_file, "Trigger %03i: flags=%04x, value=%08x, time=%8x, num_links=%i ", i, t->flags, static_cast<unsigned>(t->value), 0, t->num_links);
+		PHYSFSX_printf(my_file, "Trigger %03i: flags=%04x, value=%08x, time=%8x, num_links=%i ", underlying_value(i), t->flags, static_cast<unsigned>(t->value), 0, t->num_links);
 #elif defined(DXX_BUILD_DESCENT_II)
-		PHYSFSX_printf(my_file, "Trigger %03i: type=%02x flags=%04x, value=%08x, time=%8x, num_links=%i ", i,
-			t->type, t->flags, t->value, 0, t->num_links);
+		PHYSFSX_printf(my_file, "Trigger %03i: type=%02x flags=%04x, value=%08x, time=%8x, num_links=%i ", underlying_value(i),
+			static_cast<uint8_t>(t->type), static_cast<uint8_t>(t->flags), t->value, 0, t->num_links);
 #endif
 
-		for (unsigned j = 0; j < t->num_links; ++j)
-			PHYSFSX_printf(my_file, "[%03i:%i] ", t->seg[j], t->side[j]);
+		for (const auto &&[seg, side] : zip(partial_range(t->seg, t->num_links), t->side))
+			PHYSFSX_printf(my_file, "[%03i:%i] ", seg, underlying_value(side));
 
 		//	Find which wall this trigger is connected to.
 		const auto &&we = vcwallptr.end();
-		const auto &&wi = std::find_if(vcwallptr.begin(), we, [i](const wall *const p) { return p->trigger == i; });
+		const auto &&wi = ranges::find(vcwallptr.begin(), we, i, &wall::trigger);
 		if (wi == we)
-			err_printf(my_file, "Error: Trigger %i is not connected to any wall, so it can never be triggered.", i);
+			err_printf(my_file, "Error: Trigger %i is not connected to any wall, so it can never be triggered.", underlying_value(i));
 		else
 		{
 			const auto &&w = *wi;
-			PHYSFSX_printf(my_file, "Attached to seg:side = %i:%i, wall %hi\n", w->segnum, w->sidenum, static_cast<int16_t>(vcsegptr(w->segnum)->shared_segment::sides[w->sidenum].wall_num));
+			PHYSFSX_printf(my_file, "Attached to seg:side = %i:%i, wall %hi\n", w->segnum, underlying_value(w->sidenum), underlying_value(vcsegptr(w->segnum)->shared_segment::sides[w->sidenum].wall_num));
 		}
 	}
+}
 }
 }
 
@@ -664,19 +647,18 @@ void write_game_text_file(const char *filename)
 	strcpy(my_filename, filename);
 	strcpy( &my_filename[namelen-4], ".txm");
 
-	auto my_file = PHYSFSX_openWriteBuffered(my_filename);
+	auto &&[my_file, physfserr] = PHYSFSX_openWriteBuffered(my_filename);
 	if (!my_file)	{
 		gr_palette_load(gr_palette);
-		nm_messagebox( NULL, 1, "Ok", "ERROR: Unable to open %s\nErrno = %i", my_filename, errno);
-
+		nm_messagebox(menu_title{nullptr}, 1, TXT_OK, "ERROR: Unable to open %s\n%s", my_filename, PHYSFS_getErrorByCode(physfserr));
 		return;
 	}
 
-	dump_used_textures_level(my_file, 0);
-	say_totals(vcobjptridx, my_file, Gamesave_current_filename);
+	dump_used_textures_level(my_file, 0, filename);
+	say_totals(vcobjptridx, my_file, filename);
 
 	PHYSFSX_printf(my_file, "\nNumber of segments:   %4i\n", Highest_segment_index+1);
-	PHYSFSX_printf(my_file, "Number of objects:    %4i\n", Highest_object_index+1);
+	PHYSFSX_printf(my_file, "Number of objects:    %4i\n", Objects.get_count());
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
 	auto &vcwallptridx = Walls.vcptridx;
 	PHYSFSX_printf(my_file, "Number of walls:      %4i\n", Walls.get_count());
@@ -686,8 +668,7 @@ void write_game_text_file(const char *filename)
 	auto &Triggers = LevelUniqueWallSubsystemState.Triggers;
 	PHYSFSX_printf(my_file, "Number of triggers:   %4i\n", Triggers.get_count());
 	}
-	PHYSFSX_printf(my_file, "Number of matcens:    %4i\n", LevelSharedRobotcenterState.Num_robot_centers);
-	PHYSFSX_printf(my_file, "\n");
+	PHYSFSX_printf(my_file, "Number of matcens:    %4i\n\n", LevelSharedRobotcenterState.Num_robot_centers);
 
 	write_segment_text(vcsegptridx, my_file);
 
@@ -710,58 +691,56 @@ void write_game_text_file(const char *filename)
 	write_key_text(vcobjptridx, Segments, vcwallptridx, my_file);
 }
 
-#if defined(DXX_BUILD_DESCENT_II)
-//	Adam: Change NUM_ADAM_LEVELS to the number of levels.
-#define	NUM_ADAM_LEVELS	30
+namespace dsx {
+namespace {
 
-//	Adam: Stick the names here.
-constexpr char Adam_level_names[NUM_ADAM_LEVELS][13] = {
-	"D2LEVA-1.LVL",
-	"D2LEVA-2.LVL",
-	"D2LEVA-3.LVL",
-	"D2LEVA-4.LVL",
-	"D2LEVA-S.LVL",
-
-	"D2LEVB-1.LVL",
-	"D2LEVB-2.LVL",
-	"D2LEVB-3.LVL",
-	"D2LEVB-4.LVL",
-	"D2LEVB-S.LVL",
-
-	"D2LEVC-1.LVL",
-	"D2LEVC-2.LVL",
-	"D2LEVC-3.LVL",
-	"D2LEVC-4.LVL",
-	"D2LEVC-S.LVL",
-
-	"D2LEVD-1.LVL",
-	"D2LEVD-2.LVL",
-	"D2LEVD-3.LVL",
-	"D2LEVD-4.LVL",
-	"D2LEVD-S.LVL",
-
-	"D2LEVE-1.LVL",
-	"D2LEVE-2.LVL",
-	"D2LEVE-3.LVL",
-	"D2LEVE-4.LVL",
-	"D2LEVE-S.LVL",
-
-	"D2LEVF-1.LVL",
-	"D2LEVF-2.LVL",
-	"D2LEVF-3.LVL",
-	"D2LEVF-4.LVL",
-	"D2LEVF-S.LVL",
+#if defined(DXX_BUILD_DESCENT_I)
+const char Shareware_level_names[NUM_SHAREWARE_LEVELS][12] = {
+	"level01.rdl",
+	"level02.rdl",
+	"level03.rdl",
+	"level04.rdl",
+	"level05.rdl",
+	"level06.rdl",
+	"level07.rdl"
 };
 
+const char Registered_level_names[NUM_REGISTERED_LEVELS][12] = {
+	"level08.rdl",
+	"level09.rdl",
+	"level10.rdl",
+	"level11.rdl",
+	"level12.rdl",
+	"level13.rdl",
+	"level14.rdl",
+	"level15.rdl",
+	"level16.rdl",
+	"level17.rdl",
+	"level18.rdl",
+	"level19.rdl",
+	"level20.rdl",
+	"level21.rdl",
+	"level22.rdl",
+	"level23.rdl",
+	"level24.rdl",
+	"level25.rdl",
+	"level26.rdl",
+	"level27.rdl",
+	"levels1.rdl",
+	"levels2.rdl",
+	"levels3.rdl"
+};
+#endif
+
+#if defined(DXX_BUILD_DESCENT_II)
 static int Ignore_tmap_num2_error;
 #endif
 
 // ----------------------------------------------------------------------------
-namespace dsx {
 #if defined(DXX_BUILD_DESCENT_I)
-#define determine_used_textures_level(LevelSharedDestructibleLightState,load_level_flag,shareware_flag,level_num,tmap_buf,wall_buffer_type,level_tmap_buf,max_tmap)	determine_used_textures_level(load_level_flag,shareware_flag,level_num,tmap_buf,wall_buffer_type,level_tmap_buf,max_tmap)
+#define determine_used_textures_level(load_level_flag,shareware_flag,level_num,tmap_buf,wall_buffer_type,level_tmap_buf,max_tmap)	determine_used_textures_level(load_level_flag,shareware_flag,level_num,tmap_buf,wall_buffer_type,level_tmap_buf,max_tmap)
 #endif
-static void determine_used_textures_level(d_level_shared_destructible_light_state &LevelSharedDestructibleLightState, int load_level_flag, int shareware_flag, int level_num, perm_tmap_buffer_type &tmap_buf, wall_buffer_type &wall_buf, level_tmap_buffer_type &level_tmap_buf, int max_tmap)
+static void determine_used_textures_level(int load_level_flag, int shareware_flag, int level_num, perm_tmap_buffer_type &tmap_buf, wall_buffer_type &wall_buf, level_tmap_buffer_type &level_tmap_buf, int max_tmap)
 {
 #if defined(DXX_BUILD_DESCENT_II)
 	auto &Objects = LevelUniqueObjectState.Objects;
@@ -770,6 +749,7 @@ static void determine_used_textures_level(d_level_shared_destructible_light_stat
 	int	j;
 
 	auto &Walls = LevelUniqueWallSubsystemState.Walls;
+	auto &WallAnims = GameSharedState.WallAnims;
 #if defined(DXX_BUILD_DESCENT_I)
 	tmap_buf = {};
 
@@ -777,9 +757,9 @@ static void determine_used_textures_level(d_level_shared_destructible_light_stat
 		load_level(shareware_flag ? Shareware_level_names[level_num] : Registered_level_names[level_num]);
 	}
 
-	range_for (const auto &&segp, vcsegptr)
+	range_for (const cscusegment segp, vcsegptr)
 	{
-		range_for (const auto &&z, zip(segp->shared_segment::sides, segp->unique_segment::sides))
+		range_for (const auto &&z, zip(segp.s.sides, segp.u.sides))
 		{
 			auto &sside = std::get<0>(z);
 			if (sside.wall_num != wall_none)
@@ -803,21 +783,19 @@ static void determine_used_textures_level(d_level_shared_destructible_light_stat
 			}
 
 			auto &uside = std::get<1>(z);
-			if (uside.tmap_num >= 0)
-                         {
-				if (uside.tmap_num < max_tmap)
-                                 {
-					tmap_buf[uside.tmap_num]++;
-					if (level_tmap_buf[uside.tmap_num] == -1)
-						level_tmap_buf[uside.tmap_num] = level_num + (!shareware_flag) * NUM_SHAREWARE_LEVELS;
-                                 }
+			const auto tmap1idx = get_texture_index(uside.tmap_num);
+			if (tmap1idx < max_tmap)
+			{
+				++ tmap_buf[tmap1idx];
+				if (auto &t = level_tmap_buf[tmap1idx]; t == -1)
+					t = level_num + (!shareware_flag) * NUM_SHAREWARE_LEVELS;
+			}
                                 else
                                  {
 					Int3(); //	Error, bogus texture map.  Should not be greater than max_tmap.
                                  }
-                         }
 
-			if (const auto tmap_num2 = uside.tmap_num2 & 0x3fff)
+			if (const auto tmap_num2 = get_texture_index(uside.tmap_num2))
                          {
 				if (tmap_num2 < max_tmap) {
 					++tmap_buf[tmap_num2];
@@ -829,14 +807,11 @@ static void determine_used_textures_level(d_level_shared_destructible_light_stat
                  }
          }
 #elif defined(DXX_BUILD_DESCENT_II)
+	(void)load_level_flag;
 	(void)max_tmap;
 	(void)shareware_flag;
 
 	tmap_buf = {};
-
-	if (load_level_flag) {
-		load_level(LevelSharedDestructibleLightState, Adam_level_names[level_num]);
-	}
 
 	auto &Polygon_models = LevelSharedPolygonModelState.Polygon_models;
 	//	Process robots.
@@ -865,9 +840,9 @@ static void determine_used_textures_level(d_level_shared_destructible_light_stat
 	Ignore_tmap_num2_error = 0;
 
 	//	Process walls and segment sides.
-	range_for (const auto &&segp, vmsegptr)
+	range_for (const csmusegment segp, vmsegptr)
 	{
-		range_for (const auto &&z, zip(segp->shared_segment::sides, segp->unique_segment::sides, segp->children))
+		range_for (const auto &&z, zip(segp.s.sides, segp.u.sides, segp.s.children))
 		{
 			auto &sside = std::get<0>(z);
 			auto &uside = std::get<1>(z);
@@ -889,11 +864,10 @@ static void determine_used_textures_level(d_level_shared_destructible_light_stat
 					}
 				}
 			} else if (child == segment_none) {
-
-				if (uside.tmap_num >= 0)
 				{
-					if (uside.tmap_num < Textures.size()) {
-						const auto ti = Textures[uside.tmap_num].index;
+					const auto tmap1idx = get_texture_index(uside.tmap_num);
+					if (tmap1idx < Textures.size()) {
+						const auto ti = Textures[tmap1idx].index;
 						assert(ti < tmap_buf.size());
 						++tmap_buf[ti];
 						if (level_tmap_buf[ti] == -1)
@@ -902,7 +876,7 @@ static void determine_used_textures_level(d_level_shared_destructible_light_stat
 						Int3();	//	Error, bogus texture map.  Should not be greater than max_tmap.
 				}
 
-				if (const auto masked_tmap_num2 = (uside.tmap_num2 & 0x3fff))
+				if (const auto masked_tmap_num2 = get_texture_index(uside.tmap_num2))
 				{
 					if (masked_tmap_num2 < Textures.size())
 					{
@@ -915,7 +889,7 @@ static void determine_used_textures_level(d_level_shared_destructible_light_stat
 						if (!Ignore_tmap_num2_error)
 							Int3();	//	Error, bogus texture map.  Should not be greater than max_tmap.
 						Ignore_tmap_num2_error = 1;
-						uside.tmap_num2 = 0;
+						uside.tmap_num2 = texture2_value::None;
 					}
 				}
 			}
@@ -924,16 +898,20 @@ static void determine_used_textures_level(d_level_shared_destructible_light_stat
 #endif
 }
 }
+}
 
+namespace {
 // ----------------------------------------------------------------------------
 template <std::size_t N>
-static void merge_buffers(array<int, N> &dest, const array<int, N> &src)
+static void merge_buffers(std::array<int, N> &dest, const std::array<int, N> &src)
 {
 	std::transform(dest.begin(), dest.end(), src.begin(), dest.begin(), std::plus<int>());
+}
 }
 
 // ----------------------------------------------------------------------------
 namespace dsx {
+namespace {
 static void say_used_tmaps(PHYSFS_File *const my_file, const perm_tmap_buffer_type &tb)
 {
 	int	i;
@@ -944,11 +922,7 @@ static void say_used_tmaps(PHYSFS_File *const my_file, const perm_tmap_buffer_ty
 	const auto Num_tmaps = LevelUniqueTmapInfoState.Num_tmaps;
 	for (i=0; i<Num_tmaps; i++)
 		if (tb[i]) {
-			PHYSFSX_printf(my_file, "[%3i %8s (%4i)] ", i, static_cast<const char *>(TmapInfo[i].filename), tb[i]);
-			if (count++ >= 4) {
-				PHYSFSX_printf(my_file, "\n");
-				count = 0;
-			}
+			PHYSFSX_printf(my_file, "[%3i %8s (%4i)]%s", i, static_cast<const char *>(TmapInfo[i].filename), tb[i], count++ >= 4 ? (count = 0, "\n") : " ");
 		}
 #elif defined(DXX_BUILD_DESCENT_II)
 	for (i = 0; i < tb.size(); ++i)
@@ -956,7 +930,6 @@ static void say_used_tmaps(PHYSFS_File *const my_file, const perm_tmap_buffer_ty
 			PHYSFSX_printf(my_file, "[%3i %8s (%4i)]\n", i, AllBitmaps[i].name.data(), tb[i]);
 		}
 #endif
-}
 }
 
 #if defined(DXX_BUILD_DESCENT_I)
@@ -985,36 +958,34 @@ static void say_used_once_tmaps(PHYSFS_File *const my_file, const perm_tmap_buff
 #endif
 
 // ----------------------------------------------------------------------------
-namespace dsx {
-static void say_unused_tmaps(PHYSFS_File *my_file, perm_tmap_buffer_type &tb)
+static void say_unused_tmaps(PHYSFS_File *my_file, perm_tmap_buffer_type &perm_tmap_buf)
 {
-	int	i;
-	int	count = 0;
-
 #if defined(DXX_BUILD_DESCENT_I)
 	const unsigned bound = LevelUniqueTmapInfoState.Num_tmaps;
 	auto &TmapInfo = LevelUniqueTmapInfoState.TmapInfo;
+	auto &tmap_name_source = TmapInfo;
 #elif defined(DXX_BUILD_DESCENT_II)
 	const unsigned bound = MAX_BITMAP_FILES;
+	auto &tmap_name_source = AllBitmaps;
 #endif
-	for (i=0; i < bound; i++)
-		if (!tb[i]) {
-			if (GameBitmaps[Textures[i].index].bm_data == bogus_data.data())
-				PHYSFSX_printf(my_file, "U");
-			else
-				PHYSFSX_printf(my_file, " ");
+	unsigned count = 0;
+	for (auto &&[i, tb, texture, tmap_name] : enumerate(zip(partial_range(perm_tmap_buf, bound), Textures, tmap_name_source)))
+		if (!tb)
+		{
+			const char usage_indicator = (GameBitmaps[texture.index].bm_data == bogus_data.data())
+				? 'U'
+				: ' ';
 
 #if defined(DXX_BUILD_DESCENT_I)
-			PHYSFSX_printf(my_file, "[%3i %8s] ", i, static_cast<const char *>(TmapInfo[i].filename));
+			const auto filename = static_cast<const char *>(tmap_name.filename);
 #elif defined(DXX_BUILD_DESCENT_II)
-			PHYSFSX_printf(my_file, "[%3i %8s] ", i, AllBitmaps[i].name.data());
+			const auto filename = tmap_name.name.data();
 #endif
-			if (count++ >= 4) {
-				PHYSFSX_printf(my_file, "\n");
-				count = 0;
-			}
+			const char sep = (count++ >= 4)
+				? (count = 0, '\n')
+				: ' ';
+			PHYSFSX_printf(my_file, "%c[%3" PRIuFAST32 " %8s]%c", usage_indicator, i, filename, sep);
 		}
-}
 }
 
 #if defined(DXX_BUILD_DESCENT_I)
@@ -1027,6 +998,10 @@ static void say_unused_walls(PHYSFS_File *my_file, const wall_buffer_type &tb)
 			PHYSFSX_printf(my_file, "Wall %3i is unused.\n", i);
 }
 #endif
+}
+}
+
+namespace {
 
 static void say_totals(fvcobjptridx &vcobjptridx, PHYSFS_File *my_file, const char *level_name)
 {
@@ -1090,46 +1065,42 @@ static void say_totals(fvcobjptridx &vcobjptridx, PHYSFS_File *my_file, const ch
 	PHYSFSX_printf(my_file, "Total robots = %3i\n", total_robots);
 }
 
-#if defined(DXX_BUILD_DESCENT_II)
-int	First_dump_level = 0;
-int	Last_dump_level = NUM_ADAM_LEVELS-1;
-#endif
+}
+
+namespace dsx {
+namespace {
 
 // ----------------------------------------------------------------------------
-namespace dsx {
 static void say_totals_all(void)
 {
-	auto &Objects = LevelUniqueObjectState.Objects;
-	auto &vcobjptridx = Objects.vcptridx;
-	int	i;
-	auto my_file = PHYSFSX_openWriteBuffered("levels.all");
+	auto &&[my_file, physfserr] = PHYSFSX_openWriteBuffered("levels.all");
 	if (!my_file)	{
 		gr_palette_load(gr_palette);
-		nm_messagebox( NULL, 1, "Ok", "ERROR: Unable to open levels.all\nErrno=%i", errno );
-
+		nm_messagebox(menu_title{nullptr}, 1, TXT_OK, "ERROR: Unable to open levels.all\n%s", PHYSFS_getErrorByCode(physfserr));
 		return;
 	}
 
 #if defined(DXX_BUILD_DESCENT_I)
-	for (i=0; i<NUM_SHAREWARE_LEVELS; i++) {
+	auto &Objects = LevelUniqueObjectState.Objects;
+	auto &vcobjptridx = Objects.vcptridx;
+	for (unsigned i = 0; i < NUM_SHAREWARE_LEVELS; ++i)
+	{
 		load_level(Shareware_level_names[i]);
 		say_totals(vcobjptridx, my_file, Shareware_level_names[i]);
 	}
 
-	for (i=0; i<NUM_REGISTERED_LEVELS; i++) {
+	for (unsigned i = 0; i < NUM_REGISTERED_LEVELS; ++i)
+	{
 		load_level(Registered_level_names[i]);
 		say_totals(vcobjptridx, my_file, Registered_level_names[i]);
-	}
-#elif defined(DXX_BUILD_DESCENT_II)
-	for (i=First_dump_level; i<=Last_dump_level; i++) {
-		load_level(LevelSharedSegmentState.DestructibleLights, Adam_level_names[i]);
-		say_totals(vcobjptridx, my_file, Adam_level_names[i]);
 	}
 #endif
 }
 }
+}
 
-static void dump_used_textures_level(PHYSFS_File *my_file, int level_num)
+namespace {
+static void dump_used_textures_level(PHYSFS_File *my_file, int level_num, const char *const Gamesave_current_filename)
 {
 	perm_tmap_buffer_type temp_tmap_buf;
 	level_tmap_buffer_type level_tmap_buf;
@@ -1137,25 +1108,22 @@ static void dump_used_textures_level(PHYSFS_File *my_file, int level_num)
 	level_tmap_buf.fill(-1);
 
 	wall_buffer_type temp_wall_buf;
-	determine_used_textures_level(LevelSharedSegmentState.DestructibleLights, 0, 1, level_num, temp_tmap_buf, temp_wall_buf, level_tmap_buf, sizeof(level_tmap_buf)/sizeof(level_tmap_buf[0]));
+	determine_used_textures_level(0, 1, level_num, temp_tmap_buf, temp_wall_buf, level_tmap_buf, level_tmap_buf.size());
 	PHYSFSX_printf(my_file, "\nTextures used in [%s]\n", Gamesave_current_filename);
 	say_used_tmaps(my_file, temp_tmap_buf);
+}
 }
 
 // ----------------------------------------------------------------------------
 namespace dsx {
 void dump_used_textures_all(void)
 {
-	int	i;
-
 say_totals_all();
 
-	auto my_file = PHYSFSX_openWriteBuffered("textures.dmp");
-
+	auto &&[my_file, physfserr] = PHYSFSX_openWriteBuffered("textures.dmp");
 	if (!my_file)	{
 		gr_palette_load(gr_palette);
-		nm_messagebox( NULL, 1, "Ok", "ERROR: Can't open textures.dmp\nErrno=%i", errno);
-
+		nm_messagebox(menu_title{nullptr}, 1, TXT_OK, "ERROR: Can't open textures.dmp\n%s", PHYSFS_getErrorByCode(physfserr));
 		return;
 	}
 
@@ -1163,51 +1131,46 @@ say_totals_all();
 	level_tmap_buffer_type level_tmap_buf;
 	level_tmap_buf.fill(-1);
 
-	perm_tmap_buffer_type temp_tmap_buf;
 #if defined(DXX_BUILD_DESCENT_I)
+	perm_tmap_buffer_type temp_tmap_buf;
 	wall_buffer_type perm_wall_buf{};
 
-	for (i=0; i<NUM_SHAREWARE_LEVELS; i++) {
+	for (unsigned i = 0; i < NUM_SHAREWARE_LEVELS; ++i)
+	{
 		wall_buffer_type temp_wall_buf;
-		determine_used_textures_level(LevelSharedDestructibleLightState, 1, 1, i, temp_tmap_buf, temp_wall_buf, level_tmap_buf, sizeof(level_tmap_buf)/sizeof(level_tmap_buf[0]));
+		determine_used_textures_level(1, 1, i, temp_tmap_buf, temp_wall_buf, level_tmap_buf, level_tmap_buf.size());
 		PHYSFSX_printf(my_file, "\nTextures used in [%s]\n", Shareware_level_names[i]);
 		say_used_tmaps(my_file, temp_tmap_buf);
 		merge_buffers(perm_tmap_buf, temp_tmap_buf);
 		merge_buffers(perm_wall_buf, temp_wall_buf);
 	}
 
-	PHYSFSX_printf(my_file, "\n\nUsed textures in all shareware mines:\n");
+	PHYSFSX_puts_literal(my_file, "\n\nUsed textures in all shareware mines:\n");
 	say_used_tmaps(my_file, perm_tmap_buf);
 
-	PHYSFSX_printf(my_file, "\nUnused textures in all shareware mines:\n");
+	PHYSFSX_puts_literal(my_file, "\nUnused textures in all shareware mines:\n");
 	say_unused_tmaps(my_file, perm_tmap_buf);
 
-	PHYSFSX_printf(my_file, "\nTextures used exactly once in all shareware mines:\n");
+	PHYSFSX_puts_literal(my_file, "\nTextures used exactly once in all shareware mines:\n");
 	say_used_once_tmaps(my_file, perm_tmap_buf, level_tmap_buf);
 
-	PHYSFSX_printf(my_file, "\nWall anims (eg, doors) unused in all shareware mines:\n");
+	PHYSFSX_puts_literal(my_file, "\nWall anims (eg, doors) unused in all shareware mines:\n");
 	say_unused_walls(my_file, perm_wall_buf);
 
-	for (i=0; i<NUM_REGISTERED_LEVELS; i++)
-#elif defined(DXX_BUILD_DESCENT_II)
-	for (i=First_dump_level; i<=Last_dump_level; i++)
-#endif
+	for (unsigned i = 0; i < NUM_REGISTERED_LEVELS; ++i)
 	{
 		wall_buffer_type temp_wall_buf;
-		determine_used_textures_level(LevelSharedSegmentState.DestructibleLights, 1, 0, i, temp_tmap_buf, temp_wall_buf, level_tmap_buf, sizeof(level_tmap_buf)/sizeof(level_tmap_buf[0]));
-#if defined(DXX_BUILD_DESCENT_I)
+		determine_used_textures_level(1, 0, i, temp_tmap_buf, temp_wall_buf, level_tmap_buf, level_tmap_buf.size());
 		PHYSFSX_printf(my_file, "\nTextures used in [%s]\n", Registered_level_names[i]);
-#elif defined(DXX_BUILD_DESCENT_II)
-		PHYSFSX_printf(my_file, "\nTextures used in [%s]\n", Adam_level_names[i]);
-#endif
 		say_used_tmaps(my_file, temp_tmap_buf);
 		merge_buffers(perm_tmap_buf, temp_tmap_buf);
 	}
+#endif
 
-	PHYSFSX_printf(my_file, "\n\nUsed textures in all (including registered) mines:\n");
+	PHYSFSX_puts_literal(my_file, "\n\nUsed textures in all (including registered) mines:\n");
 	say_used_tmaps(my_file, perm_tmap_buf);
 
-	PHYSFSX_printf(my_file, "\nUnused textures in all (including registered) mines:\n");
+	PHYSFSX_puts_literal(my_file, "\nUnused textures in all (including registered) mines:\n");
 	say_unused_tmaps(my_file, perm_tmap_buf);
 }
 }

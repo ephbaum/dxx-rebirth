@@ -17,6 +17,11 @@
 #include "text.h"
 #include "args.h"
 #include "window.h"
+#include "dxxsconf.h"
+
+#if DXX_USE_SDLIMAGE
+#include <SDL_image.h>
+#endif
 
 namespace dsx {
 
@@ -36,15 +41,26 @@ static void arch_close(void)
 	{
 		digi_close();
 	}
+#if DXX_USE_SDLIMAGE
+	IMG_Quit();
+#endif
 	SDL_Quit();
 }
 
-void arch_init(void)
+arch_atexit::~arch_atexit()
+{
+	arch_close();
+}
+
+arch_atexit arch_init()
 {
 	int t;
 
 	if (SDL_Init(SDL_INIT_VIDEO) < 0)
 		Error("SDL library initialisation failed: %s.",SDL_GetError());
+#if DXX_USE_SDLIMAGE
+	IMG_Init(0);
+#endif
 #if SDL_MAJOR_VERSION == 2
 	/* In SDL1, grabbing input grabbed both the keyboard and the mouse.
 	 * Many game management keys assume a keyboard grab.
@@ -79,7 +95,7 @@ void arch_init(void)
 	if ((t = gr_init()) != 0)
 		Error(TXT_CANT_INIT_GFX,t);
 
-	atexit(arch_close);
+	return {};
 }
 
 }

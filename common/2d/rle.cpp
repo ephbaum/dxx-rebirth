@@ -32,7 +32,6 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "pstypes.h"
 #include "u_mem.h"
 #include "gr.h"
-#include "grdef.h"
 #include "dxxerror.h"
 #include "rle.h"
 #include "byteutil.h"
@@ -41,6 +40,7 @@ COPYRIGHT 1993-1998 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "d_range.h"
 
 namespace dcx {
+namespace {
 
 constexpr uint8_t RLE_CODE = 0xe0;
 constexpr uint8_t NOT_RLE_CODE = 0x1f;
@@ -49,20 +49,27 @@ static inline int IS_RLE_CODE(const uint8_t &x)
 {
 	return (x & RLE_CODE) == RLE_CODE;
 }
+
+union rle_size_pun {
+	uint8_t *rle_little;
+	uint16_t *rle_big;
+};
+
+}
 #define rle_stosb(_dest, _len, _color)	memset(_dest,_color,_len)
 
-uint8_t *gr_rle_decode(const uint8_t *sb, uint8_t *db, const rle_position_t e)
+uint8_t *gr_rle_decode(const color_palette_index *sb, color_palette_index *db, const rle_position_t e)
 {
 	using std::advance;
 	using std::distance;
 	for (; sb != e.src;)
 	{
-		const uint8_t *p = sb;
-		uint8_t c;
+		auto p = sb;
+		color_palette_index c;
 		for (; c = *p, !IS_RLE_CODE(c);)
 			if (++p == e.src)
 				return db;
-		size_t count = (c & NOT_RLE_CODE);
+		const size_t count = (c & NOT_RLE_CODE);
 		const size_t cn = std::min<size_t>(distance(sb, p), distance(db, e.dst));
 		memcpy(db, sb, cn);
 		advance(db, cn);
@@ -79,9 +86,10 @@ uint8_t *gr_rle_decode(const uint8_t *sb, uint8_t *db, const rle_position_t e)
 	return db;
 }
 
+#if !DXX_USE_OGL
 // Given pointer to start of one scanline of rle data, uncompress it to
 // dest, from source pixels x1 to x2.
-void gr_rle_expand_scanline_masked(uint8_t *dest, const uint8_t *src, int x1, int x2)
+void gr_rle_expand_scanline_masked(uint8_t *dest, const uint8_t *src, const uint_fast32_t x1, const uint_fast32_t x2)
 {
 	int i = 0;
 	ubyte count;
@@ -129,19 +137,17 @@ void gr_rle_expand_scanline_masked(uint8_t *dest, const uint8_t *src, int x1, in
 		}
 		// we know have '*count' pixels of 'color'.
 		if ( i+count <= x2 )	{
-			if ( color != 255 )rle_stosb( dest, count, color );
-			i += count;
-			dest += count;
 		} else {
 			count = x2-i+1;
-			if ( color != 255 )rle_stosb( dest, count, color );
-			i += count;
-			dest += count;
 		}
+		if ( color != 255 )rle_stosb( dest, count, color );
+		i += count;
+		dest += count;
 	}
 }
+#endif
 
-void gr_rle_expand_scanline(uint8_t *dest, const uint8_t *src, int x1, int x2)
+void gr_rle_expand_scanline(uint8_t *dest, const uint8_t *src, const uint_fast32_t x1, const uint_fast32_t x2)
 {
 	int i = 0;
 	ubyte count;
@@ -177,7 +183,7 @@ void gr_rle_expand_scanline(uint8_t *dest, const uint8_t *src, int x1, int x2)
 	i += count;
 
 	while( i <= x2 )		{
-		color = *src++;
+		auto color = *src++;
 		if ( color == RLE_CODE ) return;
 		if ( IS_RLE_CODE(color) )	{
 			count = color & (~RLE_CODE);
@@ -188,158 +194,175 @@ void gr_rle_expand_scanline(uint8_t *dest, const uint8_t *src, int x1, int x2)
 		}
 		// we know have '*count' pixels of 'color'.
 		if ( i+count <= x2 )	{
-			rle_stosb( dest, count, color );
-			i += count;
-			dest += count;
 		} else {
 			count = x2-i+1;
-			rle_stosb( dest, count, color );
-			i += count;
-			dest += count;
 		}
+		rle_stosb(dest, count, color);
+		i += count;
+		dest += count;
 	}
 }
 
-static std::ptrdiff_t gr_rle_encode( int org_size, const uint8_t *src, ubyte *dest )
+namespace {
+
+static std::ptrdiff_t gr_rle_encode(const uint_fast32_t org_size, const uint8_t *src, uint8_t *dest)
 {
-	ubyte c, oc;
-	ubyte count;
-	uint8_t *dest_start;
+	if (!org_size)
+		return 0;
+	const auto dest_start = dest;
+	/* The value of count ranges from [1, (NOT_RLE_CODE - 1)], so uint8_t
+	 * is sufficient to hold all values.
+	 */
+	uint8_t count = 1;
+	const auto flush_pending_rle_record = [&](uint8_t previous_data_byte) {
+		if (!count)
+			return;
+		/* If the count is not 1, then the count must be recorded in the
+		 * stream.
+		 * If the count is 1, and the data byte will be mistaken for a
+		 * count, then the count of 1 must be recorded to escape the
+		 * value of the data byte.
+		 * Otherwise, write only the data byte.
+		 */
+		if (count != 1 || IS_RLE_CODE(previous_data_byte))
+			*dest++ = count | RLE_CODE;
+		*dest++ = previous_data_byte;
+	};
 
-	dest_start = dest;
-	oc = *src++;
-	count = 1;
-
-	if (org_size > 0)
-	for (uint_fast32_t i = org_size; --i;)
+	auto oc = *src++;
+	for (const auto i : xrange(org_size - 1, std::integral_constant<uint_fast32_t, 0u>(), xrange_descending()))
 	{
-		c = *src++;
-		if ( c!=oc )	{
-			if ( count )	{
-				if ( (count==1) && (! IS_RLE_CODE(oc)) )	{
-					*dest++ = oc;
-					Assert( oc != RLE_CODE );
-				} else {
-					count |= RLE_CODE;
-					*dest++ = count;
-					*dest++ = oc;
-				}
-			}
-			oc = c;
+		(void)i;
+		if (const auto c = *src++; c != oc)
+		{
+			flush_pending_rle_record(std::exchange(oc, c));
 			count = 0;
 		}
 		count++;
 		if ( count == NOT_RLE_CODE )	{
+			/* If count goes any higher, it cannot be recorded properly,
+			 * so record it now and reset the count.  This code path
+			 * would be hit for a long run of the same data value.
+			 */
 			count |= RLE_CODE;
 			*dest++=count;
 			*dest++=oc;
 			count = 0;
 		}
 	}
-	if (count)	{
-		if ( (count==1) && (! IS_RLE_CODE(oc)) )	{
-			*dest++ = oc;
-			Assert( oc != RLE_CODE );
-		} else {
-			count |= RLE_CODE;
-			*dest++ = count;
-			*dest++ = oc;
-		}
-	}
+	flush_pending_rle_record(oc);
 	*dest++ = RLE_CODE;
 
-	return dest-dest_start;
+	return std::distance(dest_start, dest);
 }
 
-static unsigned gr_rle_getsize(int org_size, const uint8_t *src)
+static unsigned gr_rle_getsize(const uint_fast32_t org_size, const uint8_t *src, const unsigned limit)
 {
-	ubyte c, oc;
-	ubyte count;
-	int dest_size=0;
+	if (!org_size)
+		return 2;
+	unsigned dest_size = 0;
 
-	oc = *src++;
-	count = 1;
+	uint8_t count = 1;
+	const auto flush_pending_rle_record = [&](uint8_t previous_data_byte) {
+		if (!count)
+			return;
+		if (count != 1 || IS_RLE_CODE(previous_data_byte))
+			dest_size += 2;
+		else
+			++ dest_size;
+	};
 
-	if (org_size > 0)
-	for (uint_fast32_t i = org_size; --i;)
+	auto oc = *src++;
+	for (const auto i : xrange(org_size - 1, std::integral_constant<uint_fast32_t, 0u>(), xrange_descending()))
 	{
-		c = *src++;
-		if ( c!=oc )	{
-			if ( count )	{
-				if ( (count==1) && (! IS_RLE_CODE(oc)) )	{
-					dest_size++;
-				} else {
-					dest_size++;
-					dest_size++;
-				}
-			}
-			oc = c;
+		(void)i;
+		if (const auto c = *src++; c != oc)
+		{
+			flush_pending_rle_record(std::exchange(oc, c));
+			if (dest_size > limit)
+				return dest_size;
 			count = 0;
 		}
 		count++;
 		if ( count == NOT_RLE_CODE )	{
 			dest_size++;
 			dest_size++;
+			if (dest_size > limit)
+				return dest_size;
 			count = 0;
 		}
 	}
-	if (count)	{
-		if ( (count==1) && (! IS_RLE_CODE(oc)) )	{
-			dest_size++;
-		} else {
-			dest_size++;
-			dest_size++;
-		}
-	}
+	flush_pending_rle_record(oc);
 	dest_size++;
-
 	return dest_size;
 }
 
-int gr_bitmap_rle_compress(grs_bitmap &bmp)
+}
+
+void gr_bitmap_rle_compress(grs_bitmap &bmp)
 {
+	if (bmp.get_flag_mask(BM_FLAG_PAGED_OUT))
+		return;
 	int doffset;
-	int large_rle = 0;
 
 	// first must check to see if this is large bitmap.
 
 	const uint_fast32_t bm_h = bmp.bm_h;
 	const uint_fast32_t bm_w = bmp.bm_w;
-	range_for (const uint_fast32_t y, xrange(bm_h))
-	{
-		auto d1 = gr_rle_getsize(bm_w, &bmp.get_bitmap_data()[bm_w * y]);
-		if (d1 > 255) {
-			large_rle = BM_FLAG_RLE_BIG;
-			break;
+	const auto large_rle = [&]() {
+		/* For each row, scan the contents of the row to determine how many
+		 * bytes would be needed to RLE encode that row.
+		 */
+		for (const uint_fast32_t y : xrange(bm_h))
+		{
+			constexpr unsigned limit = UINT8_MAX;
+			const auto d1 = gr_rle_getsize(bm_w, &bmp.get_bitmap_data()[bm_w * y], limit);
+			if (d1 > limit)
+				/* This row would need more bytes than can be recorded in a
+				 * non-big RLE encoded bitmap, so switch to big mode.
+				 * Once one row needs big mode, the entire bitmap will use
+				 * big mode, so skip scanning any remaining rows.
+				 */
+				return BM_FLAG_RLE_BIG;
 		}
-	}
+		/* Every row was checked and none required big mode, so use
+		 * non-big mode.
+		 */
+		return 0;
+	}();
 
-	RAIIdmem<uint8_t[]> rle_data;
-	MALLOC(rle_data, uint8_t[], MAX_BMP_SIZE(bm_w, bm_h));
-	if (!rle_data) return 0;
+	const auto rle_data = std::make_unique<uint8_t[]>(MAX_BMP_SIZE(bm_w, bm_h));
 	if (!large_rle)
 		doffset = 4 + bm_h;
 	else
 		doffset = 4 + (2 * bm_h);		// each row of rle'd bitmap has short instead of byte offset now
 
+	const unsigned rle_size_limit = (large_rle ? 32767 : 255);
+	const rle_size_pun dst_line_size_ptr{&rle_data[4]};
 	range_for (const uint_fast32_t y, xrange(bm_h))
 	{
-		auto d1 = gr_rle_getsize(bm_w, &bmp.get_bitmap_data()[bm_w * y]);
-		if ( ((doffset+d1) > bmp.bm_w*bmp.bm_h) || (d1 > (large_rle?32767:255) ) ) {
-			return 0;
-		}
+		const auto d1 = gr_rle_getsize(bm_w, &bmp.get_bitmap_data()[bm_w * y], rle_size_limit);
+		if (d1 > rle_size_limit || doffset + d1 > bm_w * bm_h)
+			/* Encoding this row requires more space than was allocated.
+			 * This bitmap is smaller when not encoded, so return and
+			 * leave it in its original unencoded form.
+			 *
+			 * This could happen if the bitmap had a long run of
+			 * varying colors, with each color encoded as a 1 byte long
+			 * run.
+			 */
+			return;
 		const auto d = gr_rle_encode( bmp.bm_w, &bmp.get_bitmap_data()[bmp.bm_w*y], &rle_data[doffset] );
 		Assert( d==d1 );
 		doffset	+= d;
 		if (large_rle)
-			PUT_INTEL_SHORT(&rle_data[(y*2)+4], static_cast<short>(d));
+			PUT_INTEL_SHORT(&dst_line_size_ptr.rle_big[y], static_cast<uint16_t>(d));
 		else
-			rle_data[y+4] = d;
+			dst_line_size_ptr.rle_little[y] = static_cast<uint8_t>(d);
 	}
 	memcpy(bmp.get_bitmap_data(), &doffset, 4);
 	memcpy(&bmp.get_bitmap_data()[4], &rle_data.get()[4], doffset - 4);
 	bmp.add_flags(BM_FLAG_RLE | large_rle);
-	return 1;
 }
 
 namespace {
@@ -351,12 +374,18 @@ struct rle_cache_element
 	int last_used;
 };
 
-}
-
 static int rle_cache_initialized;
 static int rle_counter;
 static int rle_next;
-static array<rle_cache_element, 32> rle_cache;
+static std::array<rle_cache_element, 32> rle_cache;
+
+static void rle_cache_init()
+{
+	rle_cache = {};
+	rle_cache_initialized = 1;
+}
+
+}
 
 void rle_cache_close(void)
 {
@@ -367,12 +396,6 @@ void rle_cache_close(void)
 	}
 }
 
-static void rle_cache_init()
-{
-	rle_cache = {};
-	rle_cache_initialized = 1;
-}
-
 void rle_cache_flush()
 {
 	range_for (auto &i, rle_cache)
@@ -381,6 +404,8 @@ void rle_cache_flush()
 		i.last_used = 0;
 	}
 }
+
+namespace {
 
 static void rle_expand_texture_sub(const grs_bitmap &bmp, grs_bitmap &rle_temp_bitmap_1)
 {
@@ -396,6 +421,7 @@ static void rle_expand_texture_sub(const grs_bitmap &bmp, grs_bitmap &rle_temp_b
 	}
 }
 
+}
 
 grs_bitmap *_rle_expand_texture(const grs_bitmap &bmp)
 {
@@ -441,6 +467,7 @@ grs_bitmap *_rle_expand_texture(const grs_bitmap &bmp)
 	return least_recently_used->expanded_bitmap.get();
 }
 
+#if !DXX_USE_OGL
 void gr_rle_expand_scanline_generic(grs_canvas &canvas, grs_bitmap &dest, int dx, const int dy, const uint8_t *src, const int x1, const int x2)
 {
 	int i = 0;
@@ -497,6 +524,7 @@ void gr_rle_expand_scanline_generic(grs_canvas &canvas, grs_bitmap &dest, int dx
 		i += count;
 	}
 }
+#endif
 
 /*
  * swaps entries 0 and 255 in an RLE bitmap without uncompressing it
@@ -509,18 +537,19 @@ void rle_swap_0_255(grs_bitmap &bmp)
 
 	rle_big = bmp.get_flag_mask(BM_FLAG_RLE_BIG);
 
-	RAIIdmem<uint8_t[]> temp;
-	MALLOC(temp, uint8_t[], MAX_BMP_SIZE(bmp.bm_w, bmp.bm_h));
+	const auto temp = std::make_unique<uint8_t[]>(MAX_BMP_SIZE(bmp.bm_w, bmp.bm_h));
 
 	const std::size_t pointer_offset = rle_big ? 4 + 2 * bmp.bm_h : 4 + bmp.bm_h;
 	auto ptr = &bmp.bm_data[pointer_offset];
 	auto ptr2 = &temp[pointer_offset];
+	const rle_size_pun src_line_size_ptr{&bmp.get_bitmap_data()[4]},
+				dst_line_size_ptr{&temp[4]};
 	for (int i = 0; i < bmp.bm_h; i++) {
 		start = ptr2;
 		if (rle_big)
-			line_size = GET_INTEL_SHORT(&bmp.bm_data[4 + 2 * i]);
+			line_size = GET_INTEL_SHORT(&src_line_size_ptr.rle_big[i]);
 		else
-			line_size = bmp.bm_data[4 + i];
+			line_size = src_line_size_ptr.rle_little[i];
 		for (int j = 0; j < line_size; j++) {
 			if ( ! IS_RLE_CODE(ptr[j]) ) {
 				if (ptr[j] == 0) {
@@ -541,10 +570,11 @@ void rle_swap_0_255(grs_bitmap &bmp)
 					*ptr2++ = ptr[j];
 			}
 		}
+		const auto dst_line_size = std::distance(start, ptr2);
 		if (rle_big)                // set line size
-			PUT_INTEL_SHORT(&temp[4 + 2 * i], static_cast<uint16_t>(ptr2 - start));
+			PUT_INTEL_SHORT(&dst_line_size_ptr.rle_big[i], static_cast<uint16_t>(dst_line_size));
 		else
-			temp[4 + i] = ptr2 - start;
+			dst_line_size_ptr.rle_little[i] = static_cast<uint8_t>(dst_line_size);
 		ptr += line_size;           // go to next line
 	}
 	len = ptr2 - temp.get();
@@ -555,31 +585,33 @@ void rle_swap_0_255(grs_bitmap &bmp)
 /*
  * remaps all entries using colormap in an RLE bitmap without uncompressing it
  */
-void rle_remap(grs_bitmap &bmp, array<color_t, 256> &colormap)
+void rle_remap(grs_bitmap &bmp, std::array<color_palette_index, 256> &colormap)
 {
 	int len, rle_big;
-	unsigned char *start;
 	unsigned short line_size;
 
 	rle_big = bmp.get_flag_mask(BM_FLAG_RLE_BIG);
 
-	RAIIdmem<uint8_t[]> temp;
-	MALLOC(temp, uint8_t[], MAX_BMP_SIZE(bmp.bm_w, bmp.bm_h) + 30000);
+	const auto temp = std::make_unique<color_palette_index[]>(MAX_BMP_SIZE(bmp.bm_w, bmp.bm_h) + 30000);
 
 	const std::size_t pointer_offset = rle_big ? 4 + 2 * bmp.bm_h : 4 + bmp.bm_h;
 	auto ptr = &bmp.get_bitmap_data()[pointer_offset];
 	auto ptr2 = &temp[pointer_offset];
+	const rle_size_pun src_line_size_ptr{&bmp.get_bitmap_data()[4]},
+				dst_line_size_ptr{&temp[4]};
 	for (int i = 0; i < bmp.bm_h; i++) {
-		start = ptr2;
+		auto start = ptr2;
 		if (rle_big)
-			line_size = GET_INTEL_SHORT(&bmp.get_bitmap_data()[4 + 2 * i]);
+			line_size = GET_INTEL_SHORT(&src_line_size_ptr.rle_big[i]);
 		else
-			line_size = bmp.get_bitmap_data()[4 + i];
+			line_size = src_line_size_ptr.rle_little[i];
 		for (int j = 0; j < line_size; j++) {
-			if ( ! IS_RLE_CODE(ptr[j])) {
-				if (IS_RLE_CODE(colormap[ptr[j]])) 
-					*ptr2++ = RLE_CODE | 1; // add "escape sequence"
-				*ptr2++ = colormap[ptr[j]]; // translate
+			const uint8_t v = ptr[j];
+			if (!IS_RLE_CODE(v))
+			{
+				if (IS_RLE_CODE(colormap[v])) 
+					*ptr2++ = color_palette_index{RLE_CODE | 1}; // add "escape sequence"
+				*ptr2++ = colormap[v]; // translate
 			} else {
 				*ptr2++ = ptr[j]; // just copy current rle code
 				if ((ptr[j] & NOT_RLE_CODE) == 0)
@@ -588,10 +620,11 @@ void rle_remap(grs_bitmap &bmp, array<color_t, 256> &colormap)
 				*ptr2++ = colormap[ptr[j]]; // translate
 			}
 		}
+		const auto dst_line_size = std::distance(start, ptr2);
 		if (rle_big)                // set line size
-			PUT_INTEL_SHORT(&temp[4 + 2 * i], static_cast<uint16_t>(ptr2 - start));
+			PUT_INTEL_SHORT(&dst_line_size_ptr.rle_big[i], static_cast<uint16_t>(dst_line_size));
 		else
-			temp[4 + i] = ptr2 - start;
+			dst_line_size_ptr.rle_little[i] = static_cast<uint8_t>(dst_line_size);
 		ptr += line_size;           // go to next line
 	}
 	len = ptr2 - temp.get();

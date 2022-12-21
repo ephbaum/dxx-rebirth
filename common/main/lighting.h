@@ -28,10 +28,10 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "maths.h"
 #include "vecmat.h"
 
-#ifdef __cplusplus
 #include "fwd-object.h"
 #include "fwd-segment.h"
 #include "3d.h"
+#include "d_array.h"
 
 #define MAX_LIGHT       0x10000     // max value
 
@@ -41,7 +41,7 @@ namespace dcx {
 
 struct d_level_unique_light_state
 {
-	array<g3s_lrgb, MAX_VERTICES> Dynamic_light;
+	enumerated_array<g3s_lrgb, MAX_VERTICES, vertnum_t> Dynamic_light;
 };
 
 }
@@ -53,7 +53,7 @@ namespace dsx {
 struct d_level_unique_headlight_state
 {
 	unsigned Num_headlights = 0;
-	array<const object_base *, 8> Headlights = {};
+	std::array<const object_base *, 8> Headlights = {};
 };
 
 struct d_level_unique_light_state :
@@ -79,6 +79,4 @@ void toggle_headlight_active(object &);
 #endif
 }
 void start_lighting_frame(const object &viewer);
-#endif
-
 #endif

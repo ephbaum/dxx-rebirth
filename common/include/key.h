@@ -43,7 +43,7 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #ifdef __cplusplus
 #include "dxxsconf.h"
 #include "dsx-ns.h"
-#include "compiler-array.h"
+#include <array>
 
 struct SDL_KeyboardEvent;
 
@@ -58,9 +58,10 @@ extern void key_init();
 extern fix64 keyd_time_when_last_pressed;
 
 // Stores Unicode values registered in one event_loop call
-extern array<unsigned char, KEY_BUFFER_SIZE> unicode_frame_buffer;
+extern std::array<unsigned char, KEY_BUFFER_SIZE> unicode_frame_buffer;
 
 extern void key_flush();    // Clears the 256 char buffer
+extern void event_keycommand_send(unsigned key); // synthesize a key command event from a keycode
 extern int event_key_get(const d_event &event);	// Get the keycode from the EVENT_KEY_COMMAND event
 extern int event_key_get_raw(const d_event &event);	// same as above but without mod states
 unsigned char key_ascii();
@@ -69,7 +70,7 @@ class pressed_keys
 {
 // Set to 1 if the key is currently down, else 0
 	uint8_t modifier_cache;
-	array<uint8_t, 256> pressed;
+	std::array<uint8_t, 256> pressed;
 public:
 	static constexpr unsigned modifier_shift = 8;
 	void update_pressed(std::size_t i, uint8_t p)
@@ -92,7 +93,7 @@ extern pressed_keys keyd_pressed;
 #define key_toggle_repeat(E)	key_toggle_repeat##E()
 void key_toggle_repeat0();
 void key_toggle_repeat1();
-window_event_result key_handler(struct SDL_KeyboardEvent *kevent);
+window_event_result key_handler(const SDL_KeyboardEvent *kevent);
 
 // for key_ismodlck
 #define KEY_ISMOD	1
@@ -236,7 +237,7 @@ struct key_props
 #endif
 };
 
-extern const array<key_props, 256> key_properties;
+extern const std::array<key_props, 256> key_properties;
 
 }
 

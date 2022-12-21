@@ -8,8 +8,13 @@
 
 #pragma once
 
+#include <SDL_version.h>
 #include "fwd-event.h"
 #include "maths.h"
+
+#if SDL_MAJOR_VERSION == 2
+#include <SDL_video.h>
+#endif
 
 #ifdef __cplusplus
 namespace dcx {
@@ -19,9 +24,13 @@ enum event_type : unsigned
 	EVENT_IDLE = 0,
 	EVENT_QUIT,
 
+#if DXX_MAX_BUTTONS_PER_JOYSTICK
 	EVENT_JOYSTICK_BUTTON_DOWN,
 	EVENT_JOYSTICK_BUTTON_UP,
+#endif
+#if DXX_MAX_AXES_PER_JOYSTICK
 	EVENT_JOYSTICK_MOVED,
+#endif
 
 	EVENT_MOUSE_BUTTON_DOWN,
 	EVENT_MOUSE_BUTTON_UP,
@@ -32,6 +41,9 @@ enum event_type : unsigned
 	EVENT_KEY_RELEASE,
 
 	EVENT_WINDOW_CREATED,
+#if SDL_MAJOR_VERSION == 2
+	EVENT_WINDOW_RESIZE,
+#endif
 	EVENT_WINDOW_ACTIVATED,
 	EVENT_WINDOW_DEACTIVATED,
 	EVENT_WINDOW_DRAW,
@@ -40,7 +52,10 @@ enum event_type : unsigned
 	EVENT_NEWMENU_DRAW,					// draw after the newmenu stuff is drawn (e.g. savegame previews)
 	EVENT_NEWMENU_CHANGED,				// an item had its value/text changed
 	EVENT_NEWMENU_SELECTED,				// user chose something - pressed enter/clicked on it
-	
+
+	EVENT_LOOP_BEGIN_LOOP,
+	EVENT_LOOP_END_LOOP,
+
 	EVENT_UI_DIALOG_DRAW,				// draw after the dialog stuff is drawn (e.g. spinning robots)
 	EVENT_UI_GADGET_PRESSED,				// user 'pressed' a gadget
 	EVENT_UI_LISTBOX_MOVED,
@@ -71,9 +86,8 @@ struct d_event
 
 struct d_create_event : d_event
 {
-	const void *const createdata;
-	constexpr d_create_event(const event_type t, const void *const c) :
-		d_event(t), createdata(c)
+	constexpr d_create_event() :
+		d_event{EVENT_WINDOW_CREATED}
 	{
 	}
 };
@@ -92,6 +106,34 @@ struct d_select_event : d_event
 	int citem;
 	d_select_event(const int c) :
 		d_event{EVENT_NEWMENU_SELECTED}, citem(c)
+	{
+	}
+};
+
+#if SDL_MAJOR_VERSION == 2
+struct d_window_size_event : d_event
+{
+	Sint32 width;
+	Sint32 height;
+	d_window_size_event(const Sint32 w, const Sint32 h) :
+		d_event{EVENT_WINDOW_RESIZE}, width(w), height(h)
+	{
+	}
+};
+#endif
+
+struct d_event_begin_loop : d_event
+{
+	d_event_begin_loop() :
+		d_event{EVENT_LOOP_BEGIN_LOOP}
+	{
+	}
+};
+
+struct d_event_end_loop : d_event
+{
+	d_event_end_loop() :
+		d_event{EVENT_LOOP_END_LOOP}
 	{
 	}
 };
